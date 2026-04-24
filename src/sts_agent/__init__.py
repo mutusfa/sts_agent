@@ -22,4 +22,5 @@ __all__ = [
 
 
 def main() -> None:
-    print("Hello from sts-agent!")
+    from .cli import run
+    run()

@@ -214,3 +214,89 @@ def test_tree_search_does_not_mutate_combat():
     assert obs_before.player_hp == obs_after.player_hp
     assert obs_before.hand == obs_after.hand
     assert obs_before.enemies[0].hp == obs_after.enemies[0].hp
+
+
+# ---------------------------------------------------------------------------
+# Transposition table
+# ---------------------------------------------------------------------------
+
+
+def test_transposition_table_reduces_nodes():
+    """TT planner must expand strictly fewer nodes than no-TT on a transposition-rich scenario.
+
+    We use a high-HP Cultist (50 HP) against a hand containing multiple distinct
+    card types.  On T=0 the Cultist only uses Incantation (no attack), so every
+    permutation of cards played leads to the *same* game state at the start of T=1.
+    The TT collapses these duplicate subtrees; the no-TT planner re-explores them.
+    """
+    # High-HP enemy: not killable in one turn, so the search explores T1+
+    combat = Combat(
+        deck=["Strike"] * 5 + ["Defend"] * 4 + ["Bash"],
+        enemies=["Cultist"],
+        seed=0,
+        player_hp=80,
+    )
+    combat.reset()
+    combat._state.enemies[0].hp = 50
+    combat._state.enemies[0].max_hp = 50
+    # Force a hand with 3 distinct card types → 6 orderings that all reach
+    # the same state after END_TURN (Cultist T0 = Incantation, no damage).
+    combat._state.piles.hand = ["Strike", "Defend", "Bash", "Strike", "Defend"]
+
+    planner_tt = TreeSearchPlanner(use_transposition_table=True)
+    planner_tt.act(combat)
+    nodes_with_tt = planner_tt._last_node_count
+
+    planner_no_tt = TreeSearchPlanner(use_transposition_table=False)
+    planner_no_tt.act(combat)
+    nodes_without_tt = planner_no_tt._last_node_count
+
+    assert nodes_with_tt < nodes_without_tt, (
+        f"TT did not reduce node count: with={nodes_with_tt} without={nodes_without_tt}"
+    )
+
+
+@pytest.mark.slow
+def test_node_budget_50hp_cultist():
+    """T=0 node count for 50-HP Cultist seed=0 must not exceed 17 000.
+
+    Guards against regressions in the transposition table or pruning logic
+    that would cause the search to re-expand previously seen states.
+    """
+    combat = Combat(
+        deck=["Strike"] * 5 + ["Defend"] * 4 + ["Bash"],
+        enemies=["Cultist"],
+        seed=0,
+        player_hp=80,
+    )
+    combat.reset()
+    combat._state.enemies[0].hp = 50
+    combat._state.enemies[0].max_hp = 50
+
+    planner = TreeSearchPlanner()
+    planner.act(combat)
+    assert planner._last_node_count <= 17_000, (
+        f"T=0 expanded {planner._last_node_count} nodes, expected ≤17 000"
+    )
+
+
+def test_transposition_table_preserves_decision():
+    """TT planner must pick the same first action as the no-TT planner."""
+    scenarios = [
+        _make_combat(enemy_hp=12),   # killable in T0 → clear optimal
+        _make_combat(enemy_hp=24),   # needs two turns
+        _make_combat(enemy_hp=12, player_hp=1),  # death-avoidance
+    ]
+    for combat in scenarios:
+        action_tt = TreeSearchPlanner(use_transposition_table=True).act(combat)
+        action_no_tt = TreeSearchPlanner(use_transposition_table=False).act(combat)
+        assert action_tt.action_type == action_no_tt.action_type, (
+            f"TT changed action_type: {action_tt} vs {action_no_tt}"
+        )
+        # Check card identity (not just index) when both play a card
+        if action_tt.action_type == ActionType.PLAY_CARD:
+            card_tt = combat._state.piles.hand[action_tt.hand_index]
+            card_no_tt = combat._state.piles.hand[action_no_tt.hand_index]
+            assert card_tt == card_no_tt, (
+                f"TT chose different card: {card_tt} vs {card_no_tt}"
+            )

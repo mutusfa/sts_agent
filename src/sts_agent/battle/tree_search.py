@@ -25,20 +25,74 @@ valid_actions() emits one entry per hand-slot, but two Strikes in hand
 produce identical successor states.  Actions are deduplicated by
 (card_id, target_index) at every node, reducing the branching factor
 to the number of *distinct* card types in hand + END_TURN.
+
+Transposition table
+--------------------
+Different orderings of card plays within a turn produce the same resulting
+game state (hand/discard/draw piles are order-invariant for the discard,
+exhaust, and hand sub-piles).  A per-act() transposition table maps a
+normalised state key → exact minimum score, so duplicate subtrees are
+resolved immediately on first re-encounter.
+
+Key normalisation:
+- draw pile:    ordered tuple (draw order matters — drawn from index 0)
+- hand:         sorted tuple (multiset; player picks which card to play)
+- discard pile: sorted tuple (multiset; reshuffled before next draw)
+- exhaust pile: sorted tuple (multiset)
+- RNG state:    included verbatim (ensures correctness for branches that
+                diverge because of differing shuffle/intent outcomes)
+
+Only exact scores (returned_score < incoming_cutoff) are cached; pruned
+returns (== cutoff, a lower bound) are not stored.
 """
 
 from __future__ import annotations
 
+import logging
 import math
+from dataclasses import astuple
 
 from sts_env.combat import Action, Combat
 from sts_env.combat.state import ActionType
 
-from .base import terminal_score
+from .base import _fmt_action, terminal_score
+
+log = logging.getLogger(__name__)
 
 
 class SearchBudgetExceeded(Exception):
     """Raised when the node-expansion budget is exhausted."""
+
+
+def _powers_key(powers) -> tuple:  # type: ignore[no-untyped-def]
+    return astuple(powers)
+
+
+def _state_key(combat: Combat) -> tuple:
+    """Return a normalised, hashable key for the current combat state.
+
+    Pile ordering is normalised where order is semantically irrelevant:
+    hand/discard/exhaust are sorted; draw pile retains its order.
+    """
+    s = combat._state  # type: ignore[union-attr]
+    enemies_key = tuple(
+        (e.name, e.hp, e.block, _powers_key(e.powers), tuple(e.move_history))
+        for e in s.enemies
+    )
+    return (
+        s.player_hp,
+        s.player_block,
+        s.energy,
+        s.turn,
+        _powers_key(s.player_powers),
+        tuple(s.piles.draw),
+        tuple(sorted(s.piles.hand)),
+        tuple(sorted(s.piles.discard)),
+        tuple(sorted(s.piles.exhaust)),
+        enemies_key,
+        combat.damage_taken,
+        s.rng._rng.getstate(),
+    )
 
 
 def _dedupe_actions(combat: Combat) -> list[Action]:
@@ -71,10 +125,19 @@ class TreeSearchPlanner:
     max_nodes:
         Maximum number of node expansions.  ``None`` = unlimited.
         Raises ``SearchBudgetExceeded`` if the budget is exceeded.
+    use_transposition_table:
+        Enable per-act() memoisation of exact subtree scores.  Defaults to
+        True.  Set False to disable (useful for benchmarking or debugging).
     """
 
-    def __init__(self, max_nodes: int | None = None) -> None:
+    def __init__(
+        self,
+        max_nodes: int | None = None,
+        use_transposition_table: bool = True,
+    ) -> None:
         self.max_nodes = max_nodes
+        self.use_transposition_table = use_transposition_table
+        self._last_node_count: int = 0
 
     def act(self, combat: Combat) -> Action:
         """Return the root action whose full subtree achieves the lowest score.
@@ -82,6 +145,7 @@ class TreeSearchPlanner:
         The original ``combat`` is *never* mutated — all rollouts use clones.
         """
         counter = _Counter(self.max_nodes)
+        tt: dict[tuple, int | float] | None = {} if self.use_transposition_table else None
         actions = _dedupe_actions(combat)
 
         best_action = actions[0]
@@ -90,7 +154,7 @@ class TreeSearchPlanner:
         for action in actions:
             clone = combat.clone()
             clone.step(action)
-            score = _min_score(clone, counter, best_score)
+            score = _min_score(clone, counter, best_score, tt)
             if score < best_score:
                 best_score = score
                 best_action = action
@@ -98,6 +162,15 @@ class TreeSearchPlanner:
                 # Score can't go below 0 — no point exploring further.
                 break
 
+        self._last_node_count = counter._count
+        obs = combat.observe()
+        log.debug(
+            "T=%d search done: action=%s score=%s nodes=%d",
+            obs.turn,
+            _fmt_action(best_action, obs.hand),
+            best_score,
+            counter._count,
+        )
         return best_action
 
 
@@ -124,8 +197,9 @@ def _min_score(
     combat: Combat,
     counter: _Counter,
     cutoff: int | float = math.inf,
+    tt: dict[tuple, int | float] | None = None,
 ) -> int | float:
-    """Recursive DFS with alpha-pruning.
+    """Recursive DFS with alpha-pruning and optional transposition table.
 
     Parameters
     ----------
@@ -137,6 +211,10 @@ def _min_score(
         Best score found so far at the parent level.  Since damage_taken is
         monotonically non-decreasing, any node whose damage_taken >= cutoff
         can only produce terminal scores >= cutoff and is pruned immediately.
+    tt:
+        Transposition table mapping state key → exact minimum score.  ``None``
+        disables memoisation.  Only exact results (score < cutoff) are stored;
+        pruned returns (score == cutoff, a lower bound) are not cached.
     """
     counter.tick()
 
@@ -147,14 +225,25 @@ def _min_score(
     if combat.observe().done:
         return terminal_score(combat)
 
+    # Transposition table lookup — only valid for exact scores stored earlier.
+    key: tuple | None = None
+    if tt is not None:
+        key = _state_key(combat)
+        if key in tt:
+            return tt[key]
+
     best: int | float = cutoff
     for action in _dedupe_actions(combat):
         clone = combat.clone()
         clone.step(action)
-        score = _min_score(clone, counter, best)
+        score = _min_score(clone, counter, best, tt)
         if score < best:
             best = score
         if best == 0:
             break  # optimal; prune remaining siblings
+
+    # Cache only exact results (not pruned lower-bounds).
+    if tt is not None and key is not None and best < cutoff:
+        tt[key] = best
 
     return best

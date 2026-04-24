@@ -6,9 +6,14 @@ valid_actions / done) works end-to-end before training any learned policy.
 
 from __future__ import annotations
 
+import logging
 import random
 
 from sts_env.combat import Action, Observation
+
+from .base import _fmt_action
+
+log = logging.getLogger(__name__)
 
 
 class RandomAgent:
@@ -24,5 +29,7 @@ class RandomAgent:
     def __init__(self, seed: int) -> None:
         self._rng = random.Random(seed)
 
-    def act(self, obs: Observation, valid_actions: list[Action]) -> Action:  # noqa: ARG002
-        return self._rng.choice(valid_actions)
+    def act(self, obs: Observation, valid_actions: list[Action]) -> Action:
+        action = self._rng.choice(valid_actions)
+        log.debug("T=%d random chose %s", obs.turn, _fmt_action(action, obs.hand))
+        return action
