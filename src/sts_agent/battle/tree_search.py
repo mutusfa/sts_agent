@@ -68,11 +68,14 @@ def _powers_key(powers) -> tuple:  # type: ignore[no-untyped-def]
     return astuple(powers)
 
 
-def _state_key(combat: Combat) -> tuple:
-    """Return a normalised, hashable key for the current combat state.
+def _state_key_base(combat: Combat) -> tuple:
+    """Return a normalised, hashable key for the current combat state, **excluding** RNG.
 
     Pile ordering is normalised where order is semantically irrelevant:
     hand/discard/exhaust are sorted; draw pile retains its order.
+
+    Shared by both the exact tree-search (which appends RNG state) and the
+    open-loop MCTS (which omits it to collapse stochastic outcomes).
     """
     s = combat._state  # type: ignore[union-attr]
     enemies_key = tuple(
@@ -91,8 +94,17 @@ def _state_key(combat: Combat) -> tuple:
         tuple(sorted(s.piles.exhaust)),
         enemies_key,
         combat.damage_taken,
-        s.rng._rng.getstate(),
     )
+
+
+def _state_key(combat: Combat) -> tuple:
+    """Return a normalised, hashable key including RNG state (exact solver).
+
+    RNG state is appended so that branches diverging due to shuffle or intent
+    outcomes are treated as distinct nodes.
+    """
+    s = combat._state  # type: ignore[union-attr]
+    return _state_key_base(combat) + (s.rng._rng.getstate(),)
 
 
 # ---------------------------------------------------------------------------
@@ -118,7 +130,7 @@ _CARD_TIER: dict[str, int] = {
     "ShrugItOff": 50,
     "Defend": 52,
 }
-_DEFAULT_TIER = 44   # unknown card → Strike-equivalent (safe middle)
+_DEFAULT_TIER = 44  # unknown card → Strike-equivalent (safe middle)
 _END_TURN_TIER = 60  # always last
 
 

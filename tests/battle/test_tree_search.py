@@ -189,6 +189,7 @@ def test_tree_search_beats_random_on_small_combat():
 def test_tree_search_budget_exceeded():
     """SearchBudgetExceeded is raised when max_nodes=1 on a non-trivial combat."""
     from sts_env.combat.encounters import cultist
+
     combat = cultist(seed=0)
     combat.reset()
 
@@ -297,7 +298,8 @@ def test_move_ordering_tries_bash_before_strike():
     actions = _ordered_actions(combat)
     cards = [
         combat._state.piles.hand[a.hand_index]
-        if a.action_type == ActionType.PLAY_CARD else "END_TURN"
+        if a.action_type == ActionType.PLAY_CARD
+        else "END_TURN"
         for a in actions
     ]
     bash_idx = cards.index("Bash")
@@ -330,7 +332,8 @@ def test_move_ordering_targets_lowest_hp_first():
 
     actions = _ordered_actions(combat)
     strike_actions = [
-        a for a in actions
+        a
+        for a in actions
         if a.action_type == ActionType.PLAY_CARD
         and combat._state.piles.hand[a.hand_index] == "Strike"
     ]
@@ -350,6 +353,7 @@ def test_move_ordering_reduces_nodes_on_multi_enemy():
     first, killing it faster and establishing a tighter cutoff that prunes the
     remaining branches.  TT is disabled to isolate the ordering effect.
     """
+
     def _run(use_ordering: bool) -> int:
         planner = TreeSearchPlanner(
             use_transposition_table=False,
@@ -391,6 +395,7 @@ def test_move_ordering_preserves_decision():
         _make_combat(enemy_hp=12, player_hp=1),
     ]
     for combat in scenarios:
+
         def _run_damage(use_ordering: bool) -> int:
             c = combat.clone()
             c.reset()

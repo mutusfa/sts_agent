@@ -36,7 +36,7 @@ import sys
 
 from sts_env.combat import encounters
 
-from .battle import RandomAgent, TreeSearchPlanner, run_agent, run_planner
+from .battle import MCTSPlanner, RandomAgent, TreeSearchPlanner, run_agent, run_planner
 from .battle.tree_search import SearchBudgetExceeded
 
 _ENCOUNTERS = {
@@ -87,9 +87,15 @@ def _build_parser() -> argparse.ArgumentParser:
     battle.add_argument("--seed", type=int, default=0, help="RNG seed (default: 0).")
     battle.add_argument(
         "--agent",
-        choices=("random", "tree"),
+        choices=("random", "tree", "mcts"),
         default="tree",
         help="Agent to use (default: tree).",
+    )
+    battle.add_argument(
+        "--simulations",
+        type=int,
+        default=1000,
+        help="MCTSPlanner simulation budget per act() (mcts agent only, default: 1000).",
     )
     battle.add_argument(
         "--player-hp",
@@ -103,7 +109,7 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         dest="max_nodes",
-        help="TreeSearchPlanner node budget (tree agent only).",
+        help="Node expansion budget (tree and mcts agents; default: unlimited).",
     )
     battle.add_argument(
         "-v",
@@ -143,10 +149,18 @@ def run(argv: list[str] | None = None) -> None:
 def _run_battle(args: argparse.Namespace) -> None:
     combat = _ENCOUNTERS[args.encounter](args.seed, player_hp=args.player_hp)
 
+    mcts_planner: MCTSPlanner | None = None
     try:
         if args.agent == "tree":
             planner = TreeSearchPlanner(max_nodes=args.max_nodes)
             damage = run_planner(planner, combat)
+        elif args.agent == "mcts":
+            mcts_planner = MCTSPlanner(
+                simulations=args.simulations,
+                max_nodes=args.max_nodes,
+                seed=args.seed,
+            )
+            damage = run_planner(mcts_planner, combat)
         else:
             agent = RandomAgent(seed=args.seed)
             damage = run_agent(agent, combat)
@@ -157,10 +171,17 @@ def _run_battle(args: argparse.Namespace) -> None:
     obs = combat.observe()
     result = "dead" if obs.player_dead else "won"
 
-    print(
+    summary = (
         f"agent={args.agent} encounter={args.encounter} seed={args.seed} "
         f"damage={damage} turns={obs.turn} result={result}"
     )
+    if mcts_planner is not None:
+        stats = mcts_planner.last_stats
+        summary += (
+            f" mean={stats['mean']:.1f} std={stats['std']:.1f} max={stats['max']:.1f}"
+        )
+
+    print(summary)
 
     if obs.player_dead:
         raise SystemExit(1)

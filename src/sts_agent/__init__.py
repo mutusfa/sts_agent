@@ -1,6 +1,7 @@
 from .battle import (
     BattleAgent,
     BattlePlanner,
+    MCTSPlanner,
     RandomAgent,
     SearchBudgetExceeded,
     TreeSearchPlanner,
@@ -12,6 +13,7 @@ from .battle import (
 __all__ = [
     "BattleAgent",
     "BattlePlanner",
+    "MCTSPlanner",
     "RandomAgent",
     "SearchBudgetExceeded",
     "TreeSearchPlanner",
