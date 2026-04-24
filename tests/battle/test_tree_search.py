@@ -14,7 +14,7 @@ from sts_env.combat.state import ActionType
 
 from sts_agent.battle import RandomAgent, TreeSearchPlanner, run_agent, run_planner
 from sts_agent.battle.base import terminal_score
-from sts_agent.battle.tree_search import SearchBudgetExceeded
+from sts_agent.battle.tree_search import SearchBudgetExceeded, _ordered_actions
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +279,132 @@ def test_node_budget_50hp_cultist():
     assert planner._last_node_count <= 17_000, (
         f"T=0 expanded {planner._last_node_count} nodes, expected ≤17 000"
     )
+
+
+# ---------------------------------------------------------------------------
+# Move ordering heuristic
+# ---------------------------------------------------------------------------
+
+
+def test_move_ordering_tries_bash_before_strike():
+    """_ordered_actions must return Bash before Strike before Defend before END_TURN.
+
+    Bash (tier 20) < Strike (tier 44) < Defend (tier 52) < END_TURN (tier 60).
+    """
+    combat = _make_combat(enemy_hp=50)
+    combat._state.piles.hand = ["Strike", "Bash", "Defend"]
+
+    actions = _ordered_actions(combat)
+    cards = [
+        combat._state.piles.hand[a.hand_index]
+        if a.action_type == ActionType.PLAY_CARD else "END_TURN"
+        for a in actions
+    ]
+    bash_idx = cards.index("Bash")
+    strike_idx = cards.index("Strike")
+    defend_idx = cards.index("Defend")
+    end_idx = cards.index("END_TURN")
+
+    assert bash_idx < strike_idx, f"Bash should come before Strike: {cards}"
+    assert strike_idx < defend_idx, f"Strike should come before Defend: {cards}"
+    assert defend_idx < end_idx, f"Defend should come before END_TURN: {cards}"
+
+
+def test_move_ordering_targets_lowest_hp_first():
+    """Within attack actions, the lowest-HP target must come first.
+
+    Uses two Cultists (both MadGremlins via enemies list) with different HP.
+    """
+    combat = Combat(
+        deck=["Strike"] * 5 + ["Defend"] * 4 + ["Bash"],
+        enemies=["MadGremlin", "MadGremlin"],
+        seed=0,
+        player_hp=80,
+    )
+    combat.reset()
+    combat._state.enemies[0].hp = 20
+    combat._state.enemies[0].max_hp = 20
+    combat._state.enemies[1].hp = 5
+    combat._state.enemies[1].max_hp = 5
+    combat._state.piles.hand = ["Strike", "Defend"]
+
+    actions = _ordered_actions(combat)
+    strike_actions = [
+        a for a in actions
+        if a.action_type == ActionType.PLAY_CARD
+        and combat._state.piles.hand[a.hand_index] == "Strike"
+    ]
+    assert len(strike_actions) >= 2, "Expected Strike against each enemy"
+    first_target_hp = combat._state.enemies[strike_actions[0].target_index].hp
+    assert first_target_hp == 5, (
+        f"Expected first Strike target to have 5 HP, got {first_target_hp}"
+    )
+
+
+def test_move_ordering_reduces_nodes_on_multi_enemy():
+    """Move ordering must reduce nodes on a 2-enemy fight where target choice matters.
+
+    enemy[0] has 14 HP (needs 3 Strikes to kill), enemy[1] has 8 HP (needs 2).
+    Unordered tries enemy[0] first (natural valid_actions() index order), so
+    the first completed path is suboptimal.  Ordered tries the lower-HP enemy[1]
+    first, killing it faster and establishing a tighter cutoff that prunes the
+    remaining branches.  TT is disabled to isolate the ordering effect.
+    """
+    def _run(use_ordering: bool) -> int:
+        planner = TreeSearchPlanner(
+            use_transposition_table=False,
+            use_move_ordering=use_ordering,
+        )
+        combat = Combat(
+            deck=["Strike"] * 5 + ["Defend"] * 4 + ["Bash"],
+            enemies=["MadGremlin", "MadGremlin"],
+            seed=0,
+            player_hp=80,
+        )
+        combat.reset()
+        combat._state.enemies[0].hp = combat._state.enemies[0].max_hp = 14
+        combat._state.enemies[1].hp = combat._state.enemies[1].max_hp = 8
+        combat._state.piles.hand = ["Strike", "Strike", "Strike", "Defend", "Defend"]
+        planner.act(combat)
+        return planner._last_node_count
+
+    nodes_ordered = _run(True)
+    nodes_unordered = _run(False)
+
+    assert nodes_ordered < nodes_unordered, (
+        f"Move ordering did not reduce nodes: "
+        f"ordered={nodes_ordered} unordered={nodes_unordered}"
+    )
+
+
+def test_move_ordering_preserves_decision():
+    """Move ordering must not degrade outcome quality.
+
+    Ordering may legitimately choose a different first action when multiple
+    moves are tied at the optimal score (e.g. both Strike and Defend lead to
+    0 damage when the enemy is killable).  What must be preserved is the
+    *terminal damage_taken*, not the specific first action chosen.
+    """
+    scenarios = [
+        _make_combat(enemy_hp=12),
+        _make_combat(enemy_hp=24),
+        _make_combat(enemy_hp=12, player_hp=1),
+    ]
+    for combat in scenarios:
+        def _run_damage(use_ordering: bool) -> int:
+            c = combat.clone()
+            c.reset()
+            p = TreeSearchPlanner(use_move_ordering=use_ordering)
+            obs = c.observe()
+            while not obs.done:
+                obs, _, _ = c.step(p.act(c))
+            return c.damage_taken
+
+        dmg_ord = _run_damage(True)
+        dmg_unord = _run_damage(False)
+        assert dmg_ord == dmg_unord, (
+            f"Move ordering changed terminal damage: ordered={dmg_ord} unordered={dmg_unord}"
+        )
 
 
 def test_transposition_table_preserves_decision():

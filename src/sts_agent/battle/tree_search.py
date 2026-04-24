@@ -95,6 +95,52 @@ def _state_key(combat: Combat) -> tuple:
     )
 
 
+# ---------------------------------------------------------------------------
+# Move ordering
+# ---------------------------------------------------------------------------
+
+# Per-card priority — lower = tried first.  Spaced by 10 so new cards can
+# slot between tiers without renumbering.
+#
+#  10   (reserved for POWER cards — none implemented yet)
+#  20   cards that apply lasting effects this turn (Bash → Vulnerable)
+#  30   free (cost-0) cards — always play, they cost nothing
+#  40-49 attack-dominant cards, ranked by expected damage/energy
+#  50-59 block/defensive skills, ranked by expected block/energy
+#  60   END_TURN (always last)
+_CARD_TIER: dict[str, int] = {
+    "Bash": 20,
+    "Anger": 30,
+    "Cleave": 40,
+    "PommelStrike": 42,
+    "Strike": 44,
+    "IronWave": 46,
+    "ShrugItOff": 50,
+    "Defend": 52,
+}
+_DEFAULT_TIER = 44   # unknown card → Strike-equivalent (safe middle)
+_END_TURN_TIER = 60  # always last
+
+
+def _order_key(action: Action, combat: Combat) -> tuple:
+    """Sort key for move ordering: (tier, target_hp, card_id)."""
+    if action.action_type != ActionType.PLAY_CARD:
+        return (_END_TURN_TIER, 0, "")
+    card_id = combat._state.piles.hand[action.hand_index]  # type: ignore[union-attr]
+    tier = _CARD_TIER.get(card_id, _DEFAULT_TIER)
+    target_hp = 0
+    ti = action.target_index
+    enemies = combat._state.enemies  # type: ignore[union-attr]
+    if 0 <= ti < len(enemies):
+        target_hp = enemies[ti].hp
+    return (tier, target_hp, card_id)
+
+
+def _ordered_actions(combat: Combat) -> list[Action]:
+    """Return deduplicated actions sorted by move-ordering heuristic."""
+    return sorted(_dedupe_actions(combat), key=lambda a: _order_key(a, combat))
+
+
 def _dedupe_actions(combat: Combat) -> list[Action]:
     """Return valid actions with duplicates collapsed by (card_id, target_index).
 
@@ -134,9 +180,11 @@ class TreeSearchPlanner:
         self,
         max_nodes: int | None = None,
         use_transposition_table: bool = True,
+        use_move_ordering: bool = True,
     ) -> None:
         self.max_nodes = max_nodes
         self.use_transposition_table = use_transposition_table
+        self.use_move_ordering = use_move_ordering
         self._last_node_count: int = 0
 
     def act(self, combat: Combat) -> Action:
@@ -148,7 +196,8 @@ class TreeSearchPlanner:
         tt: dict[tuple, int | float] | None = (
             {} if self.use_transposition_table else None
         )
-        actions = _dedupe_actions(combat)
+        _actions = _ordered_actions if self.use_move_ordering else _dedupe_actions
+        actions = _actions(combat)
 
         best_action = actions[0]
         best_score: int | float = math.inf
@@ -156,7 +205,7 @@ class TreeSearchPlanner:
         for action in actions:
             clone = combat.clone()
             clone.step(action)
-            score = _min_score(clone, counter, best_score, tt)
+            score = _min_score(clone, counter, best_score, tt, self.use_move_ordering)
             if score < best_score:
                 best_score = score
                 best_action = action
@@ -199,8 +248,10 @@ def _min_score(
     counter: _Counter,
     cutoff: int | float = math.inf,
     tt: dict[tuple, int | float] | None = None,
+    use_move_ordering: bool = True,
 ) -> int | float:
-    """Recursive DFS with alpha-pruning and optional transposition table.
+    """Recursive DFS with alpha-pruning, optional transposition table, and
+    optional move ordering.
 
     Parameters
     ----------
@@ -216,6 +267,9 @@ def _min_score(
         Transposition table mapping state key → exact minimum score.  ``None``
         disables memoisation.  Only exact results (score < cutoff) are stored;
         pruned returns (score == cutoff, a lower bound) are not cached.
+    use_move_ordering:
+        When True, use _ordered_actions (card-tier + low-HP-target ordering).
+        When False, use plain _dedupe_actions order.
     """
     counter.tick()
 
@@ -233,11 +287,12 @@ def _min_score(
         if key in tt:
             return tt[key]
 
+    _actions = _ordered_actions if use_move_ordering else _dedupe_actions
     best: int | float = cutoff
-    for action in _dedupe_actions(combat):
+    for action in _actions(combat):
         clone = combat.clone()
         clone.step(action)
-        score = _min_score(clone, counter, best, tt)
+        score = _min_score(clone, counter, best, tt, use_move_ordering)
         if score < best:
             best = score
         if best == 0:
