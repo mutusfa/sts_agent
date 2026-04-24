@@ -230,6 +230,7 @@ class MCTSPlanner:
         self._exploration_c = exploration_c
         self._rng = random.Random(seed)
         self.last_stats: dict[str, float] = {}
+        self._node_store: dict[tuple, _Node] = {}
 
     def act(self, combat: Combat) -> Action:
         """Return the action with the lowest estimated expected damage.
@@ -242,13 +243,17 @@ class MCTSPlanner:
         c = self._exploration_c if self._exploration_c is not None else start_hp
 
         root_key = _mcts_state_key(combat)
-        root_node = _Node(
-            state_key=root_key,
-            untried_action_keys=[
-                _action_concept_key(a, combat) for a in _ordered_actions(combat)
-            ],
-        )
-        node_store: dict[tuple, _Node] = {root_key: root_node}
+        if root_key in self._node_store:
+            root_node = self._node_store[root_key]
+        else:
+            root_node = _Node(
+                state_key=root_key,
+                untried_action_keys=[
+                    _action_concept_key(a, combat) for a in _ordered_actions(combat)
+                ],
+            )
+            self._node_store = {root_key: root_node}
+        node_store = self._node_store
 
         sims_run = 0
         nodes_expanded = 0

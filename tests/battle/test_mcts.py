@@ -164,3 +164,62 @@ def test_std_and_max_are_finite():
     planner.act(combat)
     assert math.isfinite(planner.last_stats["std"])
     assert math.isfinite(planner.last_stats["max"])
+
+
+# ---------------------------------------------------------------------------
+# 7. Tree reuse across deterministic turn boundary
+# ---------------------------------------------------------------------------
+
+@pytest.mark.slow
+def test_tree_reused_across_deterministic_turn_boundary():
+    """Nodes explored during act() must be reused as priors on subsequent calls.
+
+    Starter deck is 10 cards: T0 draws 5, T1 draws the remaining 5 — the draw
+    pile is empty after T1 so no shuffle occurs until T2's first draw.  Cultist
+    follows a scripted intent sequence (Incantation T0, then a repeating pattern)
+    so enemy transitions add no entropy.  This means the T0→T1 trajectory is
+    fully deterministic: the realized successor state-key after stepping an
+    action *must* already be present in _node_store if MCTS explored that path.
+
+    Protocol:
+    1. Use high enemy HP so T0 never ends the fight.
+    2. Walk the real combat one step at a time with planner.act() → combat.step().
+    3. After each act() (except the very first), assert that the *current*
+       root key was already in _node_store before that call ran — verified by
+       capturing the store's key-set before the call.
+    4. Require that at least one cross-turn hit is observed (i.e. a cache hit
+       after an END_TURN), proving reuse works across turn boundaries, not just
+       within a turn.
+    """
+    combat = _make_combat(seed=0, enemy_hp=80)
+    planner = MCTSPlanner(simulations=500, seed=0)
+
+    cross_turn_hit = False
+    prev_turn = combat.observe().turn
+
+    for step_idx in range(12):  # enough to comfortably span T0 and T1
+        if combat.observe().done:
+            break
+
+        # Capture the store contents and turn *before* this act() call.
+        keys_before = set(planner._node_store.keys())
+        current_key = _mcts_state_key(combat)
+        current_turn = combat.observe().turn
+
+        action = planner.act(combat)
+
+        if step_idx > 0:
+            # The root state must have been in the store before this call.
+            assert current_key in keys_before, (
+                f"Step {step_idx} (turn {current_turn}): root key not found in "
+                f"_node_store before act() — tree was not reused"
+            )
+            if current_turn > prev_turn:
+                cross_turn_hit = True
+
+        prev_turn = current_turn
+        combat.step(action)
+
+    assert cross_turn_hit, (
+        "No cross-turn cache hit observed — reuse did not survive an END_TURN"
+    )
