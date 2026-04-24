@@ -12,12 +12,7 @@ battle  Run a single combat and print a one-line summary.
 
 Encounters
 ----------
-cultist      Single Cultist.
-jaw_worm     Single Jaw Worm.
-acid_slime_m Single Acid Slime (M).
-small_slimes SpikeSlimeS + AcidSlimeS.
-two_louses   Two louses (seeded RedLouse/GreenLouse mix).
-gremlin_gang Four gremlins drawn from the STS pool.
+All public functions in sts_env.combat.encounters are available automatically.
 
 Verbosity
 ---------
@@ -35,6 +30,7 @@ Exit codes
 from __future__ import annotations
 
 import argparse
+import inspect
 import logging
 import sys
 
@@ -44,12 +40,8 @@ from .battle import RandomAgent, TreeSearchPlanner, run_agent, run_planner
 from .battle.tree_search import SearchBudgetExceeded
 
 _ENCOUNTERS = {
-    "cultist": encounters.cultist,
-    "jaw_worm": encounters.jaw_worm,
-    "acid_slime_m": encounters.acid_slime_m,
-    "small_slimes": encounters.small_slimes,
-    "two_louses": encounters.two_louses,
-    "gremlin_gang": encounters.gremlin_gang,
+    name: fn
+    for name, fn in inspect.getmembers(encounters, inspect.isfunction)
 }
 
 _SUBCOMMANDS = ("battle",)
