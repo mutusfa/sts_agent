@@ -69,6 +69,31 @@ def _fmt_action(action: Action, hand: list[str]) -> str:
     return f"{card}→E{action.target_index}"
 
 
+_PLAYER_POWER_ABBREV: dict[str, str] = {
+    "strength": "str",
+    "vulnerable": "vuln",
+    "weak": "weak",
+    "frail": "frail",
+}
+_ENEMY_POWER_ABBREV: dict[str, str] = {
+    "strength": "str",
+    "vulnerable": "vuln",
+    "weak": "weak",
+    "curl_up": "curl",
+    "angry": "angry",
+}
+
+
+def _fmt_powers(powers: dict, abbrev: dict[str, str]) -> str:
+    """Return a compact string of nonzero power stacks, e.g. 'weak:2 vuln:1'."""
+    parts = [
+        f"{abbrev.get(k, k)}:{v}"
+        for k, v in powers.items()
+        if v and k in abbrev
+    ]
+    return " ".join(parts)
+
+
 def _fmt_obs(obs: Observation) -> str:
     """Single-line observation snapshot."""
     def _fmt_enemy_intent(enemy: object) -> str:
@@ -92,14 +117,22 @@ def _fmt_obs(obs: Observation) -> str:
             f" hits:{hits_str} blk+:{block_str})"
         )
 
-    enemies = " ".join(
-        f"{e.name}({e.hp}/{e.max_hp} blk:{e.block} {_fmt_enemy_intent(e)})"
-        for e in obs.enemies
-    )
+    def _fmt_enemy(e: object) -> str:
+        hp = getattr(e, "hp", "?")
+        max_hp = getattr(e, "max_hp", "?")
+        blk = getattr(e, "block", 0)
+        name = getattr(e, "name", "?")
+        powers_str = _fmt_powers(getattr(e, "powers", {}), _ENEMY_POWER_ABBREV)
+        powers_part = f" [{powers_str}]" if powers_str else ""
+        return f"{name}({hp}/{max_hp} blk:{blk}{powers_part} {_fmt_enemy_intent(e)})"
+
+    enemies = " ".join(_fmt_enemy(e) for e in obs.enemies)
     hand = ",".join(obs.hand)
+    player_powers_str = _fmt_powers(obs.player_powers, _PLAYER_POWER_ABBREV)
+    player_powers_part = f" [{player_powers_str}]" if player_powers_str else ""
     return (
         f"T={obs.turn} hp={obs.player_hp}/{obs.player_max_hp} "
-        f"blk={obs.player_block} nrg={obs.energy} hand=[{hand}] | {enemies}"
+        f"blk={obs.player_block} nrg={obs.energy}{player_powers_part} hand=[{hand}] | {enemies}"
     )
 
 
