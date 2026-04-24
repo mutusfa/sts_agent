@@ -2,14 +2,14 @@
 
 import pytest
 
-from sts_env.combat import Combat
+from sts_env.combat.encounters import cultist, jaw_worm
 
 
 @pytest.fixture()
-def ironclad_vs_cultist() -> Combat:
-    return Combat.ironclad_starter(enemy="Cultist", seed=0)
+def ironclad_vs_cultist():
+    return cultist(seed=0)
 
 
 @pytest.fixture()
-def ironclad_vs_jaw_worm() -> Combat:
-    return Combat.ironclad_starter(enemy="JawWorm", seed=0)
+def ironclad_vs_jaw_worm():
+    return jaw_worm(seed=0)

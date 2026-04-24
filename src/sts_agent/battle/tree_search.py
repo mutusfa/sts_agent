@@ -145,7 +145,9 @@ class TreeSearchPlanner:
         The original ``combat`` is *never* mutated — all rollouts use clones.
         """
         counter = _Counter(self.max_nodes)
-        tt: dict[tuple, int | float] | None = {} if self.use_transposition_table else None
+        tt: dict[tuple, int | float] | None = (
+            {} if self.use_transposition_table else None
+        )
         actions = _dedupe_actions(combat)
 
         best_action = actions[0]
@@ -178,6 +180,7 @@ class TreeSearchPlanner:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+
 class _Counter:
     """Mutable node-expansion counter; raises SearchBudgetExceeded at limit."""
 
@@ -188,9 +191,7 @@ class _Counter:
     def tick(self) -> None:
         self._count += 1
         if self._max is not None and self._count >= self._max:
-            raise SearchBudgetExceeded(
-                f"Search budget of {self._max} nodes exceeded."
-            )
+            raise SearchBudgetExceeded(f"Search budget of {self._max} nodes exceeded.")
 
 
 def _min_score(

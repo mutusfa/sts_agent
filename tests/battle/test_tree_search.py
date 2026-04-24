@@ -188,7 +188,8 @@ def test_tree_search_beats_random_on_small_combat():
 
 def test_tree_search_budget_exceeded():
     """SearchBudgetExceeded is raised when max_nodes=1 on a non-trivial combat."""
-    combat = Combat.ironclad_starter(enemy="Cultist", seed=0)
+    from sts_env.combat.encounters import cultist
+    combat = cultist(seed=0)
     combat.reset()
 
     planner = TreeSearchPlanner(max_nodes=1)
@@ -283,8 +284,8 @@ def test_node_budget_50hp_cultist():
 def test_transposition_table_preserves_decision():
     """TT planner must pick the same first action as the no-TT planner."""
     scenarios = [
-        _make_combat(enemy_hp=12),   # killable in T0 → clear optimal
-        _make_combat(enemy_hp=24),   # needs two turns
+        _make_combat(enemy_hp=12),  # killable in T0 → clear optimal
+        _make_combat(enemy_hp=24),  # needs two turns
         _make_combat(enemy_hp=12, player_hp=1),  # death-avoidance
     ]
     for combat in scenarios:

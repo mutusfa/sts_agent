@@ -46,8 +46,9 @@ def test_random_agent_always_returns_valid_action(ironclad_vs_cultist: Combat):
 
 def test_random_agent_same_seed_reproducible():
     """Two agents with the same seed must produce the same action sequence."""
-    combat_a = Combat.ironclad_starter(enemy="Cultist", seed=7)
-    combat_b = Combat.ironclad_starter(enemy="Cultist", seed=7)
+    from sts_env.combat.encounters import cultist
+    combat_a = cultist(seed=7)
+    combat_b = cultist(seed=7)
 
     agent_a = RandomAgent(seed=99)
     agent_b = RandomAgent(seed=99)
@@ -79,8 +80,9 @@ def test_random_agent_same_seed_reproducible():
 
 def test_random_agent_different_seeds_differ():
     """Two agents with different seeds must diverge at some point."""
-    combat_a = Combat.ironclad_starter(enemy="Cultist", seed=7)
-    combat_b = Combat.ironclad_starter(enemy="Cultist", seed=7)
+    from sts_env.combat.encounters import cultist
+    combat_a = cultist(seed=7)
+    combat_b = cultist(seed=7)
 
     agent_a = RandomAgent(seed=1)
     agent_b = RandomAgent(seed=2)
@@ -132,8 +134,9 @@ def test_run_agent_terminates_vs_jaw_worm(ironclad_vs_jaw_worm: Combat):
 
 def test_random_agent_reusable_across_combats():
     """RandomAgent should work correctly when used for multiple separate runs."""
+    from sts_env.combat.encounters import cultist
     agent = RandomAgent(seed=5)
     for seed in range(3):
-        combat = Combat.ironclad_starter(enemy="Cultist", seed=seed)
+        combat = cultist(seed=seed)
         damage = run_agent(agent, combat)
         assert damage >= 0
