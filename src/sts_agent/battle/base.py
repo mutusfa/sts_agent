@@ -152,7 +152,11 @@ def run_agent(agent: BattleAgent, combat: Combat) -> int:
              type(agent).__name__, enemy_names,
              obs.player_hp, obs.player_max_hp, obs.hand)
 
+    prev_turn = -1
     while not obs.done:
+        if obs.turn != prev_turn:
+            log.debug("--- Turn %d ---", obs.turn)
+            prev_turn = obs.turn
         actions = combat.valid_actions()
         action = agent.act(obs, actions)
         log.debug("T=%d action=%s | before: %s",
@@ -176,7 +180,12 @@ def run_planner(planner: BattlePlanner, combat: Combat) -> int:
              type(planner).__name__, enemy_names,
              obs.player_hp, obs.player_max_hp, obs.hand)
 
+    prev_turn = -1
     while not obs.done:
+        curr_turn = combat.observe().turn
+        if curr_turn != prev_turn:
+            log.debug("--- Turn %d ---", curr_turn)
+            prev_turn = curr_turn
         action = planner.act(combat)
         obs_before = combat.observe()
         log.debug("T=%d action=%s | before: %s",
