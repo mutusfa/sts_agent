@@ -1,0 +1,384 @@
+"""LLM-based strategy agent for card reward decisions.
+
+Uses dspy.ReAct to give the LLM simulation tools for evaluating card choices,
+with a configurable timeout and deterministic forced-pick fallback.
+
+Architecture
+------------
+::
+
+    Character state + card choices + upcoming encounters
+        │
+        ▼
+    dspy.ReAct (thought → tool call → observation loop)
+        │  tools: simulate_upcoming, try_card
+        │  budget: 5 min (tools raise TimeoutError when exceeded)
+        ▼
+    Extracted pick (card_id or "skip")
+        │
+        ▼
+    Validate against choices → forced-pick fallback on any failure
+
+Public API
+----------
+StrategyAgent   — main agent class
+configure_lm    — set up the z.ai / OpenAI-compatible LM
+ensure_lm       — lazy init helper
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import time
+from pathlib import Path
+
+import dspy
+
+from sts_env.run.character import Character
+
+from .simulate import SimResult, simulate_encounter, simulate_with_card
+
+log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Environment / API key
+# ---------------------------------------------------------------------------
+
+_ENV_PATH = Path(__file__).resolve().parent.parent.parent / ".env"
+
+
+def _load_env() -> None:
+    """Load ``GLM_API_KEY`` from the project ``.env`` if not already set."""
+    if _ENV_PATH.exists():
+        for line in _ENV_PATH.read_text().splitlines():
+            line = line.strip()
+            if "=" in line and not line.startswith("#"):
+                key, _, value = line.partition("=")
+                os.environ.setdefault(key.strip(), value.strip())
+
+
+_load_env()
+
+# ---------------------------------------------------------------------------
+# LM configuration
+# ---------------------------------------------------------------------------
+
+ZAI_API_BASE = "https://open.bigmodel.cn/api/paas/v4/"
+DEFAULT_MODEL = "glm-5.1"
+DEFAULT_TIMEOUT = 300  # seconds (5 min)
+
+_lm_configured = False
+
+
+def configure_lm(
+    model: str = DEFAULT_MODEL,
+    api_key: str | None = None,
+    api_base: str = ZAI_API_BASE,
+) -> dspy.LM:
+    """Configure the dspy language model.
+
+    Parameters
+    ----------
+    model:
+        Model name forwarded to the provider (default ``"glm-5.1"``).
+    api_key:
+        API key.  Falls back to ``GLM_API_KEY`` env var.
+    api_base:
+        OpenAI-compatible base URL.
+
+    Returns
+    -------
+    The configured :class:`dspy.LM` instance.
+    """
+    global _lm_configured
+    key = api_key or os.environ.get("GLM_API_KEY", "")
+    if not key:
+        raise RuntimeError(
+            "GLM_API_KEY not found. Set it in sts_agent/.env or as an env var."
+        )
+    lm = dspy.LM(f"openai/{model}", api_key=key, api_base=api_base)
+    dspy.configure(lm=lm)
+    _lm_configured = True
+    return lm
+
+
+def ensure_lm() -> None:
+    """Configure the LM with defaults on first use."""
+    if not _lm_configured:
+        configure_lm()
+
+
+# ---------------------------------------------------------------------------
+# Simulation tools (LLM-callable)
+# ---------------------------------------------------------------------------
+
+
+def _format_result(label: str, result: SimResult) -> str:
+    """Render a :class:`SimResult` as a compact string for the LLM."""
+    status = "SURVIVED" if result.survived else "DIED"
+    return (
+        f"{label}: {status} | "
+        f"damage_taken={result.damage_taken} | "
+        f"max_hp_gained={result.max_hp_gained} | "
+        f"final_hp={result.final_hp}/{result.final_max_hp} | "
+        f"turns={result.turns}"
+    )
+
+
+def _make_tools(
+    character: Character,
+    upcoming: list[tuple[str, str]],
+    seed: int,
+    budget_checker: callable,
+) -> list:
+    """Create tool callables bound to the current decision context.
+
+    Each tool checks the remaining time budget before running a simulation.
+    """
+
+    def simulate_upcoming(encounter_index: str) -> str:
+        """Simulate an upcoming encounter with the current deck (baseline).
+
+        Args:
+            encounter_index: 0-based index into the upcoming encounters list.
+        Returns:
+            Human-readable simulation result (survived, damage, HP, turns).
+        """
+        budget_checker()
+        idx = int(encounter_index)
+        if idx < 0 or idx >= len(upcoming):
+            return f"Error: index {idx} out of range [0, {len(upcoming) - 1}]"
+
+        enc_type, enc_id = upcoming[idx]
+        encounter_seed = seed * 1000 + idx
+        result = simulate_encounter(
+            character, enc_type, enc_id, encounter_seed,
+            max_nodes=5000, simulations=5000,
+        )
+        return _format_result(f"Baseline ({enc_type}/{enc_id})", result)
+
+    def try_card(card_id: str, encounter_index: str) -> str:
+        """Simulate an encounter with a hypothetical card added to the deck.
+
+        Args:
+            card_id: The card ID to evaluate (one of the reward choices).
+            encounter_index: 0-based index into the upcoming encounters list.
+        Returns:
+            Human-readable simulation result for the card + encounter.
+        """
+        budget_checker()
+        idx = int(encounter_index)
+        if idx < 0 or idx >= len(upcoming):
+            return f"Error: index {idx} out of range [0, {len(upcoming) - 1}]"
+
+        enc_type, enc_id = upcoming[idx]
+        encounter_seed = seed * 1000 + idx
+        result = simulate_with_card(
+            character, card_id, enc_type, enc_id, encounter_seed,
+            max_nodes=5000, simulations=5000,
+        )
+        return _format_result(f"With {card_id} vs {enc_type}/{enc_id}", result)
+
+    return [simulate_upcoming, try_card]
+
+
+# ---------------------------------------------------------------------------
+# dspy signature
+# ---------------------------------------------------------------------------
+
+
+class CardPickSignature(dspy.Signature):
+    """You are a Slay the Spire strategy expert deciding which card to pick from combat rewards.
+
+    Analyze the card choices using simulation tools to evaluate how each card
+    performs in upcoming encounters. Pick the card that best improves survivability.
+
+    If no card meaningfully helps, or the deck is already efficient, skip.
+
+    Card evaluation priorities for Ironclad:
+    1. Survivability — survive the encounter, minimize damage taken.
+    2. Max HP gains — Feed is extremely valuable.
+    3. Deck synergy — attack density, block consistency.
+    4. Upcoming difficulty — elites and boss need stronger cards.
+    """
+
+    character_state: str = dspy.InputField(
+        desc="Current character: HP, deck size, potions, relics, floor"
+    )
+    card_choices: str = dspy.InputField(
+        desc="3 card IDs offered as reward, comma-separated"
+    )
+    upcoming_encounters: str = dspy.InputField(
+        desc="Remaining encounters as index:type/id pairs, semicolon-separated"
+    )
+    reasoning: str = dspy.OutputField(
+        desc="Brief analysis of each card option based on simulation results"
+    )
+    pick: str = dspy.OutputField(
+        desc="Exact card ID to pick from the choices, or 'skip' to skip all rewards"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Strategy Agent
+# ---------------------------------------------------------------------------
+
+
+class StrategyAgent:
+    """LLM-based card-pick agent with simulation tools and timeout.
+
+    Parameters
+    ----------
+    timeout_seconds:
+        Wall-clock budget per card pick decision (default 300 s = 5 min).
+    model:
+        LM model name (default ``"glm-5.1"``).
+
+    Usage
+    -----
+    ::
+
+        agent = StrategyAgent(timeout_seconds=300)
+        pick = agent.pick_card(character, ["Anger", "Inflame", "Feed"],
+                               upcoming, seed=42)
+    """
+
+    def __init__(
+        self,
+        timeout_seconds: int = DEFAULT_TIMEOUT,
+        model: str = DEFAULT_MODEL,
+    ) -> None:
+        self.timeout = timeout_seconds
+        self.model = model
+        self._start_time: float = 0.0
+        self._timed_out: bool = False
+
+    # -- budget enforcement --------------------------------------------------
+
+    def _check_budget(self) -> None:
+        """Raise :class:`TimeoutError` if the decision budget is exhausted."""
+        if self._timed_out:
+            raise TimeoutError("Strategy budget already exceeded")
+        elapsed = time.time() - self._start_time
+        if elapsed > self.timeout:
+            self._timed_out = True
+            raise TimeoutError(
+                f"Strategy budget of {self.timeout}s exceeded "
+                f"(elapsed: {elapsed:.1f}s)"
+            )
+
+    # -- main entry point ----------------------------------------------------
+
+    def pick_card(
+        self,
+        character: Character,
+        card_choices: list[str],
+        upcoming_encounters: list[tuple[str, str]],
+        seed: int,
+    ) -> str | None:
+        """Pick a card from reward choices using LLM + simulation.
+
+        Parameters
+        ----------
+        character:
+            Current character state (deep-copied by simulate tools).
+        card_choices:
+            3 card IDs to choose from.
+        upcoming_encounters:
+            Remaining ``(type, id)`` encounters in the act.
+        seed:
+            Master seed for deterministic simulations.
+
+        Returns
+        -------
+        The picked card ID, or ``None`` if skipped.
+        """
+        ensure_lm()
+        self._start_time = time.time()
+        self._timed_out = False
+
+        # Format inputs for the LLM
+        char_state = character.summary()
+        choices_str = ", ".join(card_choices)
+        upcoming_str = "; ".join(
+            f"{i}: {t}/{e}" for i, (t, e) in enumerate(upcoming_encounters)
+        )
+
+        # Create context-bound tools
+        tools = _make_tools(
+            character, upcoming_encounters, seed, self._check_budget
+        )
+
+        try:
+            react = dspy.ReAct(CardPickSignature, tools=tools, max_iters=8)
+            result = react(
+                character_state=char_state,
+                card_choices=choices_str,
+                upcoming_encounters=upcoming_str,
+            )
+            raw_pick: str = getattr(result, "pick", "").strip()
+
+            if raw_pick.lower() in ("skip", "none", ""):
+                log.info("LLM strategy: skipped (%s)", card_choices)
+                return None
+
+            # Exact match (case-insensitive)
+            for choice in card_choices:
+                if choice.lower() == raw_pick.lower():
+                    log.info("LLM strategy: picked %s", choice)
+                    return choice
+
+            # Substring match (LLM sometimes adds spaces/words)
+            for choice in card_choices:
+                if (
+                    raw_pick.lower() in choice.lower()
+                    or choice.lower() in raw_pick.lower()
+                ):
+                    log.info(
+                        "LLM strategy: fuzzy-matched '%s' → %s",
+                        raw_pick, choice,
+                    )
+                    return choice
+
+            log.warning(
+                "LLM returned '%s' not matching choices %s; forced pick",
+                raw_pick, card_choices,
+            )
+            return self._forced_pick(character, card_choices, upcoming_encounters)
+
+        except TimeoutError:
+            elapsed = time.time() - self._start_time
+            log.warning(
+                "Strategy timeout after %.1fs; forced pick", elapsed,
+            )
+            return self._forced_pick(character, card_choices, upcoming_encounters)
+
+        except Exception as exc:
+            log.warning("Strategy agent error: %s; forced pick", exc)
+            return self._forced_pick(character, card_choices, upcoming_encounters)
+
+    # -- deterministic fallback ----------------------------------------------
+
+    @staticmethod
+    def _forced_pick(
+        character: Character,
+        card_choices: list[str],
+        upcoming_encounters: list[tuple[str, str]],
+    ) -> str | None:
+        """Deterministic fallback when the LLM fails or times out.
+
+        Priority: rare → uncommon → first card.
+        """
+        from sts_env.run.rewards import IRONCLAD_RARE_CARDS, IRONCLAD_UNCOMMON_CARDS
+
+        rare_set = set(IRONCLAD_RARE_CARDS)
+        uncommon_set = set(IRONCLAD_UNCOMMON_CARDS)
+
+        for c in card_choices:
+            if c in rare_set:
+                return c
+        for c in card_choices:
+            if c in uncommon_set:
+                return c
+        return card_choices[0] if card_choices else None

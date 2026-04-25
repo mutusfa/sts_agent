@@ -8,6 +8,7 @@ authors = [
 ]
 requires-python = ">=3.13"
 dependencies = [
+    "dspy-ai>=3.2.0",
     "sts-env",
 ]
 
