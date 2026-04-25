@@ -101,13 +101,16 @@ class _EdgeStats:
     _sum: float = 0.0
     _sum_sq: float = 0.0
     _max: float = -math.inf
+    deaths: int = 0  # rollouts that ended in player death (score >= start_hp)
 
-    def update(self, score: float) -> None:
+    def update(self, score: float, *, start_hp: float = math.inf) -> None:
         self.n += 1
         self._sum += score
         self._sum_sq += score * score
         if score > self._max:
             self._max = score
+        if score >= start_hp:
+            self.deaths += 1
 
     @property
     def mean(self) -> float:
@@ -345,7 +348,7 @@ class MCTSPlanner:
             for node, concept_key in path:
                 if concept_key not in node.edges:
                     node.edges[concept_key] = _EdgeStats()
-                node.edges[concept_key].update(score)
+                node.edges[concept_key].update(score, start_hp=start_hp)
 
             sims_run += 1
 
@@ -358,6 +361,7 @@ class MCTSPlanner:
             "std": best_edge.std,
             "max": best_edge.max if best_edge.n > 0 else math.nan,
             "n": float(best_edge.n),
+            "deaths": float(best_edge.deaths),
             "simulations": float(sims_run),
             "nodes": float(nodes_expanded),
         }

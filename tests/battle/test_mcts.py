@@ -116,7 +116,7 @@ def test_last_stats_populated():
     planner.act(combat)
 
     stats = planner.last_stats
-    required = {"mean", "std", "max", "n", "simulations", "nodes"}
+    required = {"mean", "std", "max", "n", "deaths", "simulations", "nodes"}
     assert required == set(stats.keys()), f"Missing keys: {required - set(stats.keys())}"
 
     assert stats["n"] > 0
