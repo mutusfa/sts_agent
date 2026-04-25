@@ -9,6 +9,7 @@ from __future__ import annotations
 import pytest
 
 from sts_env.combat import Action, Combat
+from sts_env.combat.card import Card
 from sts_env.combat.cards import CardType, get_spec
 from sts_env.combat.state import ActionType
 
@@ -57,16 +58,16 @@ def test_tree_search_picks_attack_not_end_turn():
     when a lethal line exists.
     """
     combat = _make_combat(enemy_hp=12)
-    combat._state.piles.hand = ["Strike", "Strike", "Defend"]
+    combat._state.piles.hand = [Card("Strike"), Card("Strike"), Card("Defend")]
 
     action = TreeSearchPlanner().act(combat)
 
     assert action.action_type == ActionType.PLAY_CARD, (
         "Planner chose END_TURN despite a 2-Strike lethal in hand"
     )
-    card_id = combat._state.piles.hand[action.hand_index]
-    assert get_spec(card_id).card_type == CardType.ATTACK, (
-        f"Planner played a non-attack ({card_id}) instead of a lethal Strike"
+    card = combat._state.piles.hand[action.hand_index]
+    assert get_spec(card.card_id).card_type == CardType.ATTACK, (
+        f"Planner played a non-attack ({card.card_id}) instead of a lethal Strike"
     )
 
 
@@ -243,7 +244,7 @@ def test_transposition_table_reduces_nodes():
     combat._state.enemies[0].max_hp = 50
     # Force a hand with 3 distinct card types → 6 orderings that all reach
     # the same state after END_TURN (Cultist T0 = Incantation, no damage).
-    combat._state.piles.hand = ["Strike", "Defend", "Bash", "Strike", "Defend"]
+    combat._state.piles.hand = [Card("Strike"), Card("Defend"), Card("Bash"), Card("Strike"), Card("Defend")]
 
     planner_tt = TreeSearchPlanner(use_transposition_table=True)
     planner_tt.act(combat)
@@ -293,11 +294,11 @@ def test_move_ordering_tries_bash_before_strike():
     Bash (tier 20) < Strike (tier 44) < Defend (tier 52) < END_TURN (tier 60).
     """
     combat = _make_combat(enemy_hp=50)
-    combat._state.piles.hand = ["Strike", "Bash", "Defend"]
+    combat._state.piles.hand = [Card("Strike"), Card("Bash"), Card("Defend")]
 
     actions = _ordered_actions(combat)
     cards = [
-        combat._state.piles.hand[a.hand_index]
+        combat._state.piles.hand[a.hand_index].card_id
         if a.action_type == ActionType.PLAY_CARD
         else "END_TURN"
         for a in actions
@@ -328,14 +329,14 @@ def test_move_ordering_targets_lowest_hp_first():
     combat._state.enemies[0].max_hp = 20
     combat._state.enemies[1].hp = 5
     combat._state.enemies[1].max_hp = 5
-    combat._state.piles.hand = ["Strike", "Defend"]
+    combat._state.piles.hand = [Card("Strike"), Card("Defend")]
 
     actions = _ordered_actions(combat)
     strike_actions = [
         a
         for a in actions
         if a.action_type == ActionType.PLAY_CARD
-        and combat._state.piles.hand[a.hand_index] == "Strike"
+        and combat._state.piles.hand[a.hand_index].card_id == "Strike"
     ]
     assert len(strike_actions) >= 2, "Expected Strike against each enemy"
     first_target_hp = combat._state.enemies[strike_actions[0].target_index].hp
@@ -368,7 +369,7 @@ def test_move_ordering_reduces_nodes_on_multi_enemy():
         combat.reset()
         combat._state.enemies[0].hp = combat._state.enemies[0].max_hp = 14
         combat._state.enemies[1].hp = combat._state.enemies[1].max_hp = 8
-        combat._state.piles.hand = ["Strike", "Strike", "Strike", "Defend", "Defend"]
+        combat._state.piles.hand = [Card("Strike"), Card("Strike"), Card("Strike"), Card("Defend"), Card("Defend")]
         planner.act(combat)
         return planner._last_node_count
 
@@ -429,6 +430,6 @@ def test_transposition_table_preserves_decision():
         if action_tt.action_type == ActionType.PLAY_CARD:
             card_tt = combat._state.piles.hand[action_tt.hand_index]
             card_no_tt = combat._state.piles.hand[action_no_tt.hand_index]
-            assert card_tt == card_no_tt, (
-                f"TT chose different card: {card_tt} vs {card_no_tt}"
+            assert card_tt.card_id == card_no_tt.card_id, (
+                f"TT chose different card: {card_tt.card_id} vs {card_no_tt.card_id}"
             )

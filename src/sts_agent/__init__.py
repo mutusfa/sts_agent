@@ -1,28 +1,14 @@
-from .battle import (
-    BattleAgent,
-    BattlePlanner,
-    MCTSPlanner,
-    RandomAgent,
-    SearchBudgetExceeded,
-    TreeSearchPlanner,
-    run_agent,
-    run_planner,
-    terminal_score,
-)
+"""Slay the Spire AI agent."""
+
+from .battle import RandomAgent, TreeSearchPlanner, MCTSPlanner
+from .battle.base import BattleAgent, BattlePlanner, run_agent, run_planner
 
 __all__ = [
+    "RandomAgent",
+    "TreeSearchPlanner",
+    "MCTSPlanner",
     "BattleAgent",
     "BattlePlanner",
-    "MCTSPlanner",
-    "RandomAgent",
-    "SearchBudgetExceeded",
-    "TreeSearchPlanner",
     "run_agent",
     "run_planner",
-    "terminal_score",
 ]
-
-
-def main() -> None:
-    from .cli import run
-    run()

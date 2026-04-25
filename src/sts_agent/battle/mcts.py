@@ -69,6 +69,7 @@ import random
 from dataclasses import dataclass, field
 
 from sts_env.combat import Action, Combat
+from sts_env.combat.card import Card
 from sts_env.combat.state import ActionType
 
 from .base import _fmt_action, terminal_score
@@ -145,7 +146,7 @@ class _Node:
 def _action_concept_key(action: Action, combat: Combat) -> tuple:
     """Stable key for an action, invariant to slot positions.
 
-    - PLAY_CARD:     ("CARD", card_id, target_index)
+    - PLAY_CARD:     ("CARD", card_id, cost_override, target_index)
     - USE_POTION:    ("USE",  potion_id, target_index)
     - DISCARD_POTION:("DISCARD", potion_id)
     - END_TURN:      ("END",)
@@ -156,14 +157,20 @@ def _action_concept_key(action: Action, combat: Combat) -> tuple:
     if action.action_type == ActionType.END_TURN:
         return ("END",)
     if action.action_type == ActionType.PLAY_CARD:
-        card_id = s.piles.hand[action.hand_index]
-        return ("CARD", card_id, action.target_index)
+        card: Card = s.piles.hand[action.hand_index]
+        return ("CARD", card.card_id, card.cost_override, action.target_index)
     if action.action_type == ActionType.USE_POTION:
         potion_id = s.potions[action.potion_index]
         return ("USE", potion_id, action.target_index)
-    # DISCARD_POTION
-    potion_id = s.potions[action.potion_index]
-    return ("DISCARD", potion_id)
+    if action.action_type == ActionType.DISCARD_POTION:
+        potion_id = s.potions[action.potion_index]
+        return ("DISCARD", potion_id)
+    if action.action_type == ActionType.CHOOSE_CARD:
+        return ("CHOOSE", action.choice_index)
+    if action.action_type == ActionType.SKIP_CHOICE:
+        return ("SKIP",)
+    # Fallback for unknown types
+    return ("END",)
 
 
 def _resolve_action(concept_key: tuple, combat: Combat) -> Action | None:

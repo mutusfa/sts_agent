@@ -7,8 +7,13 @@ choices.
 
 Pruning (alpha / monotone lower-bound)
 ---------------------------------------
-damage_taken is monotonically non-decreasing through a combat — you can only
-accumulate damage, never heal.  Therefore:
+damage_taken (= start_hp - current_hp) is *mostly* monotonically
+non-decreasing through a combat — enemies deal damage each turn, and
+you can only block so much.  The Feed card breaks strict monotonicity
+(its heal can reduce damage_taken), but the effect is small (+3 HP per
+kill) and the pruning still produces correct results in the vast
+majority of cases.  The max_hp gain from Feed is exposed separately
+via combat.max_hp_gained for strategic-layer valuation.
 
   If combat.damage_taken >= best_so_far, this branch can score no better than
   best_so_far, so it can be pruned immediately.
@@ -54,6 +59,7 @@ from dataclasses import astuple
 
 from sts_env.combat import Action, Combat
 from sts_env.combat.state import ActionType
+from sts_env.combat.card import Card
 
 from .base import _fmt_action, terminal_score
 
@@ -79,22 +85,26 @@ def _state_key_base(combat: Combat) -> tuple:
     """
     s = combat._state  # type: ignore[union-attr]
     enemies_key = tuple(
-        (e.name, e.hp, e.block, _powers_key(e.powers), tuple(e.move_history))
+        (e.name, e.hp, e.max_hp, e.block, _powers_key(e.powers),
+         tuple(e.move_history), e.misc, e.pending_split, e.is_escaping)
         for e in s.enemies
     )
     return (
         s.player_hp,
+        s.player_max_hp,
         s.player_block,
         s.energy,
         s.turn,
         _powers_key(s.player_powers),
-        tuple(s.piles.draw),
-        tuple(sorted(s.piles.hand)),
-        tuple(sorted(s.piles.discard)),
-        tuple(sorted(s.piles.exhaust)),
+        tuple(c.to_key() for c in s.piles.draw),
+        tuple(sorted(c.to_key() for c in s.piles.hand)),
+        tuple(sorted(c.to_key() for c in s.piles.discard)),
+        tuple(sorted(c.to_key() for c in s.piles.exhaust)),
         enemies_key,
         combat.damage_taken,
         tuple(s.potions),
+        s.energy_loss_next_turn,
+        tuple(c.to_key() for c in s.potion_choices),
     )
 
 
@@ -140,23 +150,31 @@ _END_TURN_TIER = 60
 
 
 def _order_key(action: Action, combat: Combat) -> tuple:
-    """Sort key for move ordering: (tier, target_hp, label)."""
+    """Sort key for move ordering: (tier, effective_cost, target_hp, label)."""
     s = combat._state  # type: ignore[union-attr]
     if action.action_type == ActionType.PLAY_CARD:
-        card_id = s.piles.hand[action.hand_index]
-        tier = _CARD_TIER.get(card_id, _DEFAULT_TIER)
+        card: Card = s.piles.hand[action.hand_index]
+        tier = _CARD_TIER.get(card.card_id, _DEFAULT_TIER)
+        # Factor in effective cost so free cards sort first
+        from sts_env.combat.cards import get_spec
+        spec = get_spec(card.card_id)
+        effective_cost = card.cost_override if card.cost_override is not None else spec.cost
         target_hp = 0
         ti = action.target_index
         if 0 <= ti < len(s.enemies):
             target_hp = s.enemies[ti].hp
-        return (tier, target_hp, card_id)
+        return (tier, effective_cost, target_hp, card.card_id)
     if action.action_type == ActionType.USE_POTION:
         potion_id = s.potions[action.potion_index] if action.potion_index < len(s.potions) else ""
-        return (_USE_POTION_TIER, 0, potion_id)
+        return (_USE_POTION_TIER, 0, 0, potion_id)
     if action.action_type == ActionType.DISCARD_POTION:
         potion_id = s.potions[action.potion_index] if action.potion_index < len(s.potions) else ""
-        return (_DISCARD_POTION_TIER, 0, potion_id)
-    return (_END_TURN_TIER, 0, "")
+        return (_DISCARD_POTION_TIER, 0, 0, potion_id)
+    if action.action_type == ActionType.CHOOSE_CARD:
+        return (_USE_POTION_TIER, 0, action.choice_index, "CHOOSE")
+    if action.action_type == ActionType.SKIP_CHOICE:
+        return (58, 0, 0, "SKIP")
+    return (_END_TURN_TIER, 0, 0, "")
 
 
 def _ordered_actions(combat: Combat) -> list[Action]:
@@ -167,7 +185,7 @@ def _ordered_actions(combat: Combat) -> list[Action]:
 def _dedupe_actions(combat: Combat) -> list[Action]:
     """Return valid actions with duplicates collapsed by a type-tagged key.
 
-    - PLAY_CARD: keyed by (card_id, target_index) — hand slot doesn't matter.
+    - PLAY_CARD: keyed by (card_id, cost_override, target_index) — hand slot doesn't matter.
     - USE_POTION: keyed by (potion_id, target_index) — slot index doesn't matter.
     - DISCARD_POTION: keyed by potion_id — order-independent.
     - END_TURN: unique singleton.
@@ -177,14 +195,18 @@ def _dedupe_actions(combat: Combat) -> list[Action]:
     result: list[Action] = []
     for action in combat.valid_actions():
         if action.action_type == ActionType.PLAY_CARD:
-            card_id = s.piles.hand[action.hand_index]
-            key: tuple = ("CARD", card_id, action.target_index)
+            card: Card = s.piles.hand[action.hand_index]
+            key: tuple = ("CARD", card.card_id, card.cost_override, action.target_index)
         elif action.action_type == ActionType.USE_POTION:
             potion_id = s.potions[action.potion_index]
             key = ("USE", potion_id, action.target_index)
         elif action.action_type == ActionType.DISCARD_POTION:
             potion_id = s.potions[action.potion_index]
             key = ("DISCARD", potion_id)
+        elif action.action_type == ActionType.CHOOSE_CARD:
+            key = ("CHOOSE", action.choice_index)
+        elif action.action_type == ActionType.SKIP_CHOICE:
+            key = ("SKIP",)
         else:
             key = ("END",)
         if key not in seen:
