@@ -130,7 +130,7 @@ class _Node:
 
     state_key: tuple
     # Actions not yet expanded (in priority order, pop from front).
-    # Stored as conceptual keys: (card_id, target_index) or ("END_TURN", -1).
+    # Stored as conceptual keys; see _action_concept_key for the key schema.
     untried_action_keys: list[tuple] = field(default_factory=list)
     # Edge stats keyed by conceptual action key.
     edges: dict[tuple, _EdgeStats] = field(default_factory=dict)
@@ -143,33 +143,42 @@ class _Node:
 
 
 def _action_concept_key(action: Action, combat: Combat) -> tuple:
-    """Stable key for an action: (card_id, target_index) for PLAY_CARD, or ("END_TURN", -1).
+    """Stable key for an action, invariant to slot positions.
 
-    Using card_id rather than hand_index makes the key invariant to hand slot
-    positions, which may differ across different simulation paths reaching the
-    same MCTS node.
+    - PLAY_CARD:     ("CARD", card_id, target_index)
+    - USE_POTION:    ("USE",  potion_id, target_index)
+    - DISCARD_POTION:("DISCARD", potion_id)
+    - END_TURN:      ("END",)
+
+    Mirrors the key shape used by _dedupe_actions so the two helpers stay in sync.
     """
+    s = combat._state  # type: ignore[union-attr]
     if action.action_type == ActionType.END_TURN:
-        return ("END_TURN", -1)
-    card_id = combat._state.piles.hand[action.hand_index]  # type: ignore[union-attr]
-    return (card_id, action.target_index)
+        return ("END",)
+    if action.action_type == ActionType.PLAY_CARD:
+        card_id = s.piles.hand[action.hand_index]
+        return ("CARD", card_id, action.target_index)
+    if action.action_type == ActionType.USE_POTION:
+        potion_id = s.potions[action.potion_index]
+        return ("USE", potion_id, action.target_index)
+    # DISCARD_POTION
+    potion_id = s.potions[action.potion_index]
+    return ("DISCARD", potion_id)
 
 
 def _resolve_action(concept_key: tuple, combat: Combat) -> Action | None:
     """Find a valid Action matching a conceptual key in the current combat state.
 
-    Returns None if the action is no longer legal (e.g. not enough energy).
+    Returns None if the action is no longer legal (e.g. card costs more energy
+    than available, or potion has already been used).
     """
-    card_id, target_index = concept_key
-    if card_id == "END_TURN":
+    tag = concept_key[0]
+    if tag == "END":
         return Action.end_turn()
     for action in combat.valid_actions():
         if action.action_type == ActionType.END_TURN:
             continue
-        if (
-            combat._state.piles.hand[action.hand_index] == card_id  # type: ignore[union-attr]
-            and action.target_index == target_index
-        ):
+        if _action_concept_key(action, combat) == concept_key:
             return action
     return None
 
@@ -279,7 +288,7 @@ class MCTSPlanner:
                 if action is None:
                     # Action no longer valid in this sim path — fall back to END_TURN
                     action = Action.end_turn()
-                    concept_key = ("END_TURN", -1)
+                    concept_key = ("END",)
                 path.append((current_node, concept_key))
                 current_combat.step(action)
                 child_key = _mcts_state_key(current_combat)
@@ -304,7 +313,7 @@ class MCTSPlanner:
                 action = _resolve_action(concept_key, current_combat)
                 if action is None:
                     action = Action.end_turn()
-                    concept_key = ("END_TURN", -1)
+                    concept_key = ("END",)
                 path.append((current_node, concept_key))
                 current_combat.step(action)
                 child_key = _mcts_state_key(current_combat)
@@ -398,7 +407,7 @@ class MCTSPlanner:
         if not root.edges:
             dummy = _EdgeStats()
             dummy.update(math.inf)
-            fallback = root.untried_action_keys[0] if root.untried_action_keys else ("END_TURN", -1)
+            fallback = root.untried_action_keys[0] if root.untried_action_keys else ("END",)
             return fallback, dummy
 
         best_key = min(root.edges, key=lambda k: root.edges[k].mean)

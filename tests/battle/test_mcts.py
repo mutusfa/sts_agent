@@ -10,8 +10,9 @@ import math
 import pytest
 
 from sts_env.combat import Combat
+from sts_env.combat.encounters import IRONCLAD_STARTER
 
-from sts_agent.battle import MCTSPlanner
+from sts_agent.battle import MCTSPlanner, run_planner
 from sts_agent.battle.mcts import _mcts_state_key
 
 
@@ -223,3 +224,33 @@ def test_tree_reused_across_deterministic_turn_boundary():
     assert cross_turn_hit, (
         "No cross-turn cache hit observed — reuse did not survive an END_TURN"
     )
+
+
+# ---------------------------------------------------------------------------
+# 8. BlockPotion reduces damage on AcidSlimeL
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.slow
+def test_block_potion_reduces_acid_slime_l_damage():
+    """Agent given a BlockPotion should clear AcidSlimeL with ≤26 damage.
+
+    Without the potion, the baseline is 34 damage.  A BlockPotion grants 12
+    block (enough to absorb one of the slime's corrosive-spit hits), so the
+    optimal planner should hold off playing the potion until the right moment
+    and finish with at most 26 damage taken.
+    """
+    baseline = Combat(IRONCLAD_STARTER, ["AcidSlimeL", "Empty"], seed=0, player_hp=80)
+    with_potion = Combat(
+        IRONCLAD_STARTER,
+        ["AcidSlimeL", "Empty"],
+        seed=0,
+        player_hp=80,
+        potions=["BlockPotion"],
+    )
+
+    base_dmg = run_planner(MCTSPlanner(simulations=2000, seed=0), baseline)
+    pot_dmg = run_planner(MCTSPlanner(simulations=2000, seed=0), with_potion)
+
+    assert base_dmg == 34, f"Baseline changed: expected 34, got {base_dmg}"
+    assert pot_dmg <= 26, f"BlockPotion didn't help enough: {pot_dmg} > 26"

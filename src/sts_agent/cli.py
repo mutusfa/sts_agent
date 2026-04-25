@@ -34,7 +34,7 @@ import inspect
 import logging
 import sys
 
-from sts_env.combat import encounters
+from sts_env.combat import Combat, encounters
 
 from .battle import MCTSPlanner, RandomAgent, TreeSearchPlanner, run_agent, run_planner
 from .battle.tree_search import SearchBudgetExceeded
@@ -112,6 +112,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Node expansion budget (tree and mcts agents; default: unlimited).",
     )
     battle.add_argument(
+        "--potions",
+        nargs="*",
+        default=[],
+        metavar="POTION_ID",
+        help="Potions to start with (e.g. BlockPotion EnergyPotion).",
+    )
+    battle.add_argument(
         "-v",
         "--verbose",
         action="count",
@@ -148,6 +155,15 @@ def run(argv: list[str] | None = None) -> None:
 
 def _run_battle(args: argparse.Namespace) -> None:
     combat = _ENCOUNTERS[args.encounter](args.seed, player_hp=args.player_hp)
+    if args.potions:
+        # Rebuild with potions using the same deck/enemies resolved by the factory.
+        combat = Combat(
+            deck=combat._deck,  # type: ignore[union-attr]
+            enemies=combat._enemy_names,  # type: ignore[union-attr]
+            seed=args.seed,
+            player_hp=args.player_hp,
+            potions=args.potions,
+        )
 
     mcts_planner: MCTSPlanner | None = None
     try:

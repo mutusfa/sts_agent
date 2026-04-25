@@ -94,6 +94,7 @@ def _state_key_base(combat: Combat) -> tuple:
         tuple(sorted(s.piles.exhaust)),
         enemies_key,
         combat.damage_taken,
+        tuple(s.potions),
     )
 
 
@@ -111,14 +112,16 @@ def _state_key(combat: Combat) -> tuple:
 # Move ordering
 # ---------------------------------------------------------------------------
 
-# Per-card priority — lower = tried first.  Spaced by 10 so new cards can
+# Per-action priority — lower = tried first.  Spaced by 10 so new entries can
 # slot between tiers without renumbering.
 #
 #  10   (reserved for POWER cards — none implemented yet)
 #  20   cards that apply lasting effects this turn (Bash → Vulnerable)
+#  25   USE_POTION — defensive/utility potions best used before taking damage
 #  30   free (cost-0) cards — always play, they cost nothing
 #  40-49 attack-dominant cards, ranked by expected damage/energy
 #  50-59 block/defensive skills, ranked by expected block/energy
+#  59   DISCARD_POTION — almost never useful; try last before END_TURN
 #  60   END_TURN (always last)
 _CARD_TIER: dict[str, int] = {
     "Bash": 20,
@@ -131,21 +134,29 @@ _CARD_TIER: dict[str, int] = {
     "Defend": 52,
 }
 _DEFAULT_TIER = 44  # unknown card → Strike-equivalent (safe middle)
-_END_TURN_TIER = 60  # always last
+_USE_POTION_TIER = 25
+_DISCARD_POTION_TIER = 59
+_END_TURN_TIER = 60
 
 
 def _order_key(action: Action, combat: Combat) -> tuple:
-    """Sort key for move ordering: (tier, target_hp, card_id)."""
-    if action.action_type != ActionType.PLAY_CARD:
-        return (_END_TURN_TIER, 0, "")
-    card_id = combat._state.piles.hand[action.hand_index]  # type: ignore[union-attr]
-    tier = _CARD_TIER.get(card_id, _DEFAULT_TIER)
-    target_hp = 0
-    ti = action.target_index
-    enemies = combat._state.enemies  # type: ignore[union-attr]
-    if 0 <= ti < len(enemies):
-        target_hp = enemies[ti].hp
-    return (tier, target_hp, card_id)
+    """Sort key for move ordering: (tier, target_hp, label)."""
+    s = combat._state  # type: ignore[union-attr]
+    if action.action_type == ActionType.PLAY_CARD:
+        card_id = s.piles.hand[action.hand_index]
+        tier = _CARD_TIER.get(card_id, _DEFAULT_TIER)
+        target_hp = 0
+        ti = action.target_index
+        if 0 <= ti < len(s.enemies):
+            target_hp = s.enemies[ti].hp
+        return (tier, target_hp, card_id)
+    if action.action_type == ActionType.USE_POTION:
+        potion_id = s.potions[action.potion_index] if action.potion_index < len(s.potions) else ""
+        return (_USE_POTION_TIER, 0, potion_id)
+    if action.action_type == ActionType.DISCARD_POTION:
+        potion_id = s.potions[action.potion_index] if action.potion_index < len(s.potions) else ""
+        return (_DISCARD_POTION_TIER, 0, potion_id)
+    return (_END_TURN_TIER, 0, "")
 
 
 def _ordered_actions(combat: Combat) -> list[Action]:
@@ -154,20 +165,28 @@ def _ordered_actions(combat: Combat) -> list[Action]:
 
 
 def _dedupe_actions(combat: Combat) -> list[Action]:
-    """Return valid actions with duplicates collapsed by (card_id, target_index).
+    """Return valid actions with duplicates collapsed by a type-tagged key.
 
-    For PLAY_CARD actions: two actions with the same card_id and target_index
-    lead to identical game states regardless of which hand slot was used.
-    END_TURN is unique.
+    - PLAY_CARD: keyed by (card_id, target_index) — hand slot doesn't matter.
+    - USE_POTION: keyed by (potion_id, target_index) — slot index doesn't matter.
+    - DISCARD_POTION: keyed by potion_id — order-independent.
+    - END_TURN: unique singleton.
     """
+    s = combat._state  # type: ignore[union-attr]
     seen: set[tuple] = set()
     result: list[Action] = []
     for action in combat.valid_actions():
         if action.action_type == ActionType.PLAY_CARD:
-            card_id = combat._state.piles.hand[action.hand_index]  # type: ignore[union-attr]
-            key = (card_id, action.target_index)
+            card_id = s.piles.hand[action.hand_index]
+            key: tuple = ("CARD", card_id, action.target_index)
+        elif action.action_type == ActionType.USE_POTION:
+            potion_id = s.potions[action.potion_index]
+            key = ("USE", potion_id, action.target_index)
+        elif action.action_type == ActionType.DISCARD_POTION:
+            potion_id = s.potions[action.potion_index]
+            key = ("DISCARD", potion_id)
         else:
-            key = (ActionType.END_TURN,)
+            key = ("END",)
         if key not in seen:
             seen.add(key)
             result.append(action)
