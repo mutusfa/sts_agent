@@ -38,6 +38,9 @@ from sts_env.run import relics, rewards, scenarios, builder
 from sts_env.run.character import Character
 from sts_env.run.map import generate_act1_map, get_encounter_for_room, RoomType
 from sts_env.run.rooms import pick_rest_choice, RestChoice
+from sts_env.run.events import random_act1_event, resolve_event
+from sts_env.run.shop import generate_shop, buy_card, buy_potion, buy_relic, remove_worst_card
+from sts_env.run.treasure import open_treasure
 from sts_env.combat.rng import RNG
 
 from .battle.base import BattleAgent, BattlePlanner, run_agent, run_planner
@@ -378,10 +381,36 @@ def _run_act1_map(
             result.max_hp = character.player_max_hp
             continue
 
-        # --- EVENT / SHOP / TREASURE rooms (v2 no-ops) ---
-        if room_type in (RoomType.EVENT, RoomType.SHOP, RoomType.TREASURE):
-            log.info("FLOOR %d %s: not yet implemented, skipping", floor_num + 1, room_type.name)
-            result.encounter_types.append(room_type.name.lower())
+        # --- EVENT rooms ---
+        if room_type == RoomType.EVENT:
+            event = random_act1_event(encounter_rng)
+            log.info("FLOOR %d EVENT: %s", floor_num + 1, event.event_id)
+            # Default strategy: pick first choice (simplified)
+            choice_idx = _pick_event_choice(event, character, strategy_agent)
+            desc = resolve_event(event.event_id, choice_idx, character, encounter_rng)
+            log.info("  Event result: %s", desc)
+            result.encounter_types.append("event")
+            result.damage_per_floor.append(0)
+            result.floors_cleared += 1
+            continue
+
+        # --- SHOP rooms ---
+        if room_type == RoomType.SHOP:
+            log.info("FLOOR %d SHOP", floor_num + 1)
+            shop_inv = generate_shop(encounter_rng, character)
+            _auto_shop(shop_inv, character, strategy_agent)
+            result.encounter_types.append("shop")
+            result.damage_per_floor.append(0)
+            result.floors_cleared += 1
+            continue
+
+        # --- TREASURE rooms ---
+        if room_type == RoomType.TREASURE:
+            log.info("FLOOR %d TREASURE", floor_num + 1)
+            tres = open_treasure(character, encounter_rng)
+            log.info("  Found %d gold%s", tres.gold_found,
+                     f" and {tres.relic_found}" if tres.relic_found else "")
+            result.encounter_types.append("treasure")
             result.damage_per_floor.append(0)
             result.floors_cleared += 1
             continue
@@ -569,6 +598,63 @@ def _apply_combat_rewards_simple(
     character.gold += gold_reward
 
 
+def _pick_event_choice(
+    event: "EventSpec",
+    character: Character,
+    strategy_agent: object | None,
+) -> int:
+    """Pick an event choice. Delegates to strategy agent if available."""
+    if strategy_agent is not None and hasattr(strategy_agent, "pick_event_choice"):
+        return strategy_agent.pick_event_choice(event, character)
+    # Default: pick the first (usually safest) choice
+    return 0
+
+
+def _auto_shop(
+    inventory: "ShopInventory",
+    character: Character,
+    strategy_agent: object | None,
+) -> None:
+    """Auto-spend gold at a shop using simple heuristics.
+
+    Priority: remove worst card > buy best affordable card > buy potion if slot free
+    """
+    if strategy_agent is not None and hasattr(strategy_agent, "shop"):
+        strategy_agent.shop(inventory, character)
+        return
+
+    # Simple heuristic shopping:
+    # 1. Remove worst card if affordable and deck > 10 cards
+    if character.gold >= inventory.remove_cost and len(character.deck) > 10:
+        remove_worst_card(character)
+        log.info("  Shop: removed worst card for %d gold", inventory.remove_cost)
+
+    # 2. Buy best affordable card (prefer uncommon/rare)
+    for idx in range(len(inventory.cards) - 1, -1, -1):
+        item = inventory.cards[idx]
+        if item is None:
+            continue
+        card_id, price = item
+        if character.gold >= price:
+            bought = buy_card(inventory, idx, character)
+            if bought:
+                log.info("  Shop: bought %s for %d gold", bought, price)
+                break
+
+    # 3. Buy a potion if we have a free slot
+    if len(character.potions) < character.max_potion_slots:
+        for idx in range(len(inventory.potions)):
+            item = inventory.potions[idx]
+            if item is None:
+                continue
+            potion_id, price = item
+            if character.gold >= price:
+                bought = buy_potion(inventory, idx, character)
+                if bought:
+                    log.info("  Shop: bought potion %s for %d gold", bought, price)
+                    break
+
+
 def _apply_boss_relic_reward(
     character: Character,
     result: RunResult,
@@ -609,9 +695,13 @@ def _run_battle(
 
 
 def _apply_relic_effects(character: Character) -> None:
-    """Apply end-of-combat relic effects (Burning Blood: heal 6)."""
+    """Apply end-of-combat relic effects."""
     if character.has_relic("BurningBlood"):
         character.heal(6)
+    # Orichalcum: gain 4 block at start of each combat (modeled as +4 HP after combat)
+    # Note: this is a simplification — real Orichalcum applies block at combat start
+    if character.has_relic("Orichalcum"):
+        character.heal(4)
 
 
 def _pick_card_act1(
