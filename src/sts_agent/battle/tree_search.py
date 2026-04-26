@@ -104,7 +104,12 @@ def _state_key_base(combat: Combat) -> tuple:
         combat.damage_taken,
         tuple(s.potions),
         s.energy_loss_next_turn,
-        tuple(c.to_key() for c in s.pending_choices),
+        s.rampage_extra,
+        tuple(
+            (type(f).__name__, tuple(c.to_key() for c in f.choices))
+            if hasattr(f, 'choices') else (type(f).__name__, f.label)
+            for f in s.pending_stack
+        ),
     )
 
 
