@@ -104,7 +104,7 @@ def _state_key_base(combat: Combat) -> tuple:
         combat.damage_taken,
         tuple(s.potions),
         s.energy_loss_next_turn,
-        tuple(c.to_key() for c in s.potion_choices),
+        tuple(c.to_key() for c in s.pending_choices),
     )
 
 
