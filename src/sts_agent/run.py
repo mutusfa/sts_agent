@@ -201,9 +201,10 @@ def run_scenario3(
             result.final_hp = 0
             return result
 
-        # Won the combat — apply rewards
+        # Won the combat — sync state back
         run_state.player_hp = obs.player_hp
         run_state.player_max_hp = obs.player_max_hp
+        run_state.potions = list(combat._state.potions)
         result.final_hp = run_state.player_hp
 
         # Apply relic effects (Burning Blood: heal 6)
@@ -300,6 +301,7 @@ def _run_act1_linear(
 
         character.player_hp = obs.player_hp
         character.player_max_hp = obs.player_max_hp
+        character.potions = list(combat._state.potions)
         _apply_relic_effects(character)
         result.final_hp = character.player_hp
         result.max_hp = character.player_max_hp
@@ -443,6 +445,7 @@ def _run_act1_map(
 
         character.player_hp = obs.player_hp
         character.player_max_hp = obs.player_max_hp
+        character.potions = list(combat._state.potions)
         _apply_relic_effects(character)
         result.final_hp = character.player_hp
         result.max_hp = character.player_max_hp
