@@ -243,9 +243,10 @@ class SimStrategyAgent:
 
         path: list[tuple[int, int]] = []
         floor0_nodes = sts_map.nodes.get(0, [])
-        if not floor0_nodes:
+        start_node = next((n for n in floor0_nodes if n.edges), None)
+        if not start_node:
             return path
-        current = (0, floor0_nodes[0].x)
+        current = (0, start_node.x)
         path.append(current)
 
         from random import Random

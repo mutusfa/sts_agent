@@ -491,11 +491,12 @@ def _pick_path(
     # Greedy: walk from floor 0 to 14, at each step pick the "best" next node
     path: list[tuple[int, int]] = []
 
-    # Start from the first available node on floor 0
+    # Start from the first reachable node on floor 0
     floor0_nodes = sts_map.nodes.get(0, [])
-    if not floor0_nodes:
+    start_node = next((n for n in floor0_nodes if n.edges), None)
+    if not start_node:
         return path
-    current = (0, floor0_nodes[0].x)
+    current = (0, start_node.x)
     path.append(current)
 
     # Priority: we want fights early (for card rewards), rest when hurt,
