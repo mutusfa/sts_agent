@@ -370,10 +370,11 @@ class StrategyAgent:
 
         Priority: rare → uncommon → first card.
         """
-        from sts_env.run.rewards import IRONCLAD_RARE_CARDS, IRONCLAD_UNCOMMON_CARDS
+        from sts_env.combat.card_pools import pool
+        from sts_env.combat.cards import CardColor, Rarity
 
-        rare_set = set(IRONCLAD_RARE_CARDS)
-        uncommon_set = set(IRONCLAD_UNCOMMON_CARDS)
+        rare_set = set(pool(CardColor.RED, Rarity.RARE))
+        uncommon_set = set(pool(CardColor.RED, Rarity.UNCOMMON))
 
         for c in card_choices:
             if c in rare_set:

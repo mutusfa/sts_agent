@@ -28,7 +28,8 @@ import logging
 from dataclasses import dataclass, field
 
 from sts_env.run.character import Character
-from sts_env.run.rewards import IRONCLAD_RARE_CARDS, IRONCLAD_UNCOMMON_CARDS
+from sts_env.combat.card_pools import pool
+from sts_env.combat.cards import CardColor, Rarity
 from .simulate import SimDistribution, probe_encounter, probe_with_card
 
 log = logging.getLogger(__name__)
@@ -68,8 +69,8 @@ class CardEvaluation:
         return f"{self.total_deaths / self.total_rollouts:.0%}"
 
 
-_RARE_SET = set(IRONCLAD_RARE_CARDS)
-_UNCOMMON_SET = set(IRONCLAD_UNCOMMON_CARDS)
+_RARE_SET = set(pool(CardColor.RED, Rarity.RARE))
+_UNCOMMON_SET = set(pool(CardColor.RED, Rarity.UNCOMMON))
 
 
 def _rarity_rank(card_id: str | None) -> int:
