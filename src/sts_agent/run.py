@@ -350,6 +350,10 @@ def _run_act1_map(
     sts_map = generate_act1_map(seed)
     encounter_rng = RNG(seed ^ 0xCAFE)
 
+    # Pre-generate encounter queues (faithful to real StS)
+    from sts_env.run.encounter_queue import EncounterQueue
+    encounter_queue = EncounterQueue(encounter_rng)
+
     # Choose a path through the map
     path = _pick_path(sts_map, character, strategy_agent, seed)
     total_floors = len(path)
@@ -427,7 +431,7 @@ def _run_act1_map(
             continue
 
         # --- Combat rooms (MONSTER / ELITE / BOSS) ---
-        encounter_id = get_encounter_for_room(room_type, encounter_rng)
+        encounter_id = get_encounter_for_room(room_type, encounter_queue)
         if encounter_id is None:
             log.warning("FLOOR %d %s: no encounter assigned, skipping", floor_num + 1, room_type.name)
             continue

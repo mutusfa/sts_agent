@@ -251,7 +251,10 @@ class SimStrategyAgent:
         path.append(current)
 
         from random import Random
+        from sts_env.run.encounter_queue import EncounterQueue
+        from sts_env.combat.rng import RNG as StsRNG
         rng = Random(seed ^ 0xBEEF)
+        encounter_queue = EncounterQueue(StsRNG(seed ^ 0xBEEF))
 
         while True:
             f, x = current
@@ -265,7 +268,7 @@ class SimStrategyAgent:
             else:
                 # Fork — evaluate branches
                 next_coord = self._pick_branch(
-                    sts_map, character, node, rng, seed,
+                    sts_map, character, node, rng, seed, encounter_queue,
                 )
 
             path.append(next_coord)
@@ -282,6 +285,7 @@ class SimStrategyAgent:
         node: "MapNode",
         rng: "Random",
         seed: int,
+        encounter_queue: "EncounterQueue",
     ) -> tuple[int, int]:
         """Evaluate branches at a fork and pick the best one.
 
@@ -306,7 +310,7 @@ class SimStrategyAgent:
                 continue
 
             score = self._score_branch(
-                sts_map, character, next_node, hp_ratio, rng, seed,
+                sts_map, character, next_node, hp_ratio, rng, seed, encounter_queue,
             )
             if score > best_score:
                 best_score = score
@@ -322,6 +326,7 @@ class SimStrategyAgent:
         hp_ratio: float,
         rng: "Random",
         seed: int,
+        encounter_queue: "EncounterQueue",
     ) -> tuple:
         """Score a branch for path selection.
 
@@ -343,7 +348,7 @@ class SimStrategyAgent:
             return (0.0, 0.0, 1)
 
         # --- Combat rooms (MONSTER/ELITE/BOSS) ---
-        encounter_id = get_encounter_for_room(room_type, rng)
+        encounter_id = get_encounter_for_room(room_type, encounter_queue)
         if encounter_id is None:
             return (0.0, 0.0, 2)
 
