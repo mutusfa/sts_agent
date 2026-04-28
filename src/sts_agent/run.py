@@ -459,6 +459,7 @@ def _run_act1_map(
         character.player_hp = obs.player_hp
         character.player_max_hp = obs.player_max_hp
         character.potions = list(combat._state.potions)
+        builder.sync_combat_counters(character, combat)
         _apply_relic_effects(character)
         result.final_hp = character.player_hp
         result.max_hp = character.player_max_hp
