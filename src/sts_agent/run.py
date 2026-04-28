@@ -41,6 +41,7 @@ from sts_env.run.rooms import pick_rest_choice, RestChoice
 from sts_env.run.events import random_act1_event, resolve_event
 from sts_env.run.shop import generate_shop, buy_card, buy_potion, buy_relic, remove_worst_card
 from sts_env.run.treasure import open_treasure
+from sts_env.run.neow import NeowChoice, roll_neow_options, apply_neow
 from sts_env.combat.rng import RNG
 
 from .battle.base import BattleAgent, BattlePlanner, run_agent, run_planner
@@ -107,6 +108,13 @@ def run_act1(
     """
     character = Character.ironclad()
     reward_rng = RNG(seed ^ 0xBEEF)
+    neow_rng = RNG(seed ^ 0xCA7)
+
+    # --- Neow's blessing (before any floor) ---
+    neow_options = roll_neow_options(neow_rng)
+    neow_pick = _pick_neow_option(neow_options)
+    neow_desc = apply_neow(neow_pick, character, neow_rng)
+    log.info("NEOW: %s", neow_desc)
 
     if use_map:
         return _run_act1_map(
@@ -219,7 +227,7 @@ def run_scenario3(
 
         # Card reward: pick one of 3 cards (or skip)
         is_elite = encounter_type == "elite"
-        card_choices = rewards.roll_card_rewards(reward_rng, is_elite=is_elite)
+        card_choices = rewards.roll_card_rewards(reward_rng, is_elite=is_elite, event_bus=run_state.event_bus)
         picked = _pick_card(card_choices, card_pick_strategy, reward_rng)
         if picked is not None:
             run_state.add_card(picked)
@@ -385,7 +393,8 @@ def _run_act1_map(
 
         # --- EVENT rooms ---
         if room_type == RoomType.EVENT:
-            event = random_act1_event(encounter_rng)
+            event = random_act1_event(encounter_rng, character.seen_events)
+            character.seen_events.append(event.event_id)
             log.info("FLOOR %d EVENT: %s", floor_num + 1, event.event_id)
             # Default strategy: pick first choice (simplified)
             choice_idx = _pick_event_choice(event, character, strategy_agent)
@@ -531,7 +540,7 @@ def _apply_combat_rewards(
 ) -> None:
     """Apply post-combat rewards (linear mode with remaining encounters)."""
     is_elite = encounter_type == "elite"
-    card_choices = rewards.roll_card_rewards(reward_rng, is_elite=is_elite)
+    card_choices = rewards.roll_card_rewards(reward_rng, is_elite=is_elite, event_bus=character.event_bus)
     remaining = encounter_list[floor_idx + 1:]
 
     picked = _pick_card_act1(
@@ -574,7 +583,7 @@ def _apply_combat_rewards_simple(
 ) -> None:
     """Apply post-combat rewards (map mode — no remaining encounters list)."""
     is_elite = encounter_type == "elite"
-    card_choices = rewards.roll_card_rewards(reward_rng, is_elite=is_elite)
+    card_choices = rewards.roll_card_rewards(reward_rng, is_elite=is_elite, event_bus=character.event_bus)
 
     # Use strategy agent if available, else fallback
     if strategy_agent is not None and hasattr(strategy_agent, "pick_card"):
@@ -677,7 +686,7 @@ def _apply_boss_relic_reward(
     available = [r for r in _BOSS_RELICS if not character.has_relic(r)]
     if available:
         relic = rng.choice(available)
-        character.relics.append(relic)
+        character.add_relic(relic)
         log.info("  Boss relic reward: %s", relic)
 
 
@@ -749,3 +758,23 @@ def _pick_card(
         return None
     # "random" — any card is generally better than starter cards early in the run
     return rng.choice(choices)
+
+
+def _pick_neow_option(options: list) -> NeowChoice:
+    """Pick a Neow blessing using a simple heuristic.
+
+    Priority: MAX_HP > REMOVE_CARD > RANDOM_RELIC > RANDOM_CARD.
+    Max HP and card removal are the most consistently useful early bonuses.
+    """
+    preference_order = [
+        NeowChoice.MAX_HP,
+        NeowChoice.REMOVE_CARD,
+        NeowChoice.RANDOM_RELIC,
+        NeowChoice.RANDOM_CARD,
+    ]
+    for preferred in preference_order:
+        for opt in options:
+            if opt.choice == preferred:
+                return opt.choice
+    # Fallback: first option
+    return options[0].choice
