@@ -62,7 +62,11 @@ def terminal_score(combat: Combat) -> int:
 # Format helpers
 # ---------------------------------------------------------------------------
 
-def _fmt_action(action: Action, hand: list[Card]) -> str:
+def _card_id(c) -> str:
+    """Extract card_id from an observation hand item (dict or Card)."""
+    return c["card_id"] if isinstance(c, dict) else c.card_id
+
+def _fmt_action(action: Action, hand: list) -> str:
     """Compact human-readable action string."""
     if action.action_type == ActionType.END_TURN:
         return "END_TURN"
@@ -71,7 +75,7 @@ def _fmt_action(action: Action, hand: list[Card]) -> str:
     if action.action_type == ActionType.SKIP_CHOICE:
         return "SKIP_CHOICE"
     card_obj = hand[action.hand_index] if action.hand_index < len(hand) else None
-    card = card_obj.card_id if card_obj else "?"
+    card = card_obj["card_id"] if isinstance(card_obj, dict) else (card_obj.card_id if card_obj else "?")
     return f"{card}→E{action.target_index}"
 
 
@@ -133,7 +137,7 @@ def _fmt_obs(obs: Observation) -> str:
         return f"{name}({hp}/{max_hp} blk:{blk}{powers_part} {_fmt_enemy_intent(e)})"
 
     enemies = " ".join(_fmt_enemy(e) for e in obs.enemies)
-    hand = ",".join(c.card_id for c in obs.hand)
+    hand = ",".join(_card_id(c) for c in obs.hand)
     player_powers_str = _fmt_powers(obs.player_powers, _PLAYER_POWER_ABBREV)
     player_powers_part = f" [{player_powers_str}]" if player_powers_str else ""
     return (
@@ -154,7 +158,7 @@ def run_agent(agent: BattleAgent, combat: Combat) -> int:
     obs = combat.reset()
 
     enemy_names = ", ".join(e.name for e in obs.enemies)
-    hand_str = ",".join(c.card_id for c in obs.hand)
+    hand_str = ",".join(_card_id(c) for c in obs.hand)
     log.info("START agent=%s enemies=[%s] player_hp=%d/%d hand=%s",
              type(agent).__name__, enemy_names,
              obs.player_hp, obs.player_max_hp, hand_str)
@@ -183,7 +187,7 @@ def run_planner(planner: BattlePlanner, combat: Combat) -> int:
     obs = combat.reset()
 
     enemy_names = ", ".join(e.name for e in obs.enemies)
-    hand_str = ",".join(c.card_id for c in obs.hand)
+    hand_str = ",".join(_card_id(c) for c in obs.hand)
     log.info("START planner=%s enemies=[%s] player_hp=%d/%d hand=%s",
              type(planner).__name__, enemy_names,
              obs.player_hp, obs.player_max_hp, hand_str)

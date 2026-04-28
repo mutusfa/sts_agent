@@ -71,7 +71,12 @@ class SearchBudgetExceeded(Exception):
 
 
 def _powers_key(powers) -> tuple:  # type: ignore[no-untyped-def]
-    return astuple(powers)
+    raw = astuple(powers)
+    # bomb_fuses is a list[tuple] — must be converted to tuple for hashability
+    return tuple(
+        tuple(v) if isinstance(v, list) else v
+        for v in raw
+    )
 
 
 def _state_key_base(combat: Combat) -> tuple:
