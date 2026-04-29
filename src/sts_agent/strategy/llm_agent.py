@@ -34,6 +34,7 @@ import time
 from pathlib import Path
 
 import dspy
+import mlflow
 
 from sts_env.run.character import Character
 
@@ -64,8 +65,8 @@ _load_env()
 # LM configuration
 # ---------------------------------------------------------------------------
 
-ZAI_API_BASE = "https://open.bigmodel.cn/api/paas/v4/"
-DEFAULT_MODEL = "glm-5.1"
+ZAI_API_BASE = "https://open.bigmodel.cn/api/coding/paas/v4/"
+DEFAULT_MODEL = "glm-4.5-air"
 DEFAULT_TIMEOUT = 300  # seconds (5 min)
 
 _lm_configured = False
@@ -270,6 +271,7 @@ class StrategyAgent:
 
     # -- main entry point ----------------------------------------------------
 
+    @mlflow.trace(name="pick_card")
     def pick_card(
         self,
         character: Character,
@@ -298,12 +300,19 @@ class StrategyAgent:
         self._start_time = time.time()
         self._timed_out = False
 
-        # Format inputs for the LLM
-        char_state = character.summary()
         choices_str = ", ".join(card_choices)
         upcoming_str = "; ".join(
             f"{i}: {t}/{e}" for i, (t, e) in enumerate(upcoming_encounters)
         )
+
+        span = mlflow.get_current_active_span()
+        if span:
+            span.set_attributes({
+                "character_state": character.summary(),
+                "card_choices": choices_str,
+                "upcoming_encounters": upcoming_str,
+                "seed": seed,
+            })
 
         # Create context-bound tools
         tools = _make_tools(
@@ -313,7 +322,7 @@ class StrategyAgent:
         try:
             react = dspy.ReAct(CardPickSignature, tools=tools, max_iters=8)
             result = react(
-                character_state=char_state,
+                character_state=character.summary(),
                 card_choices=choices_str,
                 upcoming_encounters=upcoming_str,
             )
@@ -321,12 +330,14 @@ class StrategyAgent:
 
             if raw_pick.lower() in ("skip", "none", ""):
                 log.info("LLM strategy: skipped (%s)", card_choices)
+                self._set_pick_attrs(None, fallback=False)
                 return None
 
             # Exact match (case-insensitive)
             for choice in card_choices:
                 if choice.lower() == raw_pick.lower():
                     log.info("LLM strategy: picked %s", choice)
+                    self._set_pick_attrs(choice, fallback=False)
                     return choice
 
             # Substring match (LLM sometimes adds spaces/words)
@@ -339,24 +350,44 @@ class StrategyAgent:
                         "LLM strategy: fuzzy-matched '%s' → %s",
                         raw_pick, choice,
                     )
+                    self._set_pick_attrs(choice, fallback=False)
                     return choice
 
             log.warning(
                 "LLM returned '%s' not matching choices %s; forced pick",
                 raw_pick, card_choices,
             )
-            return self._forced_pick(character, card_choices, upcoming_encounters)
+            pick = self._forced_pick(character, card_choices, upcoming_encounters)
+            self._set_pick_attrs(pick, fallback=True)
+            return pick
 
         except TimeoutError:
             elapsed = time.time() - self._start_time
             log.warning(
                 "Strategy timeout after %.1fs; forced pick", elapsed,
             )
-            return self._forced_pick(character, card_choices, upcoming_encounters)
+            pick = self._forced_pick(character, card_choices, upcoming_encounters)
+            self._set_pick_attrs(pick, fallback=True)
+            return pick
 
         except Exception as exc:
             log.warning("Strategy agent error: %s; forced pick", exc)
-            return self._forced_pick(character, card_choices, upcoming_encounters)
+            pick = self._forced_pick(character, card_choices, upcoming_encounters)
+            self._set_pick_attrs(pick, fallback=True)
+            return pick
+
+    def _set_pick_attrs(self, pick: str | None, *, fallback: bool) -> None:
+        """Set result attributes on the active MLflow span."""
+        span = mlflow.get_current_active_span()
+        if span is None:
+            return
+        elapsed = time.time() - self._start_time
+        span.set_attributes({
+            "pick": pick or "skip",
+            "fallback": fallback,
+            "elapsed_seconds": round(elapsed, 2),
+            "timed_out": self._timed_out,
+        })
 
     # -- deterministic fallback ----------------------------------------------
 

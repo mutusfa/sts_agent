@@ -30,7 +30,10 @@ from __future__ import annotations
 
 import logging
 import inspect
+from contextlib import contextmanager
 from dataclasses import dataclass, field
+
+import mlflow
 
 from sts_env.combat import Combat
 from sts_env.run.state import RunState
@@ -71,6 +74,7 @@ class RunResult:
 # =====================================================================
 
 
+@mlflow.trace(name="run_act1")
 def run_act1(
     planner_or_agent: BattlePlanner | BattleAgent,
     seed: int,
@@ -109,6 +113,14 @@ def run_act1(
     character = Character.ironclad()
     reward_rng = RNG(seed ^ 0xBEEF)
     neow_rng = RNG(seed ^ 0xCA7)
+
+    span = mlflow.get_current_active_span()
+    if span:
+        span.set_attributes({
+            "seed": seed,
+            "use_map": use_map,
+            "card_pick_strategy": card_pick_strategy,
+        })
 
     # --- Neow's blessing (before any floor) ---
     neow_options = roll_neow_options(neow_rng)
@@ -286,44 +298,59 @@ def _run_act1_linear(
         max_hp_gained_total=0,
     )
 
+    died = False
     for floor_idx, (encounter_type, encounter_id) in enumerate(encounter_list):
         character.floor = floor_idx + 1
         result.encounter_types.append(encounter_type)
 
         combat_seed = seed * 1000 + floor_idx
-        combat = builder.build_combat(
-            encounter_type, encounter_id, combat_seed, character=character,
-        )
 
-        damage = _run_battle(planner_or_agent, combat)
-        result.damage_per_floor.append(damage)
-        result.damage_taken_total += damage
-        result.max_hp_gained_total += combat.max_hp_gained
+        with _floor_span(floor_idx + 1, encounter_type, character) as span:
+            combat = builder.build_combat(
+                encounter_type, encounter_id, combat_seed, character=character,
+            )
 
-        obs = combat.observe()
-        if obs.player_dead:
-            log.info("FLOOR %d (%s/%s): DIED (damage=%d)",
-                     floor_idx + 1, encounter_type, encounter_id, damage)
-            result.final_hp = 0
+            damage = _run_battle(planner_or_agent, combat)
+            result.damage_per_floor.append(damage)
+            result.damage_taken_total += damage
+            result.max_hp_gained_total += combat.max_hp_gained
+
+            obs = combat.observe()
+            span.set_attributes({
+                "encounter_id": encounter_id,
+                "damage_taken": damage,
+                "max_hp_gained": combat.max_hp_gained,
+                "survived": not obs.player_dead,
+                "turns": obs.turn,
+            })
+
+            if obs.player_dead:
+                log.info("FLOOR %d (%s/%s): DIED (damage=%d)",
+                         floor_idx + 1, encounter_type, encounter_id, damage)
+                character.player_hp = 0
+                result.final_hp = 0
+                died = True
+            else:
+                character.player_hp = obs.player_hp
+                character.player_max_hp = obs.player_max_hp
+                character.potions = list(combat._state.potions)
+                _apply_relic_effects(character)
+                result.final_hp = character.player_hp
+                result.max_hp = character.player_max_hp
+
+                log.info("FLOOR %d (%s/%s): WON (damage=%d, hp=%d/%d)",
+                         floor_idx + 1, encounter_type, encounter_id, damage,
+                         character.player_hp, character.player_max_hp)
+
+                _apply_combat_rewards(
+                    character, result, encounter_type, encounter_list, floor_idx,
+                    combat_seed, reward_rng, strategy_agent, card_pick_strategy,
+                )
+
+                result.floors_cleared += 1
+
+        if died:
             return result
-
-        character.player_hp = obs.player_hp
-        character.player_max_hp = obs.player_max_hp
-        character.potions = list(combat._state.potions)
-        _apply_relic_effects(character)
-        result.final_hp = character.player_hp
-        result.max_hp = character.player_max_hp
-
-        log.info("FLOOR %d (%s/%s): WON (damage=%d, hp=%d/%d)",
-                 floor_idx + 1, encounter_type, encounter_id, damage,
-                 character.player_hp, character.player_max_hp)
-
-        _apply_combat_rewards(
-            character, result, encounter_type, encounter_list, floor_idx,
-            combat_seed, reward_rng, strategy_agent, card_pick_strategy,
-        )
-
-        result.floors_cleared += 1
 
     result.victory = True
     result.final_hp = character.player_hp
@@ -376,115 +403,165 @@ def _run_act1_map(
 
         character.floor = floor_num + 1
         room_type = node.room_type
+        room_type_str = room_type.name.lower()
 
-        # --- REST rooms ---
-        if room_type == RoomType.REST:
-            rest_result = pick_rest_choice(character, strategy=rest_strategy)
-            if rest_result.choice == RestChoice.REST:
-                log.info("FLOOR %d REST: healed %d HP (hp=%d/%d)",
-                         floor_num + 1, rest_result.hp_healed,
-                         character.player_hp, character.player_max_hp)
+        died = False
+        with _floor_span(floor_num + 1, room_type_str, character) as span:
+
+            # --- REST rooms ---
+            if room_type == RoomType.REST:
+                rest_result = pick_rest_choice(character, strategy=rest_strategy)
+                if rest_result.choice == RestChoice.REST:
+                    log.info("FLOOR %d REST: healed %d HP (hp=%d/%d)",
+                             floor_num + 1, rest_result.hp_healed,
+                             character.player_hp, character.player_max_hp)
+                    span.set_attributes({"rest_choice": "rest", "hp_healed": rest_result.hp_healed})
+                else:
+                    log.info("FLOOR %d REST: upgraded %s (hp=%d/%d)",
+                             floor_num + 1, rest_result.card_upgraded,
+                             character.player_hp, character.player_max_hp)
+                    span.set_attributes({"rest_choice": "upgrade", "card_upgraded": str(rest_result.card_upgraded)})
+                result.encounter_types.append("rest")
+                result.damage_per_floor.append(0)
+                result.floors_cleared += 1
+                result.final_hp = character.player_hp
+                result.max_hp = character.player_max_hp
+
+            # --- EVENT rooms ---
+            elif room_type == RoomType.EVENT:
+                event = random_act1_event(encounter_rng, character.seen_events)
+                character.seen_events.append(event.event_id)
+                log.info("FLOOR %d EVENT: %s", floor_num + 1, event.event_id)
+                choice_idx = _pick_event_choice(event, character, strategy_agent)
+                desc = resolve_event(event.event_id, choice_idx, character, encounter_rng)
+                log.info("  Event result: %s", desc)
+                span.set_attributes({
+                    "event_id": event.event_id,
+                    "choice_idx": choice_idx,
+                    "event_result": str(desc),
+                })
+                result.encounter_types.append("event")
+                result.damage_per_floor.append(0)
+                result.floors_cleared += 1
+
+            # --- SHOP rooms ---
+            elif room_type == RoomType.SHOP:
+                log.info("FLOOR %d SHOP", floor_num + 1)
+                shop_inv = generate_shop(encounter_rng, character)
+                _auto_shop(shop_inv, character, strategy_agent)
+                result.encounter_types.append("shop")
+                result.damage_per_floor.append(0)
+                result.floors_cleared += 1
+
+            # --- TREASURE rooms ---
+            elif room_type == RoomType.TREASURE:
+                log.info("FLOOR %d TREASURE", floor_num + 1)
+                tres = open_treasure(character, encounter_rng)
+                log.info("  Found %d gold%s", tres.gold_found,
+                         f" and {tres.relic_found}" if tres.relic_found else "")
+                span.set_attributes({
+                    "gold_found": tres.gold_found,
+                    "relic_found": str(tres.relic_found) if tres.relic_found else "",
+                })
+                result.encounter_types.append("treasure")
+                result.damage_per_floor.append(0)
+                result.floors_cleared += 1
+
             else:
-                log.info("FLOOR %d REST: upgraded %s (hp=%d/%d)",
-                         floor_num + 1, rest_result.card_upgraded,
-                         character.player_hp, character.player_max_hp)
-            result.encounter_types.append("rest")
-            result.damage_per_floor.append(0)
-            result.floors_cleared += 1
-            result.final_hp = character.player_hp
-            result.max_hp = character.player_max_hp
-            continue
+                # --- Combat rooms (MONSTER / ELITE / BOSS) ---
+                encounter_id = get_encounter_for_room(room_type, encounter_rng)
+                if encounter_id is None:
+                    log.warning("FLOOR %d %s: no encounter assigned, skipping",
+                                floor_num + 1, room_type.name)
+                else:
+                    encounter_type = room_type_str  # "monster", "elite", "boss"
+                    result.encounter_types.append(encounter_type)
 
-        # --- EVENT rooms ---
-        if room_type == RoomType.EVENT:
-            event = random_act1_event(encounter_rng, character.seen_events)
-            character.seen_events.append(event.event_id)
-            log.info("FLOOR %d EVENT: %s", floor_num + 1, event.event_id)
-            # Default strategy: pick first choice (simplified)
-            choice_idx = _pick_event_choice(event, character, strategy_agent)
-            desc = resolve_event(event.event_id, choice_idx, character, encounter_rng)
-            log.info("  Event result: %s", desc)
-            result.encounter_types.append("event")
-            result.damage_per_floor.append(0)
-            result.floors_cleared += 1
-            continue
+                    combat_seed = seed * 1000 + floor_num
+                    combat = builder.build_combat(
+                        encounter_type, encounter_id, combat_seed, character=character,
+                    )
 
-        # --- SHOP rooms ---
-        if room_type == RoomType.SHOP:
-            log.info("FLOOR %d SHOP", floor_num + 1)
-            shop_inv = generate_shop(encounter_rng, character)
-            _auto_shop(shop_inv, character, strategy_agent)
-            result.encounter_types.append("shop")
-            result.damage_per_floor.append(0)
-            result.floors_cleared += 1
-            continue
+                    damage = _run_battle(planner_or_agent, combat)
+                    result.damage_per_floor.append(damage)
+                    result.damage_taken_total += damage
+                    result.max_hp_gained_total += combat.max_hp_gained
 
-        # --- TREASURE rooms ---
-        if room_type == RoomType.TREASURE:
-            log.info("FLOOR %d TREASURE", floor_num + 1)
-            tres = open_treasure(character, encounter_rng)
-            log.info("  Found %d gold%s", tres.gold_found,
-                     f" and {tres.relic_found}" if tres.relic_found else "")
-            result.encounter_types.append("treasure")
-            result.damage_per_floor.append(0)
-            result.floors_cleared += 1
-            continue
+                    obs = combat.observe()
+                    span.set_attributes({
+                        "encounter_id": encounter_id,
+                        "damage_taken": damage,
+                        "max_hp_gained": combat.max_hp_gained,
+                        "survived": not obs.player_dead,
+                        "turns": obs.turn,
+                    })
 
-        # --- Combat rooms (MONSTER / ELITE / BOSS) ---
-        encounter_id = get_encounter_for_room(room_type, encounter_queue)
-        if encounter_id is None:
-            log.warning("FLOOR %d %s: no encounter assigned, skipping", floor_num + 1, room_type.name)
-            continue
+                    if obs.player_dead:
+                        log.info("FLOOR %d (%s/%s): DIED (damage=%d)",
+                                 floor_num + 1, encounter_type, encounter_id, damage)
+                        character.player_hp = 0
+                        result.final_hp = 0
+                        died = True
+                    else:
+                        character.player_hp = obs.player_hp
+                        character.player_max_hp = obs.player_max_hp
+                        character.potions = list(combat._state.potions)
+                        builder.sync_combat_counters(character, combat)
+                        _apply_relic_effects(character)
+                        result.final_hp = character.player_hp
+                        result.max_hp = character.player_max_hp
 
-        encounter_type = room_type.name.lower()  # "monster", "elite", "boss"
-        result.encounter_types.append(encounter_type)
+                        log.info("FLOOR %d (%s/%s): WON (damage=%d, hp=%d/%d)",
+                                 floor_num + 1, encounter_type, encounter_id, damage,
+                                 character.player_hp, character.player_max_hp)
 
-        combat_seed = seed * 1000 + floor_num
-        combat = builder.build_combat(
-            encounter_type, encounter_id, combat_seed, character=character,
-        )
+                        # Boss relic reward (first boss kill)
+                        if room_type == RoomType.BOSS:
+                            _apply_boss_relic_reward(character, result, reward_rng)
 
-        damage = _run_battle(planner_or_agent, combat)
-        result.damage_per_floor.append(damage)
-        result.damage_taken_total += damage
-        result.max_hp_gained_total += combat.max_hp_gained
+                        # Card / potion / gold rewards for combat rooms
+                        _apply_combat_rewards_simple(
+                            character, result, encounter_type, combat_seed, reward_rng,
+                            strategy_agent, card_pick_strategy,
+                        )
 
-        obs = combat.observe()
-        if obs.player_dead:
-            log.info("FLOOR %d (%s/%s): DIED (damage=%d)",
-                     floor_num + 1, encounter_type, encounter_id, damage)
-            result.final_hp = 0
+                        result.floors_cleared += 1
+
+        if died:
             return result
-
-        character.player_hp = obs.player_hp
-        character.player_max_hp = obs.player_max_hp
-        character.potions = list(combat._state.potions)
-        builder.sync_combat_counters(character, combat)
-        _apply_relic_effects(character)
-        result.final_hp = character.player_hp
-        result.max_hp = character.player_max_hp
-
-        log.info("FLOOR %d (%s/%s): WON (damage=%d, hp=%d/%d)",
-                 floor_num + 1, encounter_type, encounter_id, damage,
-                 character.player_hp, character.player_max_hp)
-
-        # Boss relic reward (first boss kill)
-        if room_type == RoomType.BOSS:
-            _apply_boss_relic_reward(character, result, reward_rng)
-
-        # Card / potion / gold rewards for combat rooms
-        _apply_combat_rewards_simple(
-            character, result, encounter_type, combat_seed, reward_rng,
-            strategy_agent, card_pick_strategy,
-        )
-
-        result.floors_cleared += 1
-
     # Survived all floors
     result.victory = True
     result.final_hp = character.player_hp
     result.max_hp = character.player_max_hp
     return result
+
+
+@contextmanager
+def _floor_span(floor: int, room_type: str, character: Character):
+    """Context manager that wraps a floor iteration in an MLflow child span.
+
+    Records character state on entry and exit so each floor's impact is
+    visible in the trace — regardless of whether MLflow is active (no-ops
+    gracefully when there is no active trace context).
+    """
+    with mlflow.start_span(name=f"floor_{floor}_{room_type}") as span:
+        span.set_attributes({
+            "floor": floor,
+            "room_type": room_type,
+            "hp_before": character.player_hp,
+            "max_hp_before": character.player_max_hp,
+            "gold_before": character.gold,
+            "deck_size_before": len(character.deck),
+        })
+        try:
+            yield span
+        finally:
+            span.set_attributes({
+                "hp_after": character.player_hp,
+                "max_hp_after": character.player_max_hp,
+                "gold_after": character.gold,
+                "deck_size_after": len(character.deck),
+            })
 
 
 def _pick_path(
