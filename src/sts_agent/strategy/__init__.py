@@ -1,5 +1,6 @@
-"""Strategy layer — simulation tools and agents for card reward decisions."""
+"""Strategy layer — simulation tools and agents for run-level decisions."""
 
+from .base import BaseStrategyAgent
 from .llm_agent import StrategyAgent, configure_lm, ensure_lm
 from .sim_agent import SimStrategyAgent
 from .simulate import (
@@ -12,6 +13,7 @@ from .simulate import (
 )
 
 __all__ = [
+    "BaseStrategyAgent",
     "SimStrategyAgent",
     "StrategyAgent",
     "SimDistribution",

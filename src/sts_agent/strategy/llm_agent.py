@@ -7,7 +7,7 @@ Architecture
 ------------
 ::
 
-    Character state + card choices + upcoming encounters
+    Character state + card choices + upcoming encounters + map view
         │
         ▼
     dspy.ReAct (thought → tool call → observation loop)
@@ -32,13 +32,19 @@ import logging
 import os
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import dspy
 import mlflow
 
 from sts_env.run.character import Character
 
+from .base import BaseStrategyAgent
 from .simulate import SimResult, simulate_encounter, simulate_with_card
+
+if TYPE_CHECKING:
+    from sts_env.run.map import StSMap
+    from sts_env.run.encounter_queue import EncounterQueue
 
 log = logging.getLogger(__name__)
 
@@ -202,6 +208,16 @@ class CardPickSignature(dspy.Signature):
     2. Max HP gains — Feed is extremely valuable.
     3. Deck synergy — attack density, block consistency.
     4. Upcoming difficulty — elites and boss need stronger cards.
+
+    Act 1 encounter pool (canonical encounter ids):
+    - Hallway weak: cultist, jaw_worm, two_louses, small_slimes
+    - Hallway strong: gremlin_gang, lots_of_slimes, red_slaver, exordium_thugs,
+      exordium_wildlife, blue_slaver, looter, large_slime, three_louse, two_fungi_beasts
+    - Elites: Gremlin Nob, Lagavulin, Three Sentries
+    - Bosses: slime_boss, guardian, hexaghost
+
+    Map symbols: M=monster, E=elite, B=boss, R=rest, ?=event, $=shop, T=treasure.
+    Current floor is marked with * in the map view.
     """
 
     character_state: str = dspy.InputField(
@@ -213,6 +229,12 @@ class CardPickSignature(dspy.Signature):
     upcoming_encounters: str = dspy.InputField(
         desc="Remaining encounters as index:type/id pairs, semicolon-separated"
     )
+    map_view: str = dspy.InputField(
+        desc=(
+            "Full Act 1 map with room types; current position marked with *. "
+            "Shows branching paths and upcoming room types beyond the chosen route."
+        )
+    )
     reasoning: str = dspy.OutputField(
         desc="Brief analysis of each card option based on simulation results"
     )
@@ -222,12 +244,69 @@ class CardPickSignature(dspy.Signature):
 
 
 # ---------------------------------------------------------------------------
+# Map view rendering
+# ---------------------------------------------------------------------------
+
+_MAP_NO_MAP_STUB = "(no map available — linear scenario)"
+
+_ROOM_SYMBOLS = {
+    "MONSTER": "M",
+    "ELITE": "E",
+    "REST": "R",
+    "BOSS": "B",
+    "EVENT": "?",
+    "SHOP": "$",
+    "TREASURE": "T",
+}
+
+
+def _format_map_view(
+    sts_map: StSMap | None,
+    current_position: tuple[int, int] | None,
+) -> str:
+    """Render a compact map grid string with the current position marked.
+
+    Each row shows columns 0-6 using room-type symbols. The current floor's
+    column is suffixed with ``*``.  Rows are listed top-to-bottom (highest
+    floor first) so the boss is at the top and floor 0 at the bottom.
+
+    When ``sts_map`` is ``None`` returns a stub string so the LLM still gets
+    a meaningful (if empty) field.
+    """
+    if sts_map is None:
+        return _MAP_NO_MAP_STUB
+
+    current_floor = current_position[0] if current_position else -1
+    current_x = current_position[1] if current_position else -1
+
+    lines: list[str] = []
+    for floor in sorted(sts_map.nodes.keys(), reverse=True):
+        row_parts: list[str] = []
+        for x in range(7):  # MAP_WIDTH = 7
+            node = sts_map.get_node(floor, x)
+            if node is None or (not node.edges and not node.parents):
+                row_parts.append(".")
+                continue
+            sym = _ROOM_SYMBOLS.get(node.room_type.name, "?")
+            if floor == current_floor and x == current_x:
+                sym = sym + "*"
+            row_parts.append(sym)
+        lines.append(f"F{floor:2d}: {' '.join(row_parts)}")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Strategy Agent
 # ---------------------------------------------------------------------------
 
 
-class StrategyAgent:
+class StrategyAgent(BaseStrategyAgent):
     """LLM-based card-pick agent with simulation tools and timeout.
+
+    Inherits random-valid-option defaults from :class:`BaseStrategyAgent`
+    for every decision except :meth:`pick_card`, which is overridden to
+    consult an LLM via dspy.ReAct.
 
     Parameters
     ----------
@@ -235,6 +314,9 @@ class StrategyAgent:
         Wall-clock budget per card pick decision (default 300 s = 5 min).
     model:
         LM model name (default ``"glm-5.1"``).
+    seed:
+        Forwarded to :class:`BaseStrategyAgent` for the inherited random
+        decisions (Neow, route, rest, events, shop, boss relic).
 
     Usage
     -----
@@ -249,7 +331,9 @@ class StrategyAgent:
         self,
         timeout_seconds: int = DEFAULT_TIMEOUT,
         model: str = DEFAULT_MODEL,
+        seed: int | None = None,
     ) -> None:
+        super().__init__(seed=seed)
         self.timeout = timeout_seconds
         self.model = model
         self._start_time: float = 0.0
@@ -278,6 +362,9 @@ class StrategyAgent:
         card_choices: list[str],
         upcoming_encounters: list[tuple[str, str]],
         seed: int,
+        *,
+        sts_map: StSMap | None = None,
+        current_position: tuple[int, int] | None = None,
     ) -> str | None:
         """Pick a card from reward choices using LLM + simulation.
 
@@ -291,6 +378,11 @@ class StrategyAgent:
             Remaining ``(type, id)`` encounters in the act.
         seed:
             Master seed for deterministic simulations.
+        sts_map:
+            The full Act 1 map.  When provided (map mode), the LLM receives
+            a rendered grid with room types and the current position marked.
+        current_position:
+            ``(floor, x)`` of the node just completed, used to mark the map.
 
         Returns
         -------
@@ -304,6 +396,7 @@ class StrategyAgent:
         upcoming_str = "; ".join(
             f"{i}: {t}/{e}" for i, (t, e) in enumerate(upcoming_encounters)
         )
+        map_view = _format_map_view(sts_map, current_position)
 
         span = mlflow.get_current_active_span()
         if span:
@@ -312,6 +405,7 @@ class StrategyAgent:
                 "card_choices": choices_str,
                 "upcoming_encounters": upcoming_str,
                 "seed": seed,
+                "map_view": map_view[:500],  # truncate for span storage
             })
 
         # Create context-bound tools
@@ -325,6 +419,7 @@ class StrategyAgent:
                 character_state=character.summary(),
                 card_choices=choices_str,
                 upcoming_encounters=upcoming_str,
+                map_view=map_view,
             )
             raw_pick: str = getattr(result, "pick", "").strip()
 

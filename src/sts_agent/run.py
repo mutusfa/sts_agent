@@ -3,23 +3,23 @@
 Drives a BattlePlanner (or BattleAgent) through a sequence of encounters,
 applying relic effects, card rewards, and potion rewards between combats.
 
+All per-floor strategic decisions (Neow blessing, route through the map,
+card rewards, rest sites, events, shops, boss relic) are delegated to a
+:class:`~sts_agent.strategy.BaseStrategyAgent`.  When ``strategy_agent``
+is ``None`` the run defaults to a fresh :class:`BaseStrategyAgent` seeded
+from the run seed — i.e. a uniformly random valid choice for every
+question.
+
 Two run modes:
 
 * ``run_scenario3`` — legacy 5-floor scenario using ``RunState``.
-* ``run_act1`` — full Act 1 (8 floors) using ``Character`` and an optional
-  LLM strategy agent for card picks.
+* ``run_act1`` — full Act 1 (15 floors via map, 8 floors via legacy linear)
+  using ``Character``.
 
 Usage::
 
-    # Legacy
-    from sts_agent.run import run_scenario3
-    from sts_agent.battle.mcts import MCTSPlanner
-
-    result = run_scenario3(MCTSPlanner(), seed=42)
-    print(result)
-
-    # Act 1 with LLM strategy
     from sts_agent.run import run_act1
+    from sts_agent.battle.mcts import MCTSPlanner
     from sts_agent.strategy import StrategyAgent
 
     result = run_act1(MCTSPlanner(), seed=42, strategy_agent=StrategyAgent())
@@ -38,16 +38,23 @@ import mlflow
 from sts_env.combat import Combat
 from sts_env.run.state import RunState
 from sts_env.run import relics, rewards, scenarios, builder
+from sts_env.run.rewards import Room as _RewardRoom
 from sts_env.run.character import Character
 from sts_env.run.map import generate_act1_map, get_encounter_for_room, RoomType
-from sts_env.run.rooms import pick_rest_choice, RestChoice
+from sts_env.run.rooms import (
+    RestChoice,
+    rest_heal,
+    rest_upgrade,
+    _best_upgrade_target,
+)
 from sts_env.run.events import random_act1_event, resolve_event
-from sts_env.run.shop import generate_shop, buy_card, buy_potion, buy_relic, remove_worst_card
+from sts_env.run.shop import generate_shop
 from sts_env.run.treasure import open_treasure
-from sts_env.run.neow import NeowChoice, roll_neow_options, apply_neow
+from sts_env.run.neow import roll_neow_options, apply_neow
 from sts_env.combat.rng import RNG
 
 from .battle.base import BattleAgent, BattlePlanner, run_agent, run_planner
+from .strategy.base import BaseStrategyAgent
 
 log = logging.getLogger(__name__)
 
@@ -70,7 +77,7 @@ class RunResult:
 
 
 # =====================================================================
-# Act 1 run (Character + optional LLM strategy agent)
+# Act 1 run (Character + strategy agent)
 # =====================================================================
 
 
@@ -79,10 +86,7 @@ def run_act1(
     planner_or_agent: BattlePlanner | BattleAgent,
     seed: int,
     *,
-    strategy_agent: object | None = None,
-    card_pick_strategy: str = "random",
-    potion_use_strategy: str = "immediate",
-    rest_strategy: str = "heal_if_hurt",
+    strategy_agent: BaseStrategyAgent | None = None,
     use_map: bool = True,
 ) -> RunResult:
     """Run a full Act 1 scenario using :class:`Character` and generated map.
@@ -94,22 +98,21 @@ def run_act1(
     seed:
         Master seed for the run.
     strategy_agent:
-        A :class:`~sts_agent.strategy.StrategyAgent` for card-pick and path decisions.
-        If ``None``, falls back to *card_pick_strategy*.
-    card_pick_strategy:
-        Fallback when no strategy agent: ``"random"`` or ``"skip"``.
-    potion_use_strategy:
-        How to use potions: ``"immediate"`` or ``"never"``.
-    rest_strategy:
-        Rest site behaviour: ``"heal_if_hurt"``, ``"always_heal"``, or ``"always_upgrade"``.
+        A :class:`~sts_agent.strategy.BaseStrategyAgent` (or subclass) that
+        owns every per-floor decision.  When ``None``, a fresh
+        ``BaseStrategyAgent`` seeded from ``seed`` is used — i.e. random
+        valid choices.
     use_map:
-        If True (default), generate a branching map and walk it.
-        If False, use the old linear encounter list (backwards compat).
+        If True (default), generate a branching map and walk it (15 floors).
+        If False, use the old linear encounter list (8 floors, backwards compat).
 
     Returns
     -------
     RunResult with full run statistics.
     """
+    if strategy_agent is None:
+        strategy_agent = BaseStrategyAgent(seed=seed)
+
     character = Character.ironclad()
     reward_rng = RNG(seed ^ 0xBEEF)
     neow_rng = RNG(seed ^ 0xCA7)
@@ -119,12 +122,12 @@ def run_act1(
         span.set_attributes({
             "seed": seed,
             "use_map": use_map,
-            "card_pick_strategy": card_pick_strategy,
+            "strategy_agent": type(strategy_agent).__name__,
         })
 
     # --- Neow's blessing (before any floor) ---
     neow_options = roll_neow_options(neow_rng)
-    neow_pick = _pick_neow_option(neow_options)
+    neow_pick = strategy_agent.pick_neow(neow_options)
     neow_desc = apply_neow(neow_pick, character, neow_rng)
     log.info("NEOW: %s", neow_desc)
 
@@ -132,14 +135,11 @@ def run_act1(
         return _run_act1_map(
             planner_or_agent, seed, character, reward_rng,
             strategy_agent=strategy_agent,
-            card_pick_strategy=card_pick_strategy,
-            rest_strategy=rest_strategy,
         )
     else:
         return _run_act1_linear(
             planner_or_agent, seed, character, reward_rng,
             strategy_agent=strategy_agent,
-            card_pick_strategy=card_pick_strategy,
         )
 
 
@@ -152,8 +152,7 @@ def run_scenario3(
     planner_or_agent: BattlePlanner | BattleAgent,
     seed: int,
     *,
-    card_pick_strategy: str = "random",
-    potion_use_strategy: str = "immediate",
+    strategy_agent: BaseStrategyAgent | None = None,
 ) -> RunResult:
     """Run Scenario 3: 3 easy hallways + 1 hard + 1 elite.
 
@@ -164,15 +163,17 @@ def run_scenario3(
         or a BattleAgent (observation-only).
     seed:
         Master seed for the run.
-    card_pick_strategy:
-        How to pick card rewards: "random" (default) or "skip".
-    potion_use_strategy:
-        How to use potions: "immediate" (default) or "never".
+    strategy_agent:
+        Strategy agent for card-pick decisions.  Defaults to a random
+        :class:`BaseStrategyAgent` seeded from ``seed``.
 
     Returns
     -------
     RunResult with full run statistics.
     """
+    if strategy_agent is None:
+        strategy_agent = BaseStrategyAgent(seed=seed)
+
     encounter_list = scenarios.scenario3_encounters(seed)
     run_state = RunState()
 
@@ -193,8 +194,7 @@ def run_scenario3(
         run_state.floor = floor_idx + 1
         result.encounter_types.append(encounter_type)
 
-        # Build combat with current run state
-        combat_seed = seed * 1000 + floor_idx  # deterministic per-floor seed
+        combat_seed = seed * 1000 + floor_idx
         combat = builder.build_combat(
             encounter_type,
             encounter_id,
@@ -205,7 +205,6 @@ def run_scenario3(
             potions=run_state.potions,
         )
 
-        # Fight the combat
         damage = _run_battle(planner_or_agent, combat)
 
         result.damage_per_floor.append(damage)
@@ -227,7 +226,6 @@ def run_scenario3(
         run_state.potions = list(combat._state.potions)
         result.final_hp = run_state.player_hp
 
-        # Apply relic effects (Burning Blood: heal 6)
         relics.on_combat_end(run_state)
         result.final_hp = run_state.player_hp
 
@@ -237,34 +235,36 @@ def run_scenario3(
             run_state.player_hp, run_state.player_max_hp,
         )
 
-        # Card reward: pick one of 3 cards (or skip)
-        is_elite = encounter_type == "elite"
-        card_choices = rewards.roll_card_rewards(reward_rng, is_elite=is_elite, event_bus=run_state.event_bus)
-        picked = _pick_card(card_choices, card_pick_strategy, reward_rng)
+        room = _RewardRoom.ELITE if encounter_type == "elite" else _RewardRoom.BOSS if encounter_type == "boss" else _RewardRoom.MONSTER
+        offer, _ = rewards.roll_combat_reward_offer(
+            reward_rng, room, event_bus=run_state.event_bus,
+        )
+        upcoming = [(t, e) for t, e in encounter_list[floor_idx + 1:]]
+        # Scenario 3 has no Character; fake one is overkill — pass run_state
+        # via a thin shim only if the agent needs it.  Most agents only inspect
+        # ``character.deck``/``character.player_hp`` — both available on RunState.
+        picked = strategy_agent.pick_card(
+            run_state, list(offer.card_choices), upcoming, combat_seed,
+        )
         if picked is not None:
             run_state.add_card(picked)
             result.cards_added.append(picked)
-            log.info("  Card reward: picked %s from %s", picked, card_choices)
+            log.info("  Card reward: picked %s from %s", picked, offer.card_choices)
         else:
-            log.info("  Card reward: skipped %s", card_choices)
+            log.info("  Card reward: skipped %s", offer.card_choices)
 
-        # Potion reward
-        potion = rewards.roll_potion_reward(reward_rng)
-        if potion is not None:
+        if offer.potion is not None:
             if len(run_state.potions) < 3:
-                run_state.add_potion(potion)
-                result.potions_gained.append(potion)
-                log.info("  Potion reward: %s (slots: %s)", potion, run_state.potions)
+                run_state.add_potion(offer.potion)
+                result.potions_gained.append(offer.potion)
+                log.info("  Potion reward: %s (slots: %s)", offer.potion, run_state.potions)
             else:
-                log.info("  Potion reward: %s discarded (no slot)", potion)
+                log.info("  Potion reward: %s discarded (no slot)", offer.potion)
 
-        # Gold reward (not strategic, just tracking)
-        gold_reward = 20 if is_elite else 10
-        run_state.gold += gold_reward
+        run_state.gold += offer.gold
 
         result.floors_cleared += 1
 
-    # All combats survived
     result.victory = True
     result.final_hp = run_state.player_hp
     result.max_hp = run_state.player_max_hp
@@ -282,8 +282,7 @@ def _run_act1_linear(
     character: Character,
     reward_rng: RNG,
     *,
-    strategy_agent: object | None,
-    card_pick_strategy: str,
+    strategy_agent: BaseStrategyAgent,
 ) -> RunResult:
     """Run Act 1 with the old fixed linear encounter list (8 floors)."""
     encounter_list = scenarios.act1_encounters(seed)
@@ -344,7 +343,7 @@ def _run_act1_linear(
 
                 _apply_combat_rewards(
                     character, result, encounter_type, encounter_list, floor_idx,
-                    combat_seed, reward_rng, strategy_agent, card_pick_strategy,
+                    combat_seed, reward_rng, strategy_agent,
                 )
 
                 result.floors_cleared += 1
@@ -369,20 +368,16 @@ def _run_act1_map(
     character: Character,
     reward_rng: RNG,
     *,
-    strategy_agent: object | None,
-    card_pick_strategy: str,
-    rest_strategy: str,
+    strategy_agent: BaseStrategyAgent,
 ) -> RunResult:
     """Run Act 1 with a generated branching map (15 floors)."""
     sts_map = generate_act1_map(seed)
     encounter_rng = RNG(seed ^ 0xCAFE)
 
-    # Pre-generate encounter queues (faithful to real StS)
     from sts_env.run.encounter_queue import EncounterQueue
     encounter_queue = EncounterQueue(encounter_rng)
 
-    # Choose a path through the map
-    path = _pick_path(sts_map, character, strategy_agent, seed)
+    path = strategy_agent.plan_route(sts_map, character, seed)
     total_floors = len(path)
 
     result = RunResult(
@@ -410,7 +405,7 @@ def _run_act1_map(
 
             # --- REST rooms ---
             if room_type == RoomType.REST:
-                rest_result = pick_rest_choice(character, strategy=rest_strategy)
+                rest_result = _execute_rest_choice(strategy_agent, character)
                 if rest_result.choice == RestChoice.REST:
                     log.info("FLOOR %d REST: healed %d HP (hp=%d/%d)",
                              floor_num + 1, rest_result.hp_healed,
@@ -432,7 +427,7 @@ def _run_act1_map(
                 event = random_act1_event(encounter_rng, character.seen_events)
                 character.seen_events.append(event.event_id)
                 log.info("FLOOR %d EVENT: %s", floor_num + 1, event.event_id)
-                choice_idx = _pick_event_choice(event, character, strategy_agent)
+                choice_idx = strategy_agent.pick_event_choice(event, character)
                 desc = resolve_event(event.event_id, choice_idx, character, encounter_rng)
                 log.info("  Event result: %s", desc)
                 span.set_attributes({
@@ -448,7 +443,7 @@ def _run_act1_map(
             elif room_type == RoomType.SHOP:
                 log.info("FLOOR %d SHOP", floor_num + 1)
                 shop_inv = generate_shop(encounter_rng, character)
-                _auto_shop(shop_inv, character, strategy_agent)
+                strategy_agent.shop(shop_inv, character)
                 result.encounter_types.append("shop")
                 result.damage_per_floor.append(0)
                 result.floors_cleared += 1
@@ -469,7 +464,7 @@ def _run_act1_map(
 
             else:
                 # --- Combat rooms (MONSTER / ELITE / BOSS) ---
-                encounter_id = get_encounter_for_room(room_type, encounter_rng)
+                encounter_id = get_encounter_for_room(room_type, encounter_queue)
                 if encounter_id is None:
                     log.warning("FLOOR %d %s: no encounter assigned, skipping",
                                 floor_num + 1, room_type.name)
@@ -515,21 +510,22 @@ def _run_act1_map(
                                  floor_num + 1, encounter_type, encounter_id, damage,
                                  character.player_hp, character.player_max_hp)
 
-                        # Boss relic reward (first boss kill)
                         if room_type == RoomType.BOSS:
-                            _apply_boss_relic_reward(character, result, reward_rng)
+                            _apply_boss_relic_reward(character, strategy_agent, reward_rng)
 
-                        # Card / potion / gold rewards for combat rooms
                         _apply_combat_rewards_simple(
                             character, result, encounter_type, combat_seed, reward_rng,
-                            strategy_agent, card_pick_strategy,
+                            strategy_agent,
+                            sts_map=sts_map,
+                            current_position=(floor_num, x_pos),
+                            remaining_path=path[step_idx + 1:],
                         )
 
                         result.floors_cleared += 1
 
         if died:
             return result
-    # Survived all floors
+
     result.victory = True
     result.final_hp = character.player_hp
     result.max_hp = character.player_max_hp
@@ -538,12 +534,7 @@ def _run_act1_map(
 
 @contextmanager
 def _floor_span(floor: int, room_type: str, character: Character):
-    """Context manager that wraps a floor iteration in an MLflow child span.
-
-    Records character state on entry and exit so each floor's impact is
-    visible in the trace — regardless of whether MLflow is active (no-ops
-    gracefully when there is no active trace context).
-    """
+    """Context manager that wraps a floor iteration in an MLflow child span."""
     with mlflow.start_span(name=f"floor_{floor}_{room_type}") as span:
         span.set_attributes({
             "floor": floor,
@@ -564,49 +555,45 @@ def _floor_span(floor: int, room_type: str, character: Character):
             })
 
 
-def _pick_path(
-    sts_map,
+# ---------------------------------------------------------------------
+# Rest site execution
+# ---------------------------------------------------------------------
+
+
+@dataclass
+class _RestExecResult:
+    choice: RestChoice
+    hp_healed: int = 0
+    card_upgraded: str | None = None
+
+
+def _execute_rest_choice(
+    strategy_agent: BaseStrategyAgent,
     character: Character,
-    strategy_agent: object | None,
-    seed: int,
-) -> list[tuple[int, int]]:
-    """Choose a path through the map.
+) -> _RestExecResult:
+    """Ask the agent for a RestChoice, then execute it.
 
-    If strategy_agent has a ``pick_path`` method, delegate to it.
-    Otherwise, use a greedy heuristic: prefer Monster > Elite > Rest,
-    and pick the leftmost available branch.
+    Falls back to the alternative action when the chosen action has no
+    valid effect (e.g. UPGRADE chosen but no unupgraded cards).
     """
-    if strategy_agent is not None and hasattr(strategy_agent, "pick_path"):
-        return strategy_agent.pick_path(sts_map, character, seed)
+    choice = strategy_agent.pick_rest_choice(character)
 
-    # Greedy: walk from floor 0 to 14, at each step pick the "best" next node
-    path: list[tuple[int, int]] = []
+    if choice == RestChoice.UPGRADE:
+        target = _best_upgrade_target(character)
+        if target is not None:
+            rest_upgrade(character, target)
+            return _RestExecResult(RestChoice.UPGRADE, card_upgraded=target)
+        # Nothing to upgrade — fall back to heal.
+        healed = rest_heal(character)
+        return _RestExecResult(RestChoice.REST, hp_healed=healed)
 
-    # Start from the first reachable node on floor 0
-    floor0_nodes = sts_map.nodes.get(0, [])
-    start_node = next((n for n in floor0_nodes if n.edges), None)
-    if not start_node:
-        return path
-    current = (0, start_node.x)
-    path.append(current)
+    healed = rest_heal(character)
+    return _RestExecResult(RestChoice.REST, hp_healed=healed)
 
-    # Priority: we want fights early (for card rewards), rest when hurt,
-    # but for v1 just pick a random valid edge at each step.
-    path_rng = RNG(seed ^ 0xDEAD)
 
-    while True:
-        f, x = current
-        node = sts_map.get_node(f, x)
-        if node is None or not node.edges:
-            break
-        # Pick a random edge (v1: no strategy)
-        next_coord = path_rng.choice(node.edges)
-        path.append(next_coord)
-        if next_coord[0] == 14:
-            break
-        current = next_coord
-
-    return path
+# ---------------------------------------------------------------------
+# Reward application
+# ---------------------------------------------------------------------
 
 
 def _apply_combat_rewards(
@@ -617,41 +604,52 @@ def _apply_combat_rewards(
     floor_idx: int,
     combat_seed: int,
     reward_rng: RNG,
-    strategy_agent: object | None,
-    card_pick_strategy: str,
+    strategy_agent: BaseStrategyAgent,
 ) -> None:
     """Apply post-combat rewards (linear mode with remaining encounters)."""
-    is_elite = encounter_type == "elite"
-    card_choices = rewards.roll_card_rewards(reward_rng, is_elite=is_elite, event_bus=character.event_bus)
+    room = _RewardRoom.ELITE if encounter_type == "elite" else _RewardRoom.BOSS if encounter_type == "boss" else _RewardRoom.MONSTER
+    offer, new_factor = rewards.roll_combat_reward_offer(
+        reward_rng, room,
+        card_rarity_factor=character.card_rarity_factor,
+        event_bus=character.event_bus,
+    )
+    character.card_rarity_factor = new_factor
     remaining = encounter_list[floor_idx + 1:]
 
-    picked = _pick_card_act1(
-        character=character,
-        card_choices=card_choices,
-        remaining_encounters=remaining,
-        seed=combat_seed,
-        strategy_agent=strategy_agent,
-        fallback_strategy=card_pick_strategy,
-        rng=reward_rng,
+    picked = strategy_agent.pick_card(
+        character, list(offer.card_choices), list(remaining), combat_seed,
     )
     if picked is not None:
         character.add_card(picked)
         result.cards_added.append(picked)
-        log.info("  Card reward: picked %s from %s", picked, card_choices)
+        log.info("  Card reward: picked %s from %s", picked, offer.card_choices)
     else:
-        log.info("  Card reward: skipped %s", card_choices)
+        log.info("  Card reward: skipped %s", offer.card_choices)
 
-    potion = rewards.roll_potion_reward(reward_rng)
-    if potion is not None:
+    if offer.potion is not None:
         if len(character.potions) < character.max_potion_slots:
-            character.add_potion(potion)
-            result.potions_gained.append(potion)
-            log.info("  Potion reward: %s (slots: %s)", potion, character.potions)
+            character.add_potion(offer.potion)
+            result.potions_gained.append(offer.potion)
+            log.info("  Potion reward: %s (slots: %s)", offer.potion, character.potions)
         else:
-            log.info("  Potion reward: %s discarded (no slot)", potion)
+            log.info("  Potion reward: %s discarded (no slot)", offer.potion)
 
-    gold_reward = 30 if is_elite else 20 if encounter_type == "boss" else 10
-    character.gold += gold_reward
+    character.gold += offer.gold
+
+
+def _upcoming_from_path(
+    remaining_path: list[tuple[int, int]],
+    sts_map,
+) -> list[tuple[str, str]]:
+    """Derive upcoming (type, id) encounter hints from the remaining path."""
+    upcoming: list[tuple[str, str]] = []
+    for floor_num, x_pos in remaining_path:
+        node = sts_map.get_node(floor_num, x_pos) if sts_map is not None else None
+        if node is None:
+            continue
+        room_name = node.room_type.name.lower()
+        upcoming.append((room_name, ""))
+    return upcoming
 
 
 def _apply_combat_rewards_simple(
@@ -660,116 +658,61 @@ def _apply_combat_rewards_simple(
     encounter_type: str,
     combat_seed: int,
     reward_rng: RNG,
-    strategy_agent: object | None,
-    card_pick_strategy: str,
+    strategy_agent: BaseStrategyAgent,
+    *,
+    sts_map=None,
+    current_position: tuple[int, int] | None = None,
+    remaining_path: list[tuple[int, int]] | None = None,
 ) -> None:
-    """Apply post-combat rewards (map mode — no remaining encounters list)."""
-    is_elite = encounter_type == "elite"
-    card_choices = rewards.roll_card_rewards(reward_rng, is_elite=is_elite, event_bus=character.event_bus)
+    """Apply post-combat rewards (map mode)."""
+    room = _RewardRoom.ELITE if encounter_type == "elite" else _RewardRoom.BOSS if encounter_type == "boss" else _RewardRoom.MONSTER
+    offer, new_factor = rewards.roll_combat_reward_offer(
+        reward_rng, room,
+        card_rarity_factor=character.card_rarity_factor,
+        event_bus=character.event_bus,
+    )
+    character.card_rarity_factor = new_factor
 
-    # Use strategy agent if available, else fallback
-    if strategy_agent is not None and hasattr(strategy_agent, "pick_card"):
-        picked = strategy_agent.pick_card(character, card_choices, [], combat_seed)
-    else:
-        picked = _pick_card(card_choices, card_pick_strategy, reward_rng)
+    upcoming = _upcoming_from_path(remaining_path or [], sts_map)
+    picked = strategy_agent.pick_card(
+        character, list(offer.card_choices), upcoming, combat_seed,
+        sts_map=sts_map,
+        current_position=current_position,
+    )
 
     if picked is not None:
         character.add_card(picked)
         result.cards_added.append(picked)
-        log.info("  Card reward: picked %s from %s", picked, card_choices)
+        log.info("  Card reward: picked %s from %s", picked, offer.card_choices)
     else:
-        log.info("  Card reward: skipped %s", card_choices)
+        log.info("  Card reward: skipped %s", offer.card_choices)
 
-    potion = rewards.roll_potion_reward(reward_rng)
-    if potion is not None:
+    if offer.potion is not None:
         if len(character.potions) < character.max_potion_slots:
-            character.add_potion(potion)
-            result.potions_gained.append(potion)
-            log.info("  Potion reward: %s (slots: %s)", potion, character.potions)
+            character.add_potion(offer.potion)
+            result.potions_gained.append(offer.potion)
+            log.info("  Potion reward: %s (slots: %s)", offer.potion, character.potions)
         else:
-            log.info("  Potion reward: %s discarded (no slot)", potion)
+            log.info("  Potion reward: %s discarded (no slot)", offer.potion)
 
-    gold_reward = 30 if is_elite else 20 if encounter_type == "boss" else 10
-    character.gold += gold_reward
-
-
-def _pick_event_choice(
-    event: "EventSpec",
-    character: Character,
-    strategy_agent: object | None,
-) -> int:
-    """Pick an event choice. Delegates to strategy agent if available."""
-    if strategy_agent is not None and hasattr(strategy_agent, "pick_event_choice"):
-        return strategy_agent.pick_event_choice(event, character)
-    # Default: pick the first (usually safest) choice
-    return 0
-
-
-def _auto_shop(
-    inventory: "ShopInventory",
-    character: Character,
-    strategy_agent: object | None,
-) -> None:
-    """Auto-spend gold at a shop using simple heuristics.
-
-    Priority: remove worst card > buy best affordable card > buy potion if slot free
-    """
-    if strategy_agent is not None and hasattr(strategy_agent, "shop"):
-        strategy_agent.shop(inventory, character)
-        return
-
-    # Simple heuristic shopping:
-    # 1. Remove worst card if affordable and deck > 10 cards
-    if character.gold >= inventory.remove_cost and len(character.deck) > 10:
-        remove_worst_card(character)
-        log.info("  Shop: removed worst card for %d gold", inventory.remove_cost)
-
-    # 2. Buy best affordable card (prefer uncommon/rare)
-    for idx in range(len(inventory.cards) - 1, -1, -1):
-        item = inventory.cards[idx]
-        if item is None:
-            continue
-        card_id, price = item
-        if character.gold >= price:
-            bought = buy_card(inventory, idx, character)
-            if bought:
-                log.info("  Shop: bought %s for %d gold", bought, price)
-                break
-
-    # 3. Buy a potion if we have a free slot
-    if len(character.potions) < character.max_potion_slots:
-        for idx in range(len(inventory.potions)):
-            item = inventory.potions[idx]
-            if item is None:
-                continue
-            potion_id, price = item
-            if character.gold >= price:
-                bought = buy_potion(inventory, idx, character)
-                if bought:
-                    log.info("  Shop: bought potion %s for %d gold", bought, price)
-                    break
+    character.gold += offer.gold
 
 
 def _apply_boss_relic_reward(
     character: Character,
-    result: RunResult,
+    strategy_agent: BaseStrategyAgent,
     rng: RNG,
 ) -> None:
-    """Give a boss relic reward after defeating the boss."""
-    _BOSS_RELICS = [
-        "BurningBlood",  # already have it, but listed for completeness
-        "RedSkull",
-        "CentennialPuzzle",
-        "JuzuBracelet",
-        "Orichalcum",
-        "CeramicFish",
-    ]
-    # Pick a relic the character doesn't already have
-    available = [r for r in _BOSS_RELICS if not character.has_relic(r)]
-    if available:
-        relic = rng.choice(available)
-        character.add_relic(relic)
-        log.info("  Boss relic reward: %s", relic)
+    """Offer the boss relic reward and let the strategy agent pick."""
+    available = rewards.roll_boss_relic_choices(rng, owned=character.relics)
+    if not available:
+        return
+    relic = strategy_agent.pick_boss_relic(character, available)
+    if relic is None:
+        log.info("  Boss relic reward: skipped %s", available)
+        return
+    character.add_relic(relic)
+    log.info("  Boss relic reward: %s", relic)
 
 
 def _run_battle(
@@ -793,70 +736,6 @@ def _apply_relic_effects(character: Character) -> None:
     """Apply end-of-combat relic effects."""
     if character.has_relic("BurningBlood"):
         character.heal(6)
-    # Orichalcum: gain 4 block at start of each combat (modeled as +4 HP after combat)
-    # Note: this is a simplification — real Orichalcum applies block at combat start
+    # Orichalcum simplification — applied after combat instead of per-turn.
     if character.has_relic("Orichalcum"):
         character.heal(4)
-
-
-def _pick_card_act1(
-    *,
-    character: Character,
-    card_choices: list[str],
-    remaining_encounters: list[tuple[str, str]],
-    seed: int,
-    strategy_agent: object | None,
-    fallback_strategy: str,
-    rng: RNG,
-) -> str | None:
-    """Pick a card using the strategy agent if available, else fallback."""
-    if strategy_agent is not None and hasattr(strategy_agent, "pick_card"):
-        return strategy_agent.pick_card(
-            character, card_choices, remaining_encounters, seed,
-        )
-    return _pick_card(card_choices, fallback_strategy, rng)
-
-
-def _pick_card(
-    choices: list[str],
-    strategy: str,
-    rng: RNG,
-) -> str | None:
-    """Pick a card from the reward choices.
-
-    Parameters
-    ----------
-    choices:
-        3 card IDs to choose from.
-    strategy:
-        "random" — pick a random card from choices.
-        "skip" — don't pick any card (return None).
-
-    Returns
-    -------
-    The picked card ID, or None if skipped.
-    """
-    if strategy == "skip" or not choices:
-        return None
-    # "random" — any card is generally better than starter cards early in the run
-    return rng.choice(choices)
-
-
-def _pick_neow_option(options: list) -> NeowChoice:
-    """Pick a Neow blessing using a simple heuristic.
-
-    Priority: MAX_HP > REMOVE_CARD > RANDOM_RELIC > RANDOM_CARD.
-    Max HP and card removal are the most consistently useful early bonuses.
-    """
-    preference_order = [
-        NeowChoice.MAX_HP,
-        NeowChoice.REMOVE_CARD,
-        NeowChoice.RANDOM_RELIC,
-        NeowChoice.RANDOM_CARD,
-    ]
-    for preferred in preference_order:
-        for opt in options:
-            if opt.choice == preferred:
-                return opt.choice
-    # Fallback: first option
-    return options[0].choice

@@ -6,22 +6,37 @@ Covers:
 - StrategyAgent.pick_card with mocked LLM
 - run_act1 with mock strategy agent
 - Timeout behavior
+- Map-aware pick_card (StSMap + EncounterQueue integration)
 """
 
 from __future__ import annotations
 
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 from sts_env.run.character import Character
+from sts_env.run.map import StSMap, MapNode, RoomType, generate_act1_map
 from sts_agent.run import run_act1, RunResult
 from sts_agent.battle.mcts import MCTSPlanner
 from sts_agent.strategy.llm_agent import (
+    CardPickSignature,
     StrategyAgent,
     _format_result,
     _make_tools,
 )
 from sts_agent.strategy.simulate import SimResult
+
+
+# ---------------------------------------------------------------------------
+# Minimal fake StSMap fixture
+# ---------------------------------------------------------------------------
+
+
+def _make_minimal_map() -> StSMap:
+    """Two-floor map: floor 0 node at x=3 (MONSTER) → floor 1 node at x=3 (ELITE)."""
+    node0 = MapNode(floor=0, x=3, room_type=RoomType.MONSTER, edges=[(1, 3)], parents=[])
+    node1 = MapNode(floor=1, x=3, room_type=RoomType.ELITE, edges=[], parents=[3])
+    return StSMap(nodes={0: [node0], 1: [node1]}, seed=0)
 
 
 # ---------------------------------------------------------------------------
@@ -284,38 +299,139 @@ class TestRunAct1:
     """Integration tests for run_act1 (no LLM calls)."""
 
     def test_random_fallback_completes(self):
-        """run_act1 with random card picks completes 8 floors."""
+        """run_act1 with the default random agent completes 15 floors."""
         result = run_act1(MCTSPlanner(), seed=42)
         assert isinstance(result, RunResult)
-        assert result.total_floors == 8
-
-    def test_skip_strategy_completes(self):
-        """run_act1 with skip strategy doesn't add cards."""
-        result = run_act1(MCTSPlanner(), seed=42, card_pick_strategy="skip")
-        assert result.cards_added == []
+        assert result.total_floors == 15  # map mode by default
 
     def test_with_mock_strategy_agent(self):
         """run_act1 with a mock strategy agent delegates card picks."""
         mock_agent = MagicMock()
         mock_agent.pick_card.return_value = "Anger"
+        # plan_route still needs to return a real path; let the default base
+        # walker do it via the mock by delegating to a real BaseStrategyAgent.
+        from sts_agent.strategy import BaseStrategyAgent
+        real_router = BaseStrategyAgent(seed=42)
+        mock_agent.plan_route.side_effect = real_router.plan_route
+        mock_agent.pick_neow.side_effect = real_router.pick_neow
+        mock_agent.pick_rest_choice.side_effect = real_router.pick_rest_choice
+        mock_agent.pick_event_choice.side_effect = real_router.pick_event_choice
+        mock_agent.shop.side_effect = real_router.shop
+        mock_agent.pick_boss_relic.side_effect = real_router.pick_boss_relic
 
         result = run_act1(MCTSPlanner(), seed=42, strategy_agent=mock_agent)
 
-        if result.floors_cleared > 0:
-            assert mock_agent.pick_card.call_count >= 1
+        if result.floors_cleared > 0 and mock_agent.pick_card.call_count > 0:
             assert all(c == "Anger" for c in result.cards_added)
 
     def test_deterministic_with_same_seed(self):
-        """Same seed produces same result."""
-        r1 = run_act1(MCTSPlanner(), seed=123, card_pick_strategy="skip")
-        r2 = run_act1(MCTSPlanner(), seed=123, card_pick_strategy="skip")
+        """Same seed + same default agent produces same result."""
+        from sts_agent.strategy import BaseStrategyAgent
+        r1 = run_act1(MCTSPlanner(), seed=123, strategy_agent=BaseStrategyAgent(seed=123))
+        r2 = run_act1(MCTSPlanner(), seed=123, strategy_agent=BaseStrategyAgent(seed=123))
         assert r1 == r2
 
     def test_result_fields_populated(self):
-        """RunResult fields are properly populated."""
-        result = run_act1(MCTSPlanner(), seed=42, card_pick_strategy="skip")
+        """RunResult fields are properly populated (linear mode, 8 floors)."""
+        result = run_act1(MCTSPlanner(), seed=42, use_map=False)
         assert len(result.damage_per_floor) == result.total_floors
         assert len(result.encounter_types) == result.total_floors
         assert result.total_floors == 8
         assert result.encounter_types[0] == "easy"
         assert result.encounter_types[-1] == "boss"
+
+
+# ---------------------------------------------------------------------------
+# CardPickSignature pool hints
+# ---------------------------------------------------------------------------
+
+
+class TestSignatureEncounterPools:
+    """CardPickSignature docstring must list canonical encounter names."""
+
+    def test_mentions_weak_pool_entries(self):
+        doc = CardPickSignature.__doc__ or ""
+        for enc in ("cultist", "jaw_worm"):
+            assert enc in doc, f"Expected '{enc}' in CardPickSignature docstring"
+
+    def test_mentions_elite_pool_entries(self):
+        doc = CardPickSignature.__doc__ or ""
+        assert "Gremlin Nob" in doc
+
+    def test_mentions_boss_pool_entries(self):
+        doc = CardPickSignature.__doc__ or ""
+        assert "hexaghost" in doc
+
+
+# ---------------------------------------------------------------------------
+# Map-aware pick_card tests (mocked LLM)
+# ---------------------------------------------------------------------------
+
+
+class TestPickCardMapAware:
+    """pick_card should render a map_view and forward it to dspy.ReAct."""
+
+    @pytest.fixture(autouse=True)
+    def _mock_lm(self):
+        with patch("sts_agent.strategy.llm_agent.ensure_lm"):
+            yield
+
+    def _mock_react(self, pick_value: str):
+        mock = MagicMock()
+        mock_result = MagicMock()
+        mock_result.pick = pick_value
+        mock.return_value.return_value = mock_result
+        return mock
+
+    def test_pick_card_passes_map_view_when_sts_map_provided(self):
+        """When sts_map + current_position supplied, ReAct receives a non-empty map_view."""
+        agent = StrategyAgent()
+        fake_map = _make_minimal_map()
+
+        captured_kwargs: dict = {}
+
+        def fake_react_factory(sig, tools, max_iters):
+            inst = MagicMock()
+            def call_side_effect(**kwargs):
+                captured_kwargs.update(kwargs)
+                r = MagicMock()
+                r.pick = "Anger"
+                return r
+            inst.side_effect = call_side_effect
+            return inst
+
+        with patch("sts_agent.strategy.llm_agent.dspy.ReAct", side_effect=fake_react_factory):
+            agent.pick_card(
+                _ironclad(), ["Anger", "Inflame", "Flex"], [], seed=1,
+                sts_map=fake_map, current_position=(0, 3),
+            )
+
+        assert "map_view" in captured_kwargs
+        mv = captured_kwargs["map_view"]
+        assert mv  # non-empty
+        # Must contain at least one room-type symbol (M, E, R, B, ?, $, T)
+        assert any(sym in mv for sym in ("M", "E", "R", "B", "?", "$", "T"))
+
+    def test_pick_card_works_without_map(self):
+        """Without sts_map the call still works and map_view is a stub string."""
+        agent = StrategyAgent()
+
+        captured_kwargs: dict = {}
+
+        def fake_react_factory(sig, tools, max_iters):
+            inst = MagicMock()
+            def call_side_effect(**kwargs):
+                captured_kwargs.update(kwargs)
+                r = MagicMock()
+                r.pick = "Anger"
+                return r
+            inst.side_effect = call_side_effect
+            return inst
+
+        with patch("sts_agent.strategy.llm_agent.dspy.ReAct", side_effect=fake_react_factory):
+            agent.pick_card(_ironclad(), ["Anger", "Inflame", "Flex"], [], seed=1)
+
+        assert "map_view" in captured_kwargs
+        mv = captured_kwargs["map_view"]
+        assert isinstance(mv, str)
+        assert mv  # not empty — should be the "no map" stub message

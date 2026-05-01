@@ -26,11 +26,18 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from sts_env.run.character import Character
 from sts_env.combat.card_pools import pool
 from sts_env.combat.cards import CardColor, Rarity
+
+from .base import BaseStrategyAgent
 from .simulate import SimDistribution, probe_encounter, probe_with_card
+
+if TYPE_CHECKING:
+    from sts_env.run.encounter_queue import EncounterQueue
+    from sts_env.run.map import MapNode, StSMap
 
 log = logging.getLogger(__name__)
 
@@ -84,11 +91,11 @@ def _rarity_rank(card_id: str | None) -> int:
     return 0
 
 
-class SimStrategyAgent:
-    """Simulation-driven card-pick agent using fast MCTS probes.
+class SimStrategyAgent(BaseStrategyAgent):
+    """Simulation-driven card-pick + route-planning agent using fast MCTS probes.
 
-    For each card reward, evaluates every option (including skip) by probing
-    all remaining encounters with and without each card.  Picks the best.
+    Overrides :meth:`pick_card` and :meth:`plan_route`; inherits the random
+    defaults from :class:`BaseStrategyAgent` for everything else.
 
     Parameters
     ----------
@@ -101,6 +108,9 @@ class SimStrategyAgent:
         MCTS simulation budget per probe (default 5000).
     timeout_seconds:
         Ignored (kept for API compat with StrategyAgent).
+    seed:
+        Forwarded to :class:`BaseStrategyAgent` for the inherited random
+        decisions (Neow, rest, events, boss relic).
     """
 
     def __init__(
@@ -109,10 +119,16 @@ class SimStrategyAgent:
         sim_nodes: int = 5_000,
         sim_sims: int = 5_000,
         timeout_seconds: int = 300,
+        seed: int | None = None,
     ) -> None:
+        super().__init__(seed=seed)
         self.max_encounters = max_encounters_to_sim
         self.sim_nodes = sim_nodes
         self.sim_sims = sim_sims
+
+    # ------------------------------------------------------------------
+    # Card-pick (specialised)
+    # ------------------------------------------------------------------
 
     def pick_card(
         self,
@@ -120,18 +136,18 @@ class SimStrategyAgent:
         card_choices: list[str],
         upcoming_encounters: list[tuple[str, str]],
         seed: int,
+        *,
+        sts_map: "StSMap | None" = None,
+        current_position: tuple[int, int] | None = None,
     ) -> str | None:
         """Evaluate all card options and pick the best one."""
         if not card_choices:
             return None
 
-        # Limit encounters to simulate
         to_sim = upcoming_encounters[:self.max_encounters]
         if not to_sim:
-            # Last floor — no upcoming encounters, just pick rarest
             return self._pick_by_rarity(card_choices)
 
-        # Evaluate each option: skip + each card
         options: list[CardEvaluation] = []
         candidates = [None] + list(card_choices)  # None = skip (baseline)
 
@@ -139,7 +155,6 @@ class SimStrategyAgent:
             evals = self._evaluate_option(character, card_id, to_sim, seed)
             options.append(evals)
             label = card_id or "SKIP"
-            # Log per-encounter spreads
             spreads = " | ".join(
                 f"[{enc_type[:4]}] {d.damage_spread}"
                 for (enc_type, _), d in zip(to_sim, evals.per_encounter)
@@ -149,7 +164,6 @@ class SimStrategyAgent:
                 label, spreads,
             )
 
-        # Pick the best
         best = max(options, key=lambda e: e.score)
         log.info(
             "  → Best: %s (death=%s)",
@@ -164,11 +178,7 @@ class SimStrategyAgent:
         encounters: list[tuple[str, str]],
         seed: int,
     ) -> CardEvaluation:
-        """Probe all encounters with (or without) a card.
-
-        Uses the fast probe API — single MCTS act() per encounter per option,
-        extracting the rollout distribution from root edge statistics.
-        """
+        """Probe all encounters with (or without) a card."""
         total_expected_damage = 0.0
         total_survival_rate = 0.0
         worst_max_score = 0.0
@@ -222,10 +232,10 @@ class SimStrategyAgent:
         return choices[0] if choices else None
 
     # ------------------------------------------------------------------
-    # Map path selection
+    # Map route (specialised)
     # ------------------------------------------------------------------
 
-    def pick_path(
+    def plan_route(
         self,
         sts_map: "StSMap",
         character: Character,
@@ -240,7 +250,8 @@ class SimStrategyAgent:
         Falls back to a heuristic (prefer Rest when low HP, Elite when
         high HP) when no combat is reachable for probing.
         """
-        from sts_env.run.map import RoomType
+        from sts_env.run.encounter_queue import EncounterQueue
+        from sts_env.combat.rng import RNG as StsRNG
 
         path: list[tuple[int, int]] = []
         floor0_nodes = sts_map.nodes.get(0, [])
@@ -250,10 +261,6 @@ class SimStrategyAgent:
         current = (0, start_node.x)
         path.append(current)
 
-        from random import Random
-        from sts_env.run.encounter_queue import EncounterQueue
-        from sts_env.combat.rng import RNG as StsRNG
-        rng = Random(seed ^ 0xBEEF)
         encounter_queue = EncounterQueue(StsRNG(seed ^ 0xBEEF))
 
         while True:
@@ -263,12 +270,10 @@ class SimStrategyAgent:
                 break
 
             if len(node.edges) == 1:
-                # No fork — must take the only edge
                 next_coord = node.edges[0]
             else:
-                # Fork — evaluate branches
                 next_coord = self._pick_branch(
-                    sts_map, character, node, rng, seed, encounter_queue,
+                    sts_map, character, node, seed, encounter_queue,
                 )
 
             path.append(next_coord)
@@ -283,25 +288,14 @@ class SimStrategyAgent:
         sts_map: "StSMap",
         character: Character,
         node: "MapNode",
-        rng: "Random",
         seed: int,
         encounter_queue: "EncounterQueue",
     ) -> tuple[int, int]:
-        """Evaluate branches at a fork and pick the best one.
-
-        Strategy:
-        1. If HP is low (< 40% max), strongly prefer REST branches
-        2. Otherwise, probe the next combat on each branch and pick
-           the one with better survival rate
-        3. Tiebreak: prefer Monster > Elite > Rest (for card rewards)
-        """
-        from sts_env.run.map import RoomType, get_encounter_for_room
-
+        """Evaluate branches at a fork and pick the best one."""
         hp_ratio = character.player_hp / max(character.player_max_hp, 1)
 
-        # Score each branch
         best_coord = node.edges[0]
-        best_score = (-float("inf"),)
+        best_score: tuple = (-float("inf"),)
 
         for coord in node.edges:
             nf, nx = coord
@@ -310,7 +304,7 @@ class SimStrategyAgent:
                 continue
 
             score = self._score_branch(
-                sts_map, character, next_node, hp_ratio, rng, seed, encounter_queue,
+                sts_map, character, next_node, hp_ratio, seed, encounter_queue,
             )
             if score > best_score:
                 best_score = score
@@ -324,7 +318,6 @@ class SimStrategyAgent:
         character: Character,
         next_node: "MapNode",
         hp_ratio: float,
-        rng: "Random",
         seed: int,
         encounter_queue: "EncounterQueue",
     ) -> tuple:
@@ -337,24 +330,19 @@ class SimStrategyAgent:
 
         room_type = next_node.room_type
 
-        # --- REST rooms ---
         if room_type == RoomType.REST:
-            # Strongly prefer rest when low HP
             rest_value = 1.0 if hp_ratio < 0.4 else 0.0
             return (rest_value, 0.0, 0)
 
-        # --- Non-combat rooms (EVENT/SHOP/TREASURE) ---
         if room_type in (RoomType.EVENT, RoomType.SHOP, RoomType.TREASURE):
             return (0.0, 0.0, 1)
 
-        # --- Combat rooms (MONSTER/ELITE/BOSS) ---
         encounter_id = get_encounter_for_room(room_type, encounter_queue)
         if encounter_id is None:
             return (0.0, 0.0, 2)
 
-        encounter_type = room_type.name.lower()  # "monster", "elite", "boss"
+        encounter_type = room_type.name.lower()
 
-        # Probe the encounter to estimate survival
         try:
             dist = probe_encounter(
                 character, encounter_type, encounter_id, seed,
@@ -362,20 +350,15 @@ class SimStrategyAgent:
                 simulations=min(self.sim_sims, 1000),
             )
             survival = dist.survival_rate
-            expected_damage = dist.expected_damage
         except Exception:
-            # Fallback: can't simulate, use heuristic
             survival = 0.5
-            expected_damage = 20.0
 
-        # Room priority: Elite=3 (best rewards), Monster=2, Boss=1
         room_priority = {
             RoomType.ELITE: 3,
             RoomType.MONSTER: 2,
             RoomType.BOSS: 1,
         }.get(room_type, 0)
 
-        # If HP is critically low, penalize Elites
         if hp_ratio < 0.3 and room_type == RoomType.ELITE:
             room_priority = 0
 
