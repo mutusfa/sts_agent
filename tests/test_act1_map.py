@@ -132,13 +132,13 @@ class TestBossRelicOwnershipBoundary:
         )
 
     def test_apply_boss_relic_reward_delegates_to_env_rewards(self):
-        """_apply_boss_relic_reward must call rewards.roll_boss_relic_choices
-        and pass its result (not any agent-local list) to pick_boss_relic."""
+        """_apply_boss_relic_reward (now in sts_env) calls roll_boss_relic_choices
+        and passes its result to pick_boss_relic."""
         from unittest.mock import patch, MagicMock
         from sts_env.run.character import Character
         from sts_env.combat.rng import RNG
-        from sts_agent.run import _apply_boss_relic_reward
-        import sts_agent.run as run_mod
+        from sts_env.run.orchestrator import _apply_boss_relic_reward
+        import sts_env.run.orchestrator as orchestrator_mod
 
         character = Character.ironclad()
         strategy_agent = MagicMock()
@@ -146,7 +146,7 @@ class TestBossRelicOwnershipBoundary:
         rng = RNG(0)
 
         sentinel = ["TinyHouse", "BustedCrown"]
-        with patch.object(run_mod.rewards, "roll_boss_relic_choices",
+        with patch.object(orchestrator_mod, "roll_boss_relic_choices",
                           return_value=sentinel) as mock_roll:
             _apply_boss_relic_reward(character, strategy_agent, rng)
 
@@ -160,7 +160,7 @@ class TestBossRelicOwnershipBoundary:
         """Choices offered to pick_boss_relic must be a subset of BOSS_RELICS."""
         from sts_env.run.character import Character
         from sts_env.combat.rng import RNG
-        from sts_agent.run import _apply_boss_relic_reward
+        from sts_env.run.orchestrator import _apply_boss_relic_reward
 
         offered: list[list[str]] = []
 
