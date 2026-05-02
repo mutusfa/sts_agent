@@ -384,9 +384,10 @@ class TestPickCardMapAware:
         return mock
 
     def test_pick_card_passes_map_view_when_sts_map_provided(self):
-        """When sts_map + current_position supplied, ReAct receives a non-empty map_view."""
+        """When sts_map + current_position supplied, map_view comes from render_ascii."""
         agent = StrategyAgent()
         fake_map = _make_minimal_map()
+        fake_map.render_ascii = MagicMock(return_value="FORWARD_ASCII_MAP")
 
         captured_kwargs: dict = {}
 
@@ -407,10 +408,12 @@ class TestPickCardMapAware:
             )
 
         assert "map_view" in captured_kwargs
-        mv = captured_kwargs["map_view"]
-        assert mv  # non-empty
-        # Must contain at least one room-type symbol (M, E, R, B, ?, $, T)
-        assert any(sym in mv for sym in ("M", "E", "R", "B", "?", "$", "T"))
+        assert captured_kwargs["map_view"] == "FORWARD_ASCII_MAP"
+        fake_map.render_ascii.assert_called_once_with(
+            current_floor=0,
+            current_x=3,
+            reachable_only=True,
+        )
 
     def test_pick_card_works_without_map(self):
         """Without sts_map the call still works and map_view is a stub string."""

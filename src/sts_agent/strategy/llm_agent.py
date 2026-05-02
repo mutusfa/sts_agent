@@ -249,51 +249,22 @@ class CardPickSignature(dspy.Signature):
 
 _MAP_NO_MAP_STUB = "(no map available — linear scenario)"
 
-_ROOM_SYMBOLS = {
-    "MONSTER": "M",
-    "ELITE": "E",
-    "REST": "R",
-    "BOSS": "B",
-    "EVENT": "?",
-    "SHOP": "$",
-    "TREASURE": "T",
-}
-
 
 def _format_map_view(
     sts_map: StSMap | None,
     current_position: tuple[int, int] | None,
 ) -> str:
-    """Render a compact map grid string with the current position marked.
-
-    Each row shows columns 0-6 using room-type symbols. The current floor's
-    column is suffixed with ``*``.  Rows are listed top-to-bottom (highest
-    floor first) so the boss is at the top and floor 0 at the bottom.
-
-    When ``sts_map`` is ``None`` returns a stub string so the LLM still gets
-    a meaningful (if empty) field.
-    """
+    """Render map context using sts_env's forward-looking ASCII view."""
     if sts_map is None:
         return _MAP_NO_MAP_STUB
 
-    current_floor = current_position[0] if current_position else -1
-    current_x = current_position[1] if current_position else -1
-
-    lines: list[str] = []
-    for floor in sorted(sts_map.nodes.keys(), reverse=True):
-        row_parts: list[str] = []
-        for x in range(7):  # MAP_WIDTH = 7
-            node = sts_map.get_node(floor, x)
-            if node is None or (not node.edges and not node.parents):
-                row_parts.append(".")
-                continue
-            sym = _ROOM_SYMBOLS.get(node.room_type.name, "?")
-            if floor == current_floor and x == current_x:
-                sym = sym + "*"
-            row_parts.append(sym)
-        lines.append(f"F{floor:2d}: {' '.join(row_parts)}")
-
-    return "\n".join(lines)
+    current_floor = current_position[0] if current_position else None
+    current_x = current_position[1] if current_position else None
+    return sts_map.render_ascii(
+        current_floor=current_floor,
+        current_x=current_x,
+        reachable_only=True,
+    )
 
 
 # ---------------------------------------------------------------------------
