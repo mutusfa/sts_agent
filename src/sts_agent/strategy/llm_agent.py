@@ -226,13 +226,9 @@ class CardPickSignature(dspy.Signature):
     card_choices: str = dspy.InputField(
         desc="3 card IDs offered as reward, comma-separated"
     )
-    upcoming_encounters: str = dspy.InputField(
-        desc="Remaining encounters as index:type/id pairs, semicolon-separated"
-    )
     map_view: str = dspy.InputField(
         desc=(
-            "Full Act 1 map with room types; current position marked with *. "
-            "Shows branching paths and upcoming room types beyond the chosen route."
+            "Map nodes reachable from the current position, marked with @"
         )
     )
     reasoning: str = dspy.OutputField(
