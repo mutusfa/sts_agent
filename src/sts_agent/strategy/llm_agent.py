@@ -315,10 +315,14 @@ def _format_map_view(
 
     current_floor = current_position[0] if current_position else None
     current_x = current_position[1] if current_position else None
-    return sts_map.render_ascii(
-        current_floor=current_floor,
-        current_x=current_x,
-        reachable_only=True,
+    return (
+        "```text\n"
+        f"{sts_map.render_ascii(
+            current_floor=current_floor,
+            current_x=current_x,
+            reachable_only=True,
+        )}\n"
+        "```"
     )
 
 
