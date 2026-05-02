@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING
 import dspy
 import mlflow
 from pydantic import BaseModel
+from dotenv import load_dotenv
 
 from sts_env.run.character import Character
 
@@ -122,17 +123,8 @@ def _card_info(card_id: str) -> CardInfo:
 _ENV_PATH = Path(__file__).resolve().parent.parent.parent / ".env"
 
 
-def _load_env() -> None:
-    """Load ``GLM_API_KEY`` from the project ``.env`` if not already set."""
-    if _ENV_PATH.exists():
-        for line in _ENV_PATH.read_text().splitlines():
-            line = line.strip()
-            if "=" in line and not line.startswith("#"):
-                key, _, value = line.partition("=")
-                os.environ.setdefault(key.strip(), value.strip())
+load_dotenv(dotenv_path=_ENV_PATH)
 
-
-_load_env()
 
 # ---------------------------------------------------------------------------
 # LM configuration

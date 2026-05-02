@@ -2847,6 +2847,7 @@ source = { editable = "." }
 dependencies = [
     { name = "dspy-ai" },
     { name = "mlflow" },
+    { name = "python-dotenv" },
     { name = "sts-env" },
 ]
 
@@ -2863,6 +2864,7 @@ dev = [
 requires-dist = [
     { name = "dspy-ai", specifier = ">=3.2.0" },
     { name = "mlflow", specifier = ">=3.4" },
+    { name = "python-dotenv", specifier = ">=1.2.2" },
     { name = "sts-env", editable = "../sts_env" },
 ]
 

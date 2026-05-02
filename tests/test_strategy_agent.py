@@ -26,6 +26,7 @@ from sts_agent.strategy.llm_agent import (
     _format_result,
     _make_tools,
 )
+from sts_agent.strategy import llm_agent
 from sts_agent.strategy.simulate import SimResult
 
 
@@ -231,6 +232,13 @@ class TestTools:
                             budget_checker=lambda: None)
         result = tools[1]("Anger", "99")
         assert "Error" in result
+
+
+class TestEnvLoading:
+    def test_load_env_uses_python_dotenv(self):
+        with patch("sts_agent.strategy.llm_agent.load_dotenv") as mock_load:
+            llm_agent._load_env()
+        mock_load.assert_called_once_with(dotenv_path=llm_agent._ENV_PATH)
 
 
 # ---------------------------------------------------------------------------
