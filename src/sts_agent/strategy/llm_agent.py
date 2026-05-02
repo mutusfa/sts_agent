@@ -276,7 +276,7 @@ class CardPickSignature(dspy.Signature):
     - Bosses: slime_boss, guardian, hexaghost
 
     Map symbols: M=monster, E=elite, B=boss, R=rest, ?=event, $=shop, T=treasure.
-    Current floor is marked with * in the map view.
+    Current position is marked with @ in the map view.
     """
 
     character_state: str = dspy.InputField(
