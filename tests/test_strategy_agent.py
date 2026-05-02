@@ -19,12 +19,19 @@ from sts_env.run.map import StSMap, MapNode, RoomType, generate_act1_map
 from sts_agent.run import run_act1, RunResult
 from sts_agent.battle.mcts import MCTSPlanner
 from sts_agent.strategy.llm_agent import (
+    CardInfo,
     CardPickSignature,
     StrategyAgent,
+    _card_info,
     _format_result,
     _make_tools,
 )
 from sts_agent.strategy.simulate import SimResult
+
+
+def _choices(*card_ids: str) -> list[CardInfo]:
+    """Build a list[CardInfo] from card IDs for _forced_pick tests."""
+    return [_card_info(c) for c in card_ids]
 
 
 # ---------------------------------------------------------------------------
@@ -70,18 +77,15 @@ class TestForcedPick:
     """Deterministic fallback: rare → uncommon → first."""
 
     def test_prefers_rare(self):
-        choices = ["Anger", "Inflame", "Feed"]
-        pick = StrategyAgent._forced_pick(_ironclad(), choices, _upcoming())
+        pick = StrategyAgent._forced_pick(_ironclad(), _choices("Anger", "Inflame", "Feed"), _upcoming())
         assert pick == "Feed"  # rare
 
     def test_prefers_uncommon_when_no_rare(self):
-        choices = ["Anger", "Carnage", "Flex"]
-        pick = StrategyAgent._forced_pick(_ironclad(), choices, _upcoming())
+        pick = StrategyAgent._forced_pick(_ironclad(), _choices("Anger", "Carnage", "Flex"), _upcoming())
         assert pick == "Carnage"  # uncommon
 
     def test_picks_first_when_all_common(self):
-        choices = ["Anger", "Flex", "Cleave"]
-        pick = StrategyAgent._forced_pick(_ironclad(), choices, _upcoming())
+        pick = StrategyAgent._forced_pick(_ironclad(), _choices("Anger", "Flex", "Cleave"), _upcoming())
         assert pick == "Anger"  # first common
 
     def test_empty_choices(self):
@@ -89,12 +93,11 @@ class TestForcedPick:
         assert pick is None
 
     def test_single_choice(self):
-        pick = StrategyAgent._forced_pick(_ironclad(), ["Bludgeon"], _upcoming())
+        pick = StrategyAgent._forced_pick(_ironclad(), _choices("Bludgeon"), _upcoming())
         assert pick == "Bludgeon"  # rare
 
     def test_multiple_rares_picks_first(self):
-        choices = ["Feed", "Bludgeon", "Anger"]
-        pick = StrategyAgent._forced_pick(_ironclad(), choices, _upcoming())
+        pick = StrategyAgent._forced_pick(_ironclad(), _choices("Feed", "Bludgeon", "Anger"), _upcoming())
         assert pick == "Feed"  # first rare
 
 
@@ -125,7 +128,45 @@ class TestFormatResult:
 
 
 # ---------------------------------------------------------------------------
-# Tool function tests (mocked simulations — fast)
+# _card_info / CardInfo tests
+# ---------------------------------------------------------------------------
+
+
+class TestCardInfo:
+    def test_strike_fields(self):
+        info = _card_info("Strike")
+        assert info.card_id == "Strike"
+        assert info.cost == 1
+        assert info.card_type == "attack"
+        assert info.rarity == "basic"
+        assert info.effects == {"attack": 6}
+        assert info.upgrade == {"attack": 3}
+        assert info.custom_code is None
+
+    def test_feed_has_custom_code(self):
+        info = _card_info("Feed")
+        assert info.custom_code is not None
+        assert "gain" in info.custom_code
+
+    def test_custom_code_presence(self):
+        assert _card_info("Anger").custom_code is not None
+        assert _card_info("IronWave").custom_code is None
+
+    def test_iron_wave_effects(self):
+        info = _card_info("IronWave")
+        assert info.effects == {"attack": 5, "block": 5}
+        assert info.upgrade == {"attack": 2, "block": 2}
+
+    def test_multi_hit_card_shows_hits(self):
+        info = _card_info("TwinStrike")
+        assert info.effects.get("hits") == 2
+
+    def test_strike_no_hits_field(self):
+        # hits=1 is the default — should not appear in effects
+        assert "hits" not in _card_info("Strike").effects
+
+
+# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 
 
@@ -382,6 +423,29 @@ class TestPickCardMapAware:
         mock_result.pick = pick_value
         mock.return_value.return_value = mock_result
         return mock
+
+    def test_pick_card_passes_card_infos_to_react(self):
+        """card_choices passed to dspy.ReAct should be list[CardInfo] with correct ids."""
+        agent = StrategyAgent()
+        captured_kwargs: dict = {}
+
+        def fake_react_factory(sig, tools, max_iters):
+            inst = MagicMock()
+            def call_side_effect(**kwargs):
+                captured_kwargs.update(kwargs)
+                r = MagicMock()
+                r.pick = "Anger"
+                return r
+            inst.side_effect = call_side_effect
+            return inst
+
+        with patch("sts_agent.strategy.llm_agent.dspy.ReAct", side_effect=fake_react_factory):
+            agent.pick_card(_ironclad(), ["Anger", "Inflame", "Flex"], [], seed=1)
+
+        choices = captured_kwargs["card_choices"]
+        assert isinstance(choices, list)
+        assert all(isinstance(c, CardInfo) for c in choices)
+        assert [c.card_id for c in choices] == ["Anger", "Inflame", "Flex"]
 
     def test_pick_card_passes_map_view_when_sts_map_provided(self):
         """When sts_map + current_position supplied, map_view comes from render_ascii."""

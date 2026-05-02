@@ -28,6 +28,7 @@ ensure_lm       — lazy init helper
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 import time
@@ -36,6 +37,7 @@ from typing import TYPE_CHECKING
 
 import dspy
 import mlflow
+from pydantic import BaseModel
 
 from sts_env.run.character import Character
 
@@ -46,7 +48,72 @@ if TYPE_CHECKING:
     from sts_env.run.map import StSMap
     from sts_env.run.encounter_queue import EncounterQueue
 
+import dataclasses
+
 log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Card spec model
+# ---------------------------------------------------------------------------
+
+# Derive numeric effect field names directly from CardSpec: int fields whose
+# default is exactly 0 (excludes hits=1, booleans False==0, cost with no default).
+def _derive_effect_fields() -> tuple[str, ...]:
+    from sts_env.combat.cards import CardSpec
+    return tuple(
+        f.name for f in dataclasses.fields(CardSpec)
+        if f.default == 0 and not isinstance(f.default, bool)
+    )
+
+_EFFECT_FIELDS = _derive_effect_fields()
+
+
+class CardInfo(BaseModel):
+    """Structured card spec for LLM consumption."""
+
+    card_id: str
+    cost: int
+    card_type: str           # "attack" | "skill" | "power" | "curse" | "status"
+    rarity: str              # "basic" | "common" | "uncommon" | "rare" | "special"
+    target: str              # "single_enemy" | "all_enemies" | "none"
+    effects: dict[str, int]  # non-zero base declarative fields; hits shown only when >1
+    upgrade: dict[str, int]  # upgrade deltas (empty = not upgradeable)
+    exhausts: bool
+    custom_code: str | None  # source of custom handler if present, else None
+
+
+def _card_info(card_id: str) -> CardInfo:
+    """Build a :class:`CardInfo` from the sts_env card registry."""
+    from sts_env.combat.cards import get_spec
+
+    spec = get_spec(card_id)
+
+    effects: dict[str, int] = {}
+    for field_name in _EFFECT_FIELDS:
+        val = getattr(spec, field_name, 0)
+        if val:
+            effects[field_name] = int(val)
+    if spec.hits > 1:
+        effects["hits"] = spec.hits
+    if spec.innate:
+        effects["innate"] = 1
+
+    custom_code: str | None = None
+    if spec.custom is not None:
+        custom_code = inspect.getsource(spec.custom)
+
+    return CardInfo(
+        card_id=card_id,
+        cost=spec.cost,
+        card_type=spec.card_type.name.lower(),
+        rarity=spec.rarity.name.lower(),
+        target=spec.target.name.lower(),
+        effects=effects,
+        upgrade=dict(spec.upgrade),
+        exhausts=spec.exhausts,
+        custom_code=custom_code,
+    )
+
 
 # ---------------------------------------------------------------------------
 # Environment / API key
@@ -223,8 +290,8 @@ class CardPickSignature(dspy.Signature):
     character_state: str = dspy.InputField(
         desc="Current character: HP, deck size, potions, relics, floor"
     )
-    card_choices: str = dspy.InputField(
-        desc="3 card IDs offered as reward, comma-separated"
+    card_choices: list[CardInfo] = dspy.InputField(
+        desc="Cards offered as reward — each carries full spec, upgrade deltas, and custom handler code if any"
     )
     map_view: str = dspy.InputField(
         desc=(
@@ -359,7 +426,7 @@ class StrategyAgent(BaseStrategyAgent):
         self._start_time = time.time()
         self._timed_out = False
 
-        choices_str = ", ".join(card_choices)
+        card_infos = [_card_info(c) for c in card_choices]
         upcoming_str = "; ".join(
             f"{i}: {t}/{e}" for i, (t, e) in enumerate(upcoming_encounters)
         )
@@ -369,7 +436,7 @@ class StrategyAgent(BaseStrategyAgent):
         if span:
             span.set_attributes({
                 "character_state": character.summary(),
-                "card_choices": choices_str,
+                "card_choices": ", ".join(c.card_id for c in card_infos),
                 "upcoming_encounters": upcoming_str,
                 "seed": seed,
                 "map_view": map_view[:500],  # truncate for span storage
@@ -384,7 +451,7 @@ class StrategyAgent(BaseStrategyAgent):
             react = dspy.ReAct(CardPickSignature, tools=tools, max_iters=8)
             result = react(
                 character_state=character.summary(),
-                card_choices=choices_str,
+                card_choices=card_infos,
                 upcoming_encounters=upcoming_str,
                 map_view=map_view,
             )
@@ -396,30 +463,30 @@ class StrategyAgent(BaseStrategyAgent):
                 return None
 
             # Exact match (case-insensitive)
-            for choice in card_choices:
-                if choice.lower() == raw_pick.lower():
-                    log.info("LLM strategy: picked %s", choice)
-                    self._set_pick_attrs(choice, fallback=False)
-                    return choice
+            for info in card_infos:
+                if info.card_id.lower() == raw_pick.lower():
+                    log.info("LLM strategy: picked %s", info.card_id)
+                    self._set_pick_attrs(info.card_id, fallback=False)
+                    return info.card_id
 
             # Substring match (LLM sometimes adds spaces/words)
-            for choice in card_choices:
+            for info in card_infos:
                 if (
-                    raw_pick.lower() in choice.lower()
-                    or choice.lower() in raw_pick.lower()
+                    raw_pick.lower() in info.card_id.lower()
+                    or info.card_id.lower() in raw_pick.lower()
                 ):
                     log.info(
                         "LLM strategy: fuzzy-matched '%s' → %s",
-                        raw_pick, choice,
+                        raw_pick, info.card_id,
                     )
-                    self._set_pick_attrs(choice, fallback=False)
-                    return choice
+                    self._set_pick_attrs(info.card_id, fallback=False)
+                    return info.card_id
 
             log.warning(
                 "LLM returned '%s' not matching choices %s; forced pick",
                 raw_pick, card_choices,
             )
-            pick = self._forced_pick(character, card_choices, upcoming_encounters)
+            pick = self._forced_pick(character, card_infos, upcoming_encounters)
             self._set_pick_attrs(pick, fallback=True)
             return pick
 
@@ -428,13 +495,13 @@ class StrategyAgent(BaseStrategyAgent):
             log.warning(
                 "Strategy timeout after %.1fs; forced pick", elapsed,
             )
-            pick = self._forced_pick(character, card_choices, upcoming_encounters)
+            pick = self._forced_pick(character, card_infos, upcoming_encounters)
             self._set_pick_attrs(pick, fallback=True)
             return pick
 
         except Exception as exc:
             log.warning("Strategy agent error: %s; forced pick", exc)
-            pick = self._forced_pick(character, card_choices, upcoming_encounters)
+            pick = self._forced_pick(character, card_infos, upcoming_encounters)
             self._set_pick_attrs(pick, fallback=True)
             return pick
 
@@ -456,23 +523,17 @@ class StrategyAgent(BaseStrategyAgent):
     @staticmethod
     def _forced_pick(
         character: Character,
-        card_choices: list[str],
+        card_choices: list[CardInfo],
         upcoming_encounters: list[tuple[str, str]],
     ) -> str | None:
         """Deterministic fallback when the LLM fails or times out.
 
         Priority: rare → uncommon → first card.
         """
-        from sts_env.combat.card_pools import pool
-        from sts_env.combat.cards import CardColor, Rarity
-
-        rare_set = set(pool(CardColor.RED, Rarity.RARE))
-        uncommon_set = set(pool(CardColor.RED, Rarity.UNCOMMON))
-
-        for c in card_choices:
-            if c in rare_set:
-                return c
-        for c in card_choices:
-            if c in uncommon_set:
-                return c
-        return card_choices[0] if card_choices else None
+        for info in card_choices:
+            if info.rarity == "rare":
+                return info.card_id
+        for info in card_choices:
+            if info.rarity == "uncommon":
+                return info.card_id
+        return card_choices[0].card_id if card_choices else None
