@@ -27,7 +27,7 @@ from sts_agent.strategy.llm_agent import (
     _make_tools,
 )
 from sts_agent.strategy import llm_agent
-from sts_agent.strategy.simulate import SimResult
+from sts_agent.strategy.simulate import SimResult, _resolve_enc, _ACT1_POOLS
 
 
 def _choices(*card_ids: str) -> list[CardInfo]:
@@ -78,27 +78,27 @@ class TestForcedPick:
     """Deterministic fallback: rare → uncommon → first."""
 
     def test_prefers_rare(self):
-        pick = StrategyAgent._forced_pick(_ironclad(), _choices("Anger", "Inflame", "Feed"), _upcoming())
+        pick = StrategyAgent._forced_pick(_choices("Anger", "Inflame", "Feed"))
         assert pick == "Feed"  # rare
 
     def test_prefers_uncommon_when_no_rare(self):
-        pick = StrategyAgent._forced_pick(_ironclad(), _choices("Anger", "Carnage", "Flex"), _upcoming())
+        pick = StrategyAgent._forced_pick(_choices("Anger", "Carnage", "Flex"))
         assert pick == "Carnage"  # uncommon
 
     def test_picks_first_when_all_common(self):
-        pick = StrategyAgent._forced_pick(_ironclad(), _choices("Anger", "Flex", "Cleave"), _upcoming())
+        pick = StrategyAgent._forced_pick(_choices("Anger", "Flex", "Cleave"))
         assert pick == "Anger"  # first common
 
     def test_empty_choices(self):
-        pick = StrategyAgent._forced_pick(_ironclad(), [], _upcoming())
+        pick = StrategyAgent._forced_pick([])
         assert pick is None
 
     def test_single_choice(self):
-        pick = StrategyAgent._forced_pick(_ironclad(), _choices("Bludgeon"), _upcoming())
+        pick = StrategyAgent._forced_pick(_choices("Bludgeon"))
         assert pick == "Bludgeon"  # rare
 
     def test_multiple_rares_picks_first(self):
-        pick = StrategyAgent._forced_pick(_ironclad(), _choices("Feed", "Bludgeon", "Anger"), _upcoming())
+        pick = StrategyAgent._forced_pick(_choices("Feed", "Bludgeon", "Anger"))
         assert pick == "Feed"  # first rare
 
 
@@ -178,26 +178,26 @@ class TestTools:
         mock_result = SimResult(True, 10, 0, 70, 80, 5)
         with patch("sts_agent.strategy.llm_agent.simulate_encounter",
                    return_value=mock_result):
-            tools = _make_tools(_ironclad(), [("easy", "jaw_worm")],
-                                seed=42, budget_checker=lambda: None)
-            result = tools[0]("0")
+            tools = _make_tools(_ironclad(), seed=42, budget_checker=lambda: None)
+            result = tools[0]("monster")
             assert "SURVIVED" in result
             assert "Baseline" in result
             assert "damage_taken=10" in result
 
-    def test_simulate_upcoming_out_of_range(self):
-        tools = _make_tools(_ironclad(), [("easy", "jaw_worm")], seed=42,
-                            budget_checker=lambda: None)
-        result = tools[0]("5")
-        assert "Error" in result
+    def test_simulate_upcoming_label_contains_room_type(self):
+        mock_result = SimResult(True, 10, 0, 70, 80, 5)
+        with patch("sts_agent.strategy.llm_agent.simulate_encounter",
+                   return_value=mock_result):
+            tools = _make_tools(_ironclad(), seed=42, budget_checker=lambda: None)
+            result = tools[0]("elite")
+            assert "elite" in result
 
     def test_try_card_valid(self):
         mock_result = SimResult(True, 8, 0, 72, 80, 4)
         with patch("sts_agent.strategy.llm_agent.simulate_with_card",
                    return_value=mock_result):
-            tools = _make_tools(_ironclad(), [("easy", "jaw_worm")],
-                                seed=42, budget_checker=lambda: None)
-            result = tools[1]("Anger", "0")
+            tools = _make_tools(_ironclad(), seed=42, budget_checker=lambda: None)
+            result = tools[1]("Anger", "monster")
             assert "Anger" in result
             assert "damage_taken=8" in result
 
@@ -207,38 +207,66 @@ class TestTools:
         mock_result = SimResult(True, 5, 0, 75, 80, 3)
         with patch("sts_agent.strategy.llm_agent.simulate_encounter",
                    return_value=mock_result):
-            tools = _make_tools(_ironclad(), [("easy", "jaw_worm")], seed=42,
-                                budget_checker=checker)
-            tools[0]("0")
+            tools = _make_tools(_ironclad(), seed=42, budget_checker=checker)
+            tools[0]("monster")
         assert len(calls) == 1
 
     def test_budget_timeout_propagates(self):
         def raise_timeout():
             raise TimeoutError("budget exceeded")
 
-        tools = _make_tools(_ironclad(), [("easy", "jaw_worm")], seed=42,
-                            budget_checker=raise_timeout)
+        tools = _make_tools(_ironclad(), seed=42, budget_checker=raise_timeout)
         with pytest.raises(TimeoutError, match="budget exceeded"):
-            tools[0]("0")
-
-    def test_simulate_upcoming_negative_index(self):
-        tools = _make_tools(_ironclad(), [("easy", "jaw_worm")], seed=42,
-                            budget_checker=lambda: None)
-        result = tools[0]("-1")
-        assert "Error" in result
-
-    def test_try_card_out_of_range(self):
-        tools = _make_tools(_ironclad(), [("easy", "jaw_worm")], seed=42,
-                            budget_checker=lambda: None)
-        result = tools[1]("Anger", "99")
-        assert "Error" in result
+            tools[0]("monster")
 
 
-class TestEnvLoading:
-    def test_load_env_uses_python_dotenv(self):
-        with patch("sts_agent.strategy.llm_agent.load_dotenv") as mock_load:
-            llm_agent._load_env()
-        mock_load.assert_called_once_with(dotenv_path=llm_agent._ENV_PATH)
+# ---------------------------------------------------------------------------
+# _resolve_enc tests
+# ---------------------------------------------------------------------------
+
+
+class TestResolveEnc:
+    """_resolve_enc resolves empty enc_ids and maps room-type names to sim types."""
+
+    def test_passthrough_when_enc_id_provided(self):
+        """Non-empty enc_id is passed through unchanged."""
+        assert _resolve_enc("easy", "cultist", 42) == ("easy", "cultist")
+        assert _resolve_enc("elite", "Gremlin Nob", 0) == ("elite", "Gremlin Nob")
+
+    def test_monster_samples_from_combined_pool(self):
+        """'monster' with empty id returns a valid (easy|hard, enc_id) pair."""
+        enc_type, enc_id = _resolve_enc("monster", "", 42)
+        valid_pairs = _ACT1_POOLS["monster"]
+        assert (enc_type, enc_id) in valid_pairs
+
+    def test_elite_samples_from_elite_pool(self):
+        enc_type, enc_id = _resolve_enc("elite", "", 42)
+        assert (enc_type, enc_id) in _ACT1_POOLS["elite"]
+
+    def test_boss_samples_from_boss_pool(self):
+        enc_type, enc_id = _resolve_enc("boss", "", 42)
+        assert (enc_type, enc_id) in _ACT1_POOLS["boss"]
+
+    def test_easy_samples_from_easy_pool(self):
+        enc_type, enc_id = _resolve_enc("easy", "", 42)
+        assert (enc_type, enc_id) in _ACT1_POOLS["easy"]
+
+    def test_hard_samples_from_hard_pool(self):
+        enc_type, enc_id = _resolve_enc("hard", "", 42)
+        assert (enc_type, enc_id) in _ACT1_POOLS["hard"]
+
+    def test_deterministic_same_seed(self):
+        """Same seed always returns the same encounter."""
+        assert _resolve_enc("monster", "", 99) == _resolve_enc("monster", "", 99)
+
+    def test_different_seeds_may_differ(self):
+        """Different seeds can return different encounters (probabilistically)."""
+        results = {_resolve_enc("monster", "", s) for s in range(20)}
+        assert len(results) > 1, "Expected variety across seeds"
+
+    def test_unknown_type_raises(self):
+        with pytest.raises(ValueError, match="Unknown encounter type"):
+            _resolve_enc("dragon", "", 42)
 
 
 # ---------------------------------------------------------------------------
@@ -337,51 +365,6 @@ class TestStrategyAgent:
             )
             assert pick is None
 
-    def test_fallback_model_used_when_primary_fails(self):
-        """If primary model fails, fallback model is tried once."""
-        agent = StrategyAgent(model="primary-model", fallback_model="fallback-model")
-        model_attempts: list[str] = []
-
-        class _FakeLM:
-            def __init__(self, model_name: str):
-                self.model = model_name
-
-        def fake_ensure_lm(*, primary_model: str, fallback_model: str | None = None):
-            return _FakeLM(primary_model), _FakeLM(fallback_model)
-
-        def fake_context(*, lm):
-            class _Ctx:
-                def __enter__(self):
-                    return None
-
-                def __exit__(self, exc_type, exc, tb):
-                    return False
-
-            return _Ctx()
-
-        def fake_react_factory(sig, tools, max_iters):
-            def call_side_effect(**kwargs):
-                model_attempts.append(kwargs.get("character_state", ""))
-                if len(model_attempts) == 1:
-                    raise RuntimeError("primary failed")
-                r = MagicMock()
-                r.pick = "Anger"
-                return r
-
-            inst = MagicMock()
-            inst.side_effect = call_side_effect
-            return inst
-
-        with patch("sts_agent.strategy.llm_agent.ensure_lm", side_effect=fake_ensure_lm), \
-             patch("sts_agent.strategy.llm_agent.dspy.context", side_effect=fake_context), \
-             patch("sts_agent.strategy.llm_agent.dspy.ReAct", side_effect=fake_react_factory):
-            pick = agent.pick_card(
-                _ironclad(), ["Anger", "Inflame", "Flex"],
-                _upcoming(), seed=42,
-            )
-
-        assert pick == "Anger"
-        assert len(model_attempts) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -526,7 +509,7 @@ class TestPickCardMapAware:
             )
 
         assert "map_view" in captured_kwargs
-        assert captured_kwargs["map_view"] == "FORWARD_ASCII_MAP"
+        assert "FORWARD_ASCII_MAP" in captured_kwargs["map_view"]
         fake_map.render_ascii.assert_called_once_with(
             current_floor=0,
             current_x=3,

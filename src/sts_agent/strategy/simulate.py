@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import random
 from dataclasses import dataclass
 
 from sts_env.run.builder import build_combat
@@ -28,6 +29,83 @@ from ..battle.base import run_planner
 from ..battle.mcts import MCTSPlanner
 
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Encounter pool resolution
+# ---------------------------------------------------------------------------
+
+# Each entry is (enc_type_for_build_combat, enc_id).
+# "monster" covers the full Act 1 hallway pool (easy + hard) for use when
+# only the room type is known.  Future: sts_env could restrict the pool based
+# on how many easy/hard fights have already been seen.
+_ACT1_POOLS: dict[str, list[tuple[str, str]]] = {
+    "easy": [
+        ("easy", "cultist"),
+        ("easy", "jaw_worm"),
+        ("easy", "two_louses"),
+        ("easy", "small_slimes"),
+    ],
+    "hard": [
+        ("hard", "gremlin_gang"),
+        ("hard", "red_slaver"),
+        ("hard", "blue_slaver"),
+        ("hard", "looter"),
+        ("hard", "exordium_thugs"),
+        ("hard", "exordium_wildlife"),
+        ("hard", "large_slime"),
+        ("hard", "three_louse"),
+        ("hard", "two_fungi_beasts"),
+    ],
+    "elite": [
+        ("elite", "Gremlin Nob"),
+        ("elite", "Lagavulin"),
+        ("elite", "Three Sentries"),
+    ],
+    "boss": [
+        ("boss", "slime_boss"),
+        ("boss", "guardian"),
+        ("boss", "hexaghost"),
+    ],
+}
+# "monster" = unknown hallway difficulty → combined easy + hard pool
+_ACT1_POOLS["monster"] = _ACT1_POOLS["easy"] + _ACT1_POOLS["hard"]
+
+
+def _resolve_enc(enc_type: str, enc_id: str, seed: int) -> tuple[str, str]:
+    """Resolve a ``(enc_type, enc_id)`` pair, sampling from the pool when enc_id is empty.
+
+    Parameters
+    ----------
+    enc_type:
+        Encounter type as received (``"easy"``, ``"hard"``, ``"elite"``,
+        ``"boss"``, or ``"monster"`` for an unspecified hallway room).
+    enc_id:
+        Specific encounter identifier.  When empty the pool for *enc_type*
+        is sampled deterministically using *seed*.
+    seed:
+        Used to seed the RNG so repeated calls with the same arguments
+        always return the same encounter.
+
+    Returns
+    -------
+    ``(resolved_enc_type, resolved_enc_id)`` safe to pass to ``build_combat``.
+
+    Raises
+    ------
+    ValueError
+        If *enc_type* is not recognised and *enc_id* is also empty.
+    """
+    if enc_id:
+        return enc_type, enc_id
+
+    pool = _ACT1_POOLS.get(enc_type)
+    if pool is None:
+        raise ValueError(
+            f"Unknown encounter type {enc_type!r} and no enc_id provided. "
+            f"Known types: {list(_ACT1_POOLS)}"
+        )
+    return random.Random(seed).choice(pool)
 
 
 @dataclass
@@ -140,9 +218,11 @@ def simulate_encounter(
         A :class:`Character` whose deck / HP / potions define the player
         state.  A deep-copy is made so the original is never mutated.
     encounter_type:
-        ``"easy"``, ``"hard"``, ``"elite"``, or ``"boss"``.
+        ``"easy"``, ``"hard"``, ``"elite"``, ``"boss"``, or ``"monster"``
+        (unknown hallway difficulty — sampled from the combined easy+hard pool).
     encounter_id:
         Encounter identifier string (e.g. ``"cultist"``, ``"Lagavulin"``).
+        Pass an empty string to sample a representative encounter from the pool.
     seed:
         Combat seed for deterministic results.
     max_nodes:
@@ -154,6 +234,7 @@ def simulate_encounter(
     -------
     SimResult with survival, damage, HP, and turn information.
     """
+    encounter_type, encounter_id = _resolve_enc(encounter_type, encounter_id, seed)
     char_copy = copy.deepcopy(character)
     combat = build_combat(
         encounter_type, encounter_id, seed, character=char_copy
@@ -219,7 +300,9 @@ def probe_encounter(
     character:
         A :class:`Character`.  Deep-copied internally.
     encounter_type, encounter_id, seed:
-        Encounter specification.
+        Encounter specification.  ``encounter_type`` may be ``"monster"``
+        and ``encounter_id`` may be empty — both are resolved via
+        :func:`_resolve_enc` before building the combat.
     max_nodes:
         MCTS node budget.
     simulations:
@@ -229,6 +312,7 @@ def probe_encounter(
     -------
     SimDistribution with mean/std/max of terminal scores.
     """
+    encounter_type, encounter_id = _resolve_enc(encounter_type, encounter_id, seed)
     char_copy = copy.deepcopy(character)
     combat = build_combat(
         encounter_type, encounter_id, seed, character=char_copy

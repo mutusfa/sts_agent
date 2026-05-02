@@ -194,7 +194,6 @@ def _format_result(label: str, result: SimResult) -> str:
 
 def _make_tools(
     character: Character,
-    upcoming: list[tuple[str, str]],
     seed: int,
     budget_checker: callable,
 ) -> list:
@@ -203,48 +202,36 @@ def _make_tools(
     Each tool checks the remaining time budget before running a simulation.
     """
 
-    def simulate_upcoming(encounter_index: str) -> str:
-        """Simulate an upcoming encounter with the current deck (baseline).
+    def simulate_upcoming(room_type: str) -> str:
+        """Simulate an upcoming encounter of the given room type with the current deck.
 
         Args:
-            encounter_index: 0-based index into the upcoming encounters list.
+            room_type: Room type read from the map view — one of 'monster', 'elite', 'boss'.
         Returns:
             Human-readable simulation result (survived, damage, HP, turns).
         """
         budget_checker()
-        idx = int(encounter_index)
-        if idx < 0 or idx >= len(upcoming):
-            return f"Error: index {idx} out of range [0, {len(upcoming) - 1}]"
-
-        enc_type, enc_id = upcoming[idx]
-        encounter_seed = seed * 1000 + idx
         result = simulate_encounter(
-            character, enc_type, enc_id, encounter_seed,
+            character, room_type, "", seed * 1000,
             max_nodes=5000, simulations=5000,
         )
-        return _format_result(f"Baseline ({enc_type}/{enc_id})", result)
+        return _format_result(f"Baseline ({room_type})", result)
 
-    def try_card(card_id: str, encounter_index: str) -> str:
+    def try_card(card_id: str, room_type: str) -> str:
         """Simulate an encounter with a hypothetical card added to the deck.
 
         Args:
             card_id: The card ID to evaluate (one of the reward choices).
-            encounter_index: 0-based index into the upcoming encounters list.
+            room_type: Room type read from the map view — one of 'monster', 'elite', 'boss'.
         Returns:
             Human-readable simulation result for the card + encounter.
         """
         budget_checker()
-        idx = int(encounter_index)
-        if idx < 0 or idx >= len(upcoming):
-            return f"Error: index {idx} out of range [0, {len(upcoming) - 1}]"
-
-        enc_type, enc_id = upcoming[idx]
-        encounter_seed = seed * 1000 + idx
         result = simulate_with_card(
-            character, card_id, enc_type, enc_id, encounter_seed,
+            character, card_id, room_type, "", seed * 1000,
             max_nodes=5000, simulations=5000,
         )
-        return _format_result(f"With {card_id} vs {enc_type}/{enc_id}", result)
+        return _format_result(f"With {card_id} vs {room_type}", result)
 
     return [simulate_upcoming, try_card]
 
@@ -276,7 +263,9 @@ class CardPickSignature(dspy.Signature):
     - Bosses: slime_boss, guardian, hexaghost
 
     Map symbols: M=monster, E=elite, B=boss, R=rest, ?=event, $=shop, T=treasure.
-    Current position is marked with @ in the map view.
+    Current position is marked with @ in the map view. Upcoming reachable rooms
+    are shown with their type symbol (M/E/B/R/?/$/ T). Use M→'monster',
+    E→'elite', B→'boss' as the room_type argument to simulation tools.
     """
 
     character_state: str = dspy.InputField(
@@ -287,7 +276,9 @@ class CardPickSignature(dspy.Signature):
     )
     map_view: str = dspy.InputField(
         desc=(
-            "Map nodes reachable from the current position, marked with @"
+            "ASCII map of the act. @ = current position; "
+            "M/E/B/R/?/$/ T = upcoming reachable rooms. "
+            "Pass 'monster', 'elite', or 'boss' to the simulation tools based on what you see ahead."
         )
     )
     reasoning: str = dspy.OutputField(
@@ -405,7 +396,8 @@ class StrategyAgent(BaseStrategyAgent):
         card_choices:
             3 card IDs to choose from.
         upcoming_encounters:
-            Remaining ``(type, id)`` encounters in the act.
+            Accepted for protocol compatibility; not used — the LLM reads
+            upcoming room types from the map view instead.
         seed:
             Master seed for deterministic simulations.
         sts_map:
@@ -423,9 +415,6 @@ class StrategyAgent(BaseStrategyAgent):
         self._timed_out = False
 
         card_infos = [_card_info(c) for c in card_choices]
-        upcoming_str = "; ".join(
-            f"{i}: {t}/{e}" for i, (t, e) in enumerate(upcoming_encounters)
-        )
         map_view = _format_map_view(sts_map, current_position)
 
         span = mlflow.get_current_active_span()
@@ -433,14 +422,13 @@ class StrategyAgent(BaseStrategyAgent):
             span.set_attributes({
                 "character_state": character.summary(),
                 "card_choices": ", ".join(c.card_id for c in card_infos),
-                "upcoming_encounters": upcoming_str,
                 "seed": seed,
                 "map_view": map_view[:500],  # truncate for span storage
             })
 
         # Create context-bound tools
         tools = _make_tools(
-            character, upcoming_encounters, seed, self._check_budget
+            character, seed, self._check_budget
         )
 
         try:
@@ -481,7 +469,7 @@ class StrategyAgent(BaseStrategyAgent):
                 "LLM returned '%s' not matching choices %s; forced pick",
                 raw_pick, card_choices,
             )
-            pick = self._forced_pick(character, card_infos, upcoming_encounters)
+            pick = self._forced_pick(card_infos)
             self._set_pick_attrs(pick, fallback=True)
             return pick
 
@@ -490,13 +478,13 @@ class StrategyAgent(BaseStrategyAgent):
             log.warning(
                 "Strategy timeout after %.1fs; forced pick", elapsed,
             )
-            pick = self._forced_pick(character, card_infos, upcoming_encounters)
+            pick = self._forced_pick(card_infos)
             self._set_pick_attrs(pick, fallback=True)
             return pick
 
         except Exception as exc:
             log.warning("Strategy agent error: %s; forced pick", exc)
-            pick = self._forced_pick(character, card_infos, upcoming_encounters)
+            pick = self._forced_pick(card_infos)
             self._set_pick_attrs(pick, fallback=True)
             return pick
 
@@ -516,11 +504,7 @@ class StrategyAgent(BaseStrategyAgent):
     # -- deterministic fallback ----------------------------------------------
 
     @staticmethod
-    def _forced_pick(
-        character: Character,
-        card_choices: list[CardInfo],
-        upcoming_encounters: list[tuple[str, str]],
-    ) -> str | None:
+    def _forced_pick(card_choices: list[CardInfo]) -> str | None:
         """Deterministic fallback when the LLM fails or times out.
 
         Priority: rare → uncommon → first card.
