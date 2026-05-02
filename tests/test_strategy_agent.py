@@ -337,6 +337,52 @@ class TestStrategyAgent:
             )
             assert pick is None
 
+    def test_fallback_model_used_when_primary_fails(self):
+        """If primary model fails, fallback model is tried once."""
+        agent = StrategyAgent(model="primary-model", fallback_model="fallback-model")
+        model_attempts: list[str] = []
+
+        class _FakeLM:
+            def __init__(self, model_name: str):
+                self.model = model_name
+
+        def fake_ensure_lm(*, primary_model: str, fallback_model: str | None = None):
+            return _FakeLM(primary_model), _FakeLM(fallback_model)
+
+        def fake_context(*, lm):
+            class _Ctx:
+                def __enter__(self):
+                    return None
+
+                def __exit__(self, exc_type, exc, tb):
+                    return False
+
+            return _Ctx()
+
+        def fake_react_factory(sig, tools, max_iters):
+            def call_side_effect(**kwargs):
+                model_attempts.append(kwargs.get("character_state", ""))
+                if len(model_attempts) == 1:
+                    raise RuntimeError("primary failed")
+                r = MagicMock()
+                r.pick = "Anger"
+                return r
+
+            inst = MagicMock()
+            inst.side_effect = call_side_effect
+            return inst
+
+        with patch("sts_agent.strategy.llm_agent.ensure_lm", side_effect=fake_ensure_lm), \
+             patch("sts_agent.strategy.llm_agent.dspy.context", side_effect=fake_context), \
+             patch("sts_agent.strategy.llm_agent.dspy.ReAct", side_effect=fake_react_factory):
+            pick = agent.pick_card(
+                _ironclad(), ["Anger", "Inflame", "Flex"],
+                _upcoming(), seed=42,
+            )
+
+        assert pick == "Anger"
+        assert len(model_attempts) == 2
+
 
 # ---------------------------------------------------------------------------
 # run_act1 integration tests (slow — uses real MCTS)

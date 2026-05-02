@@ -130,8 +130,8 @@ load_dotenv(dotenv_path=_ENV_PATH)
 # LM configuration
 # ---------------------------------------------------------------------------
 
-ZAI_API_BASE = "https://open.bigmodel.cn/api/coding/paas/v4/"
-DEFAULT_MODEL = "glm-4.5-air"
+DEEPSEEK_API_BASE = "https://api.deepseek.com"
+DEFAULT_MODEL = "deepseek-v4-flash"
 DEFAULT_TIMEOUT = 300  # seconds (5 min)
 
 _lm_configured = False
@@ -140,16 +140,16 @@ _lm_configured = False
 def configure_lm(
     model: str = DEFAULT_MODEL,
     api_key: str | None = None,
-    api_base: str = ZAI_API_BASE,
+    api_base: str = DEEPSEEK_API_BASE,
 ) -> dspy.LM:
     """Configure the dspy language model.
 
     Parameters
     ----------
     model:
-        Model name forwarded to the provider (default ``"glm-5.1"``).
+        Model name forwarded to the provider (default ``"deepseek-v4-flash"``).
     api_key:
-        API key.  Falls back to ``GLM_API_KEY`` env var.
+        API key.  Falls back to ``DEEPSEEK_API_KEY`` env var.
     api_base:
         OpenAI-compatible base URL.
 
@@ -158,10 +158,10 @@ def configure_lm(
     The configured :class:`dspy.LM` instance.
     """
     global _lm_configured
-    key = api_key or os.environ.get("GLM_API_KEY", "")
+    key = api_key or os.environ.get("DEEPSEEK_API_KEY", "")
     if not key:
         raise RuntimeError(
-            "GLM_API_KEY not found. Set it in sts_agent/.env or as an env var."
+            "DEEPSEEK_API_KEY not found. Set it in sts_agent/.env or as an env var."
         )
     lm = dspy.LM(f"openai/{model}", api_key=key, api_base=api_base)
     dspy.configure(lm=lm)
@@ -444,7 +444,6 @@ class StrategyAgent(BaseStrategyAgent):
             result = react(
                 character_state=character.summary(),
                 card_choices=card_infos,
-                upcoming_encounters=upcoming_str,
                 map_view=map_view,
             )
             raw_pick: str = getattr(result, "pick", "").strip()
