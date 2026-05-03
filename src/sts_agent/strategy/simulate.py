@@ -129,6 +129,10 @@ class SimResult:
     enemy_hp_remaining:
         Total enemy HP remaining at end of combat.  0 when the player won;
         positive when the player died, indicating how close the fight was.
+    distribution:
+        PV score distribution from the first MCTS act() call.  Populated
+        by ``simulate_encounter`` when using ``MCTSPlanner``; ``None``
+        for other planners or when stats are unavailable.
     """
 
     survived: bool
@@ -138,6 +142,7 @@ class SimResult:
     final_max_hp: int
     turns: int
     enemy_hp_remaining: int = 0
+    distribution: SimDistribution | None = None
 
 
 @dataclass
@@ -224,6 +229,34 @@ class SimDistribution:
 # ---------------------------------------------------------------------------
 
 
+def _run_planner_capture_first_act(
+    planner: MCTSPlanner, combat
+) -> tuple[int, SimDistribution | None]:
+    """Drive *planner* through one full combat, capturing PV stats from the first act().
+
+    Returns ``(damage_taken, distribution)`` where *distribution* is built from
+    ``planner.last_stats`` after the very first ``act()`` call — the most
+    informative point, covering the full remaining combat from the initial state.
+    Subsequent acts' stats are intentionally ignored (state has diverged).
+    """
+    obs = combat.reset()
+    first_distribution: SimDistribution | None = None
+    while not obs.done:
+        action = planner.act(combat)
+        if first_distribution is None and planner.last_stats:
+            s = planner.last_stats
+            first_distribution = SimDistribution(
+                mean_score=s.get("pv_mean", float("nan")),
+                std_score=s.get("pv_std", 0.0),
+                max_score=s.get("pv_max", float("nan")),
+                n=int(s.get("pv_n", 0)),
+                deaths=int(s.get("pv_deaths", 0)),
+                start_hp=int(obs.player_max_hp),
+            )
+        obs, _reward, _info = combat.step(action)
+    return combat.damage_taken, first_distribution
+
+
 def simulate_encounter(
     character: Character,
     encounter_type: str,
@@ -256,7 +289,8 @@ def simulate_encounter(
 
     Returns
     -------
-    SimResult with survival, damage, HP, and turn information.
+    SimResult with survival, damage, HP, and turn information.  The
+    ``distribution`` field is populated from the PV stats of the first act().
     """
     encounter_type, encounter_id = _resolve_enc(encounter_type, encounter_id, seed)
     char_copy = copy.deepcopy(character)
@@ -264,7 +298,7 @@ def simulate_encounter(
         encounter_type, encounter_id, seed, character=char_copy
     )
     planner = MCTSPlanner(simulations=simulations, max_nodes=max_nodes)
-    damage_taken = run_planner(planner, combat)
+    damage_taken, distribution = _run_planner_capture_first_act(planner, combat)
 
     obs = combat.observe()
     return SimResult(
@@ -275,6 +309,7 @@ def simulate_encounter(
         final_max_hp=obs.player_max_hp,
         turns=obs.turn,
         enemy_hp_remaining=sum(e.hp for e in obs.enemies),
+        distribution=distribution,
     )
 
 

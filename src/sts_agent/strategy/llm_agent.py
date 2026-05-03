@@ -189,9 +189,13 @@ def ensure_lm() -> None:
 def _format_result(label: str, result: SimResult) -> str:
     """Render a :class:`SimResult` as a compact string for the LLM."""
     status = "SURVIVED" if result.survived else "DIED"
+    if result.distribution is not None:
+        dmg_field = f"damage_taken={result.distribution.damage_spread}"
+    else:
+        dmg_field = f"damage_taken={result.damage_taken}"
     parts = [
         f"{label}: {status}",
-        f"damage_taken={result.damage_taken}",
+        dmg_field,
         f"max_hp_gained={result.max_hp_gained}",
         f"final_hp={result.final_hp}/{result.final_max_hp}",
         f"turns={result.turns}",

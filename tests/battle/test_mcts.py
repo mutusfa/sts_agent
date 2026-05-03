@@ -118,7 +118,7 @@ def test_last_stats_populated():
 
     stats = planner.last_stats
     required = {"mean", "std", "max", "n", "deaths", "simulations", "nodes"}
-    assert required == set(stats.keys()), (
+    assert required.issubset(set(stats.keys())), (
         f"Missing keys: {required - set(stats.keys())}"
     )
 
@@ -258,3 +258,62 @@ def test_block_potion_reduces_acid_slime_l_damage():
 
     assert base_dmg == 32, f"Baseline changed: expected 32, got {base_dmg}"
     assert pot_dmg <= 26, f"BlockPotion didn't help enough: {pot_dmg} > 26"
+
+
+# ---------------------------------------------------------------------------
+# 9. Principal-variation stats
+# ---------------------------------------------------------------------------
+
+
+def test_pv_stats_keys_present():
+    """After act(), last_stats must contain pv_mean/pv_std/pv_max/pv_n/pv_deaths/pv_depth."""
+    combat = _make_combat()
+    planner = MCTSPlanner(simulations=100, seed=0)
+    planner.act(combat)
+
+    stats = planner.last_stats
+    pv_keys = {"pv_mean", "pv_std", "pv_max", "pv_n", "pv_deaths", "pv_depth"}
+    assert pv_keys.issubset(set(stats.keys())), (
+        f"Missing PV keys: {pv_keys - set(stats.keys())}"
+    )
+
+
+def test_pv_n_meets_min_n_when_depth_positive():
+    """When pv_depth > 0, pv_n must be >= the effective min_n threshold."""
+    combat = _make_combat(seed=0, enemy_hp=80)  # high HP so combat lasts multiple turns
+    planner = MCTSPlanner(simulations=500, seed=0)
+    planner.act(combat)
+
+    stats = planner.last_stats
+    if stats["pv_depth"] > 0:
+        min_n = max(10, int(500 ** 0.5))  # default formula: max(10, sqrt(simulations))
+        assert stats["pv_n"] >= min_n, (
+            f"pv_n={stats['pv_n']} < min_n={min_n} but pv_depth={stats['pv_depth']}"
+        )
+
+
+def test_pv_depth_positive_with_enough_simulations():
+    """With 1000 simulations MCTS should descend at least one step past the root."""
+    combat = _make_combat(seed=0, enemy_hp=80)
+    planner = MCTSPlanner(simulations=1000, seed=0)
+    planner.act(combat)
+    assert planner.last_stats["pv_depth"] >= 1, (
+        f"pv_depth={planner.last_stats['pv_depth']}: expected MCTS to descend past root "
+        f"with 1000 simulations"
+    )
+
+
+def test_pv_falls_back_to_root_edge_when_budget_tiny():
+    """With very few simulations, pv_depth should be 0 or 1 (at root / first level)."""
+    combat = _make_combat(seed=0, enemy_hp=80)
+    planner = MCTSPlanner(simulations=5, seed=0)
+    planner.act(combat)
+
+    stats = planner.last_stats
+    # With 5 sims the tree is almost flat; PV should stay at depth <= 1
+    assert stats["pv_depth"] <= 1, (
+        f"Unexpectedly deep PV with only 5 simulations: pv_depth={stats['pv_depth']}"
+    )
+    # pv stats must still be finite and sane
+    assert stats["pv_n"] > 0
+    assert math.isfinite(stats["pv_mean"])

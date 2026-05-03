@@ -5,6 +5,7 @@ from __future__ import annotations
 from sts_env.run.character import Character
 
 from sts_agent.strategy import simulate_encounter, simulate_with_card, SimResult
+from sts_agent.strategy.simulate import SimDistribution
 
 
 # ---------------------------------------------------------------------------
@@ -93,3 +94,32 @@ def test_character_not_mutated():
         char.floor,
     )
     assert snapshot == post, "Character was mutated by simulate_encounter"
+
+
+# ---------------------------------------------------------------------------
+# 5. PV distribution attached to SimResult
+# ---------------------------------------------------------------------------
+
+
+def test_simulate_encounter_has_distribution():
+    """simulate_encounter must attach a SimDistribution from the first act()."""
+    char = Character.ironclad()
+    result = simulate_encounter(
+        char, "easy", "cultist", seed=42, max_nodes=200, simulations=200
+    )
+    assert result.distribution is not None, (
+        "simulate_encounter should populate SimResult.distribution"
+    )
+    assert isinstance(result.distribution, SimDistribution)
+    assert result.distribution.n > 0, "distribution.n must be positive"
+    assert result.distribution.std_score >= 0, "std must be non-negative"
+
+
+def test_simulate_with_card_has_distribution():
+    """simulate_with_card also propagates a distribution."""
+    char = Character.ironclad()
+    result = simulate_with_card(
+        char, "Strike", "easy", "cultist", seed=42, max_nodes=200, simulations=200
+    )
+    assert result.distribution is not None
+    assert result.distribution.n > 0

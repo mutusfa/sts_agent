@@ -243,11 +243,13 @@ class MCTSPlanner:
         max_nodes: int | None = None,
         exploration_c: float | None = None,
         seed: int | None = None,
+        pv_min_n: int | None = None,
     ) -> None:
         self.simulations = simulations
         self.max_nodes = max_nodes
         self._exploration_c = exploration_c
         self._rng = random.Random(seed)
+        self._pv_min_n_override = pv_min_n
         self.last_stats: dict[str, float] = {}
         self._node_store: dict[tuple, _Node] = {}
 
@@ -356,6 +358,9 @@ class MCTSPlanner:
         best_concept_key, best_edge = self._best_root_concept(root_node)
         best_action = _resolve_action(best_concept_key, combat) or Action.end_turn()
 
+        pv_edge, pv_depth = self._pv_well_visited_edge(root_node, combat)
+        pv = pv_edge if pv_edge is not None else best_edge
+
         self.last_stats = {
             "mean": best_edge.mean if best_edge.n > 0 else math.nan,
             "std": best_edge.std,
@@ -364,6 +369,12 @@ class MCTSPlanner:
             "deaths": float(best_edge.deaths),
             "simulations": float(sims_run),
             "nodes": float(nodes_expanded),
+            "pv_mean": pv.mean if pv.n > 0 else math.nan,
+            "pv_std": pv.std,
+            "pv_max": pv.max if pv.n > 0 else math.nan,
+            "pv_n": float(pv.n),
+            "pv_deaths": float(pv.deaths),
+            "pv_depth": float(pv_depth),
         }
 
         log.debug(
@@ -409,6 +420,46 @@ class MCTSPlanner:
         if not best_keys:
             raise RuntimeError("No selectable actions at fully-expanded node.")
         return self._rng.choice(best_keys)
+
+    def _effective_pv_min_n(self) -> int:
+        """Minimum visit count required to descend one step along the PV."""
+        if self._pv_min_n_override is not None:
+            return self._pv_min_n_override
+        return max(10, int(math.sqrt(self.simulations)))
+
+    def _pv_well_visited_edge(
+        self, root: _Node, combat: Combat
+    ) -> tuple[_EdgeStats | None, int]:
+        """Walk root → argmin-mean child while edge.n >= _effective_pv_min_n.
+
+        Returns (deepest_edge_satisfying_min_n, depth). Falls back to None
+        (caller uses chosen root edge) when no edge meets the threshold.
+        """
+        min_n = self._effective_pv_min_n()
+        node = root
+        sim_combat = combat.clone()
+        last_edge: _EdgeStats | None = None
+        last_depth = 0
+        depth = 0
+        while node.edges:
+            key = min(node.edges, key=lambda k: node.edges[k].mean)
+            edge = node.edges[key]
+            if edge.n < min_n:
+                break
+            last_edge = edge
+            last_depth = depth + 1
+            action = _resolve_action(key, sim_combat)
+            if action is None:
+                break
+            sim_combat.step(action)
+            if sim_combat.observe().done:
+                break
+            child = self._node_store.get(_mcts_state_key(sim_combat))
+            if child is None or not child.edges:
+                break
+            node = child
+            depth += 1
+        return last_edge, last_depth
 
     def _best_root_concept(self, root: _Node) -> tuple[tuple, _EdgeStats]:
         """Pick the root concept key with the lowest mean score.
