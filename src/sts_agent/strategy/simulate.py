@@ -126,6 +126,9 @@ class SimResult:
         Player maximum HP at the end of combat.
     turns:
         Number of turns the combat lasted.
+    enemy_hp_remaining:
+        Total enemy HP remaining at end of combat.  0 when the player won;
+        positive when the player died, indicating how close the fight was.
     """
 
     survived: bool
@@ -134,6 +137,7 @@ class SimResult:
     final_hp: int
     final_max_hp: int
     turns: int
+    enemy_hp_remaining: int = 0
 
 
 @dataclass
@@ -201,6 +205,25 @@ class SimDistribution:
         return f"{self.expected_damage:.0f}±{self.std_score:.0f} ({pct} death)"
 
 
+# ---------------------------------------------------------------------------
+# Simulation as player skill
+# ---------------------------------------------------------------------------
+# These functions are a stand-in for player skill / game knowledge.
+#
+# An experienced StS player can look at a deck and estimate outcomes:
+#   - "Against Gremlin Nob this deck takes ~20 damage, probably dies to
+#     Lagavulin, Sentries are free"
+#   - "I want AoE for Sentries, Lagavulin lets me set up, for Gremlin Nob
+#     I need ways to mitigate damage that aren't skill-based"
+#
+# Our MCTS simulations give us the same thing in numbers — slightly more
+# exact than a human could estimate, but the same concept: evaluate deck
+# strength against specific upcoming encounters.  The `enemy_hp_remaining`
+# field on SimResult tells the LLM *how close* a loss was, turning a
+# binary "DIED" into a graded signal like "died but left the boss at 5 HP".
+# ---------------------------------------------------------------------------
+
+
 def simulate_encounter(
     character: Character,
     encounter_type: str,
@@ -218,8 +241,9 @@ def simulate_encounter(
         A :class:`Character` whose deck / HP / potions define the player
         state.  A deep-copy is made so the original is never mutated.
     encounter_type:
-        ``"easy"``, ``"hard"``, ``"elite"``, ``"boss"``, or ``"monster"``
+        ``"easy"``, ``"hard"``, ``"elite"``, ``"boss"``, ``"event"``, or ``"monster"``
         (unknown hallway difficulty — sampled from the combined easy+hard pool).
+        ``"event"`` uses event-specific encounter variants (e.g. awake Lagavulin).
     encounter_id:
         Encounter identifier string (e.g. ``"cultist"``, ``"Lagavulin"``).
         Pass an empty string to sample a representative encounter from the pool.
@@ -250,6 +274,7 @@ def simulate_encounter(
         final_hp=obs.player_hp,
         final_max_hp=obs.player_max_hp,
         turns=obs.turn,
+        enemy_hp_remaining=sum(e.hp for e in obs.enemies),
     )
 
 
@@ -290,6 +315,29 @@ def simulate_with_upgrade(
     for i, card in enumerate(char_copy.deck):
         if card == card_id:
             char_copy.deck[i] = card_id + "+"
+            break
+    return simulate_encounter(
+        char_copy, encounter_type, encounter_id, seed, **kwargs
+    )
+
+
+def simulate_without_card(
+    character: Character,
+    card_id: str,
+    encounter_type: str,
+    encounter_id: str,
+    seed: int,
+    **kwargs: object,
+) -> SimResult:
+    """Simulate an encounter with a card removed from the deck.
+
+    Removes the first occurrence of *card_id* from the copy's deck.
+    The original *character* is not mutated.
+    """
+    char_copy = copy.deepcopy(character)
+    for i, card in enumerate(char_copy.deck):
+        if card == card_id:
+            del char_copy.deck[i]
             break
     return simulate_encounter(
         char_copy, encounter_type, encounter_id, seed, **kwargs

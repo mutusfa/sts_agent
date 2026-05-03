@@ -98,8 +98,8 @@ class _RunAgentAdapter:
     def pick_rest_choice(self, character, **kwargs):
         return self._strategy.pick_rest_choice(character, **kwargs)
 
-    def pick_event_choice(self, event, character):
-        return self._strategy.pick_event_choice(event, character)
+    def pick_event_choice(self, event, character, **kwargs):
+        return self._strategy.pick_event_choice(event, character, **kwargs)
 
     def shop(self, inventory, character):
         return self._strategy.shop(inventory, character)
@@ -107,13 +107,22 @@ class _RunAgentAdapter:
     def pick_boss_relic(self, character, choices):
         return self._strategy.pick_boss_relic(character, choices)
 
+    def set_encounter_tracking(self, encounter_queue, hallway_seen, elites_seen):
+        self._strategy.set_encounter_tracking(encounter_queue, hallway_seen, elites_seen)
+
 
 # ---------------------------------------------------------------------------
 # MLflow observer
 # ---------------------------------------------------------------------------
 
 class _MlflowObserver:
-    """FloorObserver that wraps each floor in an MLflow child span."""
+    """FloorObserver that wraps each floor in an MLflow child span.
+
+    Exceptions inside a floor are recorded as span attributes but do NOT
+    propagate through the MLflow span context — this prevents one bad floor
+    from killing the entire trace.  The exception is re-raised *after* the
+    span closes cleanly so the orchestrator can decide what to do.
+    """
 
     @contextmanager
     def floor_scope(
@@ -122,6 +131,7 @@ class _MlflowObserver:
         room_type: str,
         character: Character,
     ) -> Iterator[dict[str, Any]]:
+        exc_to_reraise: BaseException | None = None
         with mlflow.start_span(name=f"floor_{floor}_{room_type}") as span:
             span.set_attributes({
                 "floor": floor,
@@ -134,6 +144,11 @@ class _MlflowObserver:
             attrs: dict[str, Any] = {}
             try:
                 yield attrs
+            except BaseException as exc:
+                # Record the error in the span but don't let MLflow see it
+                # — the span closes cleanly, keeping the trace alive.
+                span.set_attributes({"error": f"{type(exc).__name__}: {exc}"})
+                exc_to_reraise = exc
             finally:
                 span.set_attributes({
                     "hp_after": character.player_hp,
@@ -142,6 +157,10 @@ class _MlflowObserver:
                     "deck_size_after": len(character.deck),
                     **attrs,
                 })
+        # Re-raise outside the span context so the orchestrator sees it,
+        # but the MLflow span already closed cleanly (status OK).
+        if exc_to_reraise is not None:
+            raise exc_to_reraise
 
 
 # ---------------------------------------------------------------------------

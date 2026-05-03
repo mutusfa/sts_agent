@@ -172,7 +172,9 @@ class BaseStrategyAgent:
     # Events
     # ------------------------------------------------------------------
 
-    def pick_event_choice(self, event: EventSpec, character: Character) -> int:
+    def pick_event_choice(
+        self, event: EventSpec, character: Character, **kwargs: object,
+    ) -> int:
         """Pick a random event branch index."""
         if not event.choices:
             return 0

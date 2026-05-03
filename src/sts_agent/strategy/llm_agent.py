@@ -44,11 +44,12 @@ from sts_env.run.character import Character
 from sts_env.run.rooms import RestChoice, RestResult
 
 from .base import BaseStrategyAgent
-from .simulate import SimResult, simulate_encounter, simulate_with_card, simulate_with_upgrade
+from .simulate import SimResult, simulate_encounter, simulate_with_card, simulate_with_upgrade, simulate_without_card
 
 if TYPE_CHECKING:
     from sts_env.run.map import StSMap
     from sts_env.run.encounter_queue import EncounterQueue
+    from sts_env.run.events import EventSpec
 
 import dataclasses
 
@@ -81,6 +82,10 @@ class CardInfo(BaseModel):
     effects: dict[str, int]  # non-zero base declarative fields; hits shown only when >1
     upgrade: dict[str, int]  # upgrade deltas (empty = not upgradeable)
     exhausts: bool
+    # TODO: Replace raw Python source with English docstrings for custom handlers.
+    #   Need to figure out how to represent scaling effects (e.g. Juggernaut/Juggernaut+
+    #   damage, Rampage accumulator) concisely. Raw code always works as a fallback
+    #   since the LLM can reason over it, but it's token-heavy.
     custom_code: str | None  # source of custom handler if present, else None
 
 
@@ -184,13 +189,16 @@ def ensure_lm() -> None:
 def _format_result(label: str, result: SimResult) -> str:
     """Render a :class:`SimResult` as a compact string for the LLM."""
     status = "SURVIVED" if result.survived else "DIED"
-    return (
-        f"{label}: {status} | "
-        f"damage_taken={result.damage_taken} | "
-        f"max_hp_gained={result.max_hp_gained} | "
-        f"final_hp={result.final_hp}/{result.final_max_hp} | "
-        f"turns={result.turns}"
-    )
+    parts = [
+        f"{label}: {status}",
+        f"damage_taken={result.damage_taken}",
+        f"max_hp_gained={result.max_hp_gained}",
+        f"final_hp={result.final_hp}/{result.final_max_hp}",
+        f"turns={result.turns}",
+    ]
+    if result.enemy_hp_remaining > 0:
+        parts.append(f"enemy_hp_remaining={result.enemy_hp_remaining}")
+    return " | ".join(parts)
 
 
 def _format_possible_encounters(data: dict | None) -> str:
@@ -292,7 +300,35 @@ def _make_tools(
             sim_log.append(formatted)
         return formatted
 
-    return [simulate_upcoming, try_card]
+    def try_remove_card(card_id: str, room_type: str, encounter_id: str = "") -> str:
+        """Simulate an encounter with a card removed from the deck.
+
+        Args:
+            card_id: The card ID to remove from the deck.
+            room_type: Room type read from the map view — one of 'monster', 'elite', 'boss'.
+            encounter_id: Optional specific encounter ID from possible_encounters
+                (e.g. 'Lagavulin', 'cultist', 'hexaghost'). If empty, samples from the pool.
+        Returns:
+            Human-readable simulation result for the deck without that card.
+        """
+        try:
+            budget_checker()
+        except TimeoutError:
+            return (
+                "SIMULATION BUDGET EXHAUSTED — no more simulations available. "
+                "Make your pick now based on the results you already have."
+            )
+        result = simulate_without_card(
+            character, card_id, room_type, encounter_id, seed * 1000,
+            max_nodes=max_nodes, simulations=max_simulations,
+        )
+        label = f"Without {card_id} vs {encounter_id}" if encounter_id else f"Without {card_id} vs {room_type}"
+        formatted = _format_result(label, result)
+        if sim_log is not None:
+            sim_log.append(formatted)
+        return formatted
+
+    return [simulate_upcoming, try_card, try_remove_card]
 
 
 # ---------------------------------------------------------------------------
@@ -326,6 +362,9 @@ class CardPickSignature(dspy.Signature):
     character_state: str = dspy.InputField(
         desc="Current character: HP, deck size, potions, relics, floor"
     )
+    # TODO: Consider including full deck composition here for deck synergy reasoning.
+    #   Current design relies on simulation tools to evaluate synergy empirically.
+    #   Will validate with ablation studies (with/without deck info) before committing.
     card_choices: list[CardInfo] = dspy.InputField(
         desc="Cards offered as reward — each carries full spec, upgrade deltas, and custom handler code if any"
     )
@@ -401,7 +440,7 @@ def _make_rest_tools(
         """Simulate an upcoming encounter with the current deck.
 
         Args:
-            room_type: Room type: 'monster', 'elite', or 'boss'.
+            room_type: Room type: 'monster', 'elite', 'boss', or 'event'.
             encounter_id: Optional specific encounter from possible_encounters.
         """
         try:
@@ -428,7 +467,7 @@ def _make_rest_tools(
 
         Args:
             card_id: Card to upgrade (must be in upgradeable_cards list).
-            room_type: Room type: 'monster', 'elite', or 'boss'.
+            room_type: Room type: 'monster', 'elite', 'boss', or 'event'.
             encounter_id: Optional specific encounter from possible_encounters.
         """
         try:
@@ -448,7 +487,210 @@ def _make_rest_tools(
             sim_log.append(formatted)
         return formatted
 
-    return [simulate_upcoming, try_upgrade]
+    def try_remove_card(card_id: str, room_type: str, encounter_id: str = "") -> str:
+        """Simulate an encounter with a card removed from the deck.
+
+        Removes the first copy of card_id from the deck and runs a simulation.
+
+        Args:
+            card_id: Card to remove (must be in deck).
+            room_type: Room type: 'monster', 'elite', 'boss', or 'event'.
+            encounter_id: Optional specific encounter from possible_encounters.
+        """
+        try:
+            check_budget()
+        except TimeoutError:
+            return (
+                "SIMULATION BUDGET EXHAUSTED — Make your pick now based "
+                "on the results you already have."
+            )
+        result = simulate_without_card(
+            character, card_id, room_type, encounter_id, seed,
+            max_nodes=max_nodes, simulations=max_simulations,
+        )
+        label = f"Without {card_id} vs {encounter_id or room_type}"
+        formatted = _format_result(label, result)
+        if sim_log is not None:
+            sim_log.append(formatted)
+        return formatted
+
+    return [simulate_upcoming, try_upgrade, try_remove_card]
+
+
+def _make_card_removal_tools(
+    character: Character,
+    check_budget: Callable[[], None],
+    *,
+    max_simulations: int = 100,
+    max_nodes: int = 1000,
+    sim_log: list[str] | None = None,
+) -> list:
+    """Create simulation tools for the card-removal decision.
+
+    Provides ``simulate_upcoming`` and ``try_remove_card`` so the agent can
+    compare deck performance with and without each candidate card.
+    """
+    import random as _random
+
+    seed = _random.randint(0, 2**31)
+
+    def simulate_upcoming(room_type: str, encounter_id: str = "") -> str:
+        """Simulate an upcoming encounter with the current deck.
+
+        Args:
+            room_type: Room type: 'monster', 'elite', 'boss', or 'event'.
+            encounter_id: Optional specific encounter from possible_encounters.
+        """
+        try:
+            check_budget()
+        except TimeoutError:
+            return (
+                "SIMULATION BUDGET EXHAUSTED — Make your pick now based "
+                "on the results you already have."
+            )
+        result = simulate_encounter(
+            character, room_type, encounter_id, seed,
+            max_nodes=max_nodes, simulations=max_simulations,
+        )
+        formatted = _format_result(f"Baseline vs {encounter_id or room_type}", result)
+        if sim_log is not None:
+            sim_log.append(formatted)
+        return formatted
+
+    def try_remove_card(card_id: str, room_type: str, encounter_id: str = "") -> str:
+        """Simulate an encounter with a card removed from the deck.
+
+        Args:
+            card_id: Card to remove (must be in deck_cards list).
+            room_type: Room type: 'monster', 'elite', 'boss', or 'event'.
+            encounter_id: Optional specific encounter from possible_encounters.
+        """
+        try:
+            check_budget()
+        except TimeoutError:
+            return (
+                "SIMULATION BUDGET EXHAUSTED — Make your pick now based "
+                "on the results you already have."
+            )
+        result = simulate_without_card(
+            character, card_id, room_type, encounter_id, seed,
+            max_nodes=max_nodes, simulations=max_simulations,
+        )
+        formatted = _format_result(f"Without {card_id} vs {encounter_id or room_type}", result)
+        if sim_log is not None:
+            sim_log.append(formatted)
+        return formatted
+
+    return [simulate_upcoming, try_remove_card]
+
+
+# ---------------------------------------------------------------------------
+# Standard context — formalised across all strategy decisions
+# ---------------------------------------------------------------------------
+# Every LLM strategy decision receives this baseline context:
+#   - character_state: HP, max HP, gold, floor, deck size, potions, relics
+#   - map_view: ASCII map with current position and upcoming rooms
+#   - possible_encounters: remaining encounters by pool (weak/strong/elite/boss)
+#   - simulation tools: simulate_upcoming, try_card, try_upgrade (where relevant)
+#
+# This is the "standard context".  If a human StS expert would have additional
+# information that the agent lacks (e.g. exact deck list, specific event outcome
+# probabilities, card pool composition), the LLM should flag it in the
+# `missing_context` output field so we can iterate on the context design.
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Event decision signature
+# ---------------------------------------------------------------------------
+
+
+class EventPickSignature(dspy.Signature):
+    """You are a Slay the Spire strategy expert making an event choice.
+
+    You are at an event and must choose one of the presented options.  Each
+    choice describes its effect.  Evaluate based on:
+
+    1. HP ratio — low HP means avoid risky choices; high HP means you can
+       afford max-HP costs or damage.
+    2. Gold — some choices cost gold; consider if the reward is worth it.
+    3. Deck state — does your deck benefit from card removal / upgrade / add?
+    4. Upcoming difficulty — how much HP do you need for remaining floors?
+    5. Relics — some relics synergise with certain outcomes.
+
+    Use simulation tools to evaluate your deck's strength against upcoming
+    encounters if that helps weigh the trade-off.
+
+    Map symbols: M=monster, E=elite, B=boss, R=rest, ?=event, $=shop, T=treasure.
+    Current position is marked with @ in the map view.
+    """
+
+    character_state: str = dspy.InputField(
+        desc="Current HP, max HP, gold, floor, deck list (card IDs), potions, relics."
+    )
+    event_description: str = dspy.InputField(
+        desc="Narrative description of the event."
+    )
+    event_choices: list[str] = dspy.InputField(
+        desc="Ordered list of choice labels. Pick by index (0-based)."
+    )
+    map_view: str = dspy.InputField(
+        desc="ASCII map of remaining floors with room types and current position."
+    )
+    possible_encounters: str = dspy.InputField(
+        desc="Possible remaining encounters by pool (weak/strong/elite/boss)."
+    )
+    reasoning: str = dspy.OutputField(
+        desc="Brief analysis of each choice given current state."
+    )
+    missing_context: str = dspy.OutputField(
+        desc=(
+            "What additional information would a human StS expert have that "
+            "you lack for this decision? Be specific (e.g. 'exact deck list', "
+            "'card pool for Scrap Ooze', 'which card Bonfire would upgrade'). "
+            "Say 'none' if you have everything you need."
+        )
+    )
+    choice_index: str = dspy.OutputField(
+        desc="The 0-based index of the chosen option."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Card removal signature
+# ---------------------------------------------------------------------------
+
+
+class CardRemoveSignature(dspy.Signature):
+    """You are a Slay the Spire strategy expert choosing a card to remove from your deck.
+
+    Removing a card thins your deck, making it more likely to draw your best cards.
+    Basic cards (Strike, Defend) are usually good removal targets.  Curse cards
+    should almost always be removed.  Rare/powerful cards should almost never be removed.
+
+    Use the ``try_remove_card`` tool to simulate how your deck performs without
+    each candidate card against upcoming encounters.  Pick the card whose removal
+    gives the best survival outcome.
+    """
+
+    character_state: str = dspy.InputField(
+        desc="Current HP, max HP, gold, floor, deck list, potions, relics."
+    )
+    deck_cards: list[str] = dspy.InputField(
+        desc="Full list of card IDs in your deck (may contain duplicates)."
+    )
+    map_view: str = dspy.InputField(
+        desc="ASCII map of remaining floors with room types."
+    )
+    possible_encounters: str = dspy.InputField(
+        desc="Possible remaining encounters by pool."
+    )
+    reasoning: str = dspy.OutputField(
+        desc="Brief analysis of which card to remove and why."
+    )
+    card_id: str = dspy.OutputField(
+        desc="The exact card_id string to remove from deck, or 'skip' to cancel."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -716,6 +958,89 @@ class StrategyAgent(BaseStrategyAgent):
                 return info.card_id
         return card_choices[0].card_id if card_choices else None
 
+    # -- event entry point ----------------------------------------------------
+
+    @mlflow.trace(name="pick_event_choice")
+    def pick_event_choice(
+        self,
+        event: "EventSpec",
+        character: Character,
+        **kwargs: object,
+    ) -> int:
+        """Choose an event branch using the LLM.
+
+        Returns the 0-based index into ``event.choices``.
+        Falls back to the first choice on error.
+        """
+        ensure_lm()
+
+        if not event.choices:
+            return 0
+
+        # Build context --------------------------------------------------
+        sts_map = kwargs.get("sts_map")
+        current_position = kwargs.get("current_position")
+        map_view = _format_map_view(sts_map, current_position)
+        encounters_view = _format_possible_encounters(
+            self.get_possible_encounters()
+        )
+
+        # Format choices with their labels
+        choice_labels = [f"[{i}] {ch.label}" for i, ch in enumerate(event.choices)]
+
+        # LLM call -------------------------------------------------------
+        try:
+            predictor = dspy.Predict(EventPickSignature)
+            result = predictor(
+                character_state=character.summary(),
+                event_description=f"Event: {event.event_id}\n{event.description}",
+                event_choices=choice_labels,
+                map_view=map_view,
+                possible_encounters=encounters_view,
+            )
+
+            raw_choice = getattr(result, "choice_index", "0").strip()
+            reasoning = getattr(result, "reasoning", "")
+            missing = getattr(result, "missing_context", "")
+
+            # Parse choice index
+            try:
+                idx = int(raw_choice)
+            except ValueError:
+                # Try extracting first integer from the string
+                import re
+                m = re.search(r"\d+", raw_choice)
+                idx = int(m.group()) if m else 0
+
+            # Clamp to valid range
+            idx = max(0, min(idx, len(event.choices) - 1))
+
+            log.info(
+                "LLM event %s: choice=%d (%s) | reasoning=%s | missing=%s",
+                event.event_id, idx, event.choices[idx].label,
+                reasoning[:120], missing[:120],
+            )
+
+            # Log missing context as MLflow attributes for analysis
+            span = mlflow.get_current_active_span()
+            if span:
+                span.set_attributes({
+                    "event_id": event.event_id,
+                    "choice_idx": idx,
+                    "choice_label": event.choices[idx].label,
+                    "reasoning": reasoning[:500],
+                    "missing_context": missing[:500],
+                    "num_choices": len(event.choices),
+                })
+
+            return idx
+
+        except Exception:
+            log.exception(
+                "LLM event %s: error, falling back to choice 0", event.event_id,
+            )
+            return 0
+
     # -- rest site entry point ------------------------------------------------
 
     @mlflow.trace(name="pick_rest_choice")
@@ -786,3 +1111,59 @@ class StrategyAgent(BaseStrategyAgent):
         except Exception:
             log.exception("LLM strategy rest: error, falling back to heal")
             return RestResult(choice=RestChoice.REST)
+
+    # -- card removal entry point -----------------------------------------------
+
+    @mlflow.trace(name="pick_card_to_remove")
+    def pick_card_to_remove(
+        self,
+        character: Character,
+        **kwargs: object,
+    ) -> str | None:
+        """Choose a card to remove from the deck.
+
+        Uses ``try_remove_card`` simulation tool to evaluate the impact of
+        removing each candidate.  Returns the card_id to remove, or None.
+        """
+        ensure_lm()
+        self._start_time = time.time()
+        self._timed_out = False
+        self._sim_log = []
+
+        # Candidates: all cards in deck (agent can simulate to decide)
+        candidates = sorted(set(character.deck))
+
+        sts_map = kwargs.get("sts_map")
+        current_position = kwargs.get("current_position")
+        map_view = _format_map_view(sts_map, current_position)
+        encounters_view = _format_possible_encounters(
+            self.get_possible_encounters()
+        )
+
+        tools = _make_card_removal_tools(
+            character, self._check_budget,
+            max_simulations=self.max_simulations,
+            max_nodes=self.max_nodes,
+            sim_log=self._sim_log,
+        )
+
+        try:
+            react = dspy.ReAct(CardRemoveSignature, tools=tools, max_iters=8)
+            result = react(
+                character_state=character.summary(),
+                deck_cards=list(character.deck),
+                map_view=map_view,
+                possible_encounters=encounters_view,
+            )
+            raw_pick: str = getattr(result, "card_id", "").strip()
+
+            if raw_pick and raw_pick in character.deck:
+                log.info("LLM card removal: removing %s", raw_pick)
+                return raw_pick
+
+            log.warning("LLM card removal: invalid pick %r, skipping", raw_pick)
+            return None
+
+        except Exception:
+            log.exception("LLM card removal: error, skipping removal")
+            return None
