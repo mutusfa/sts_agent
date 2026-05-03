@@ -211,13 +211,40 @@ class TestTools:
             tools[0]("monster")
         assert len(calls) == 1
 
-    def test_budget_timeout_propagates(self):
+    def test_budget_timeout_returns_message(self):
+        """When budget is exhausted, tools return a message instead of raising."""
         def raise_timeout():
             raise TimeoutError("budget exceeded")
 
         tools = _make_tools(_ironclad(), seed=42, budget_checker=raise_timeout)
-        with pytest.raises(TimeoutError, match="budget exceeded"):
+        result = tools[0]("monster")
+        assert "SIMULATION BUDGET EXHAUSTED" in result
+
+    def test_sim_log_accumulates(self):
+        """sim_log collects formatted results from tool calls."""
+        log: list[str] = []
+        mock_result = SimResult(True, 10, 0, 70, 80, 5)
+        with patch("sts_agent.strategy.llm_agent.simulate_encounter",
+                   return_value=mock_result):
+            tools = _make_tools(
+                _ironclad(), seed=42, budget_checker=lambda: None, sim_log=log,
+            )
             tools[0]("monster")
+            tools[1]("Anger", "elite")
+        assert len(log) == 2
+        assert "Baseline" in log[0]
+        assert "Anger" in log[1]
+
+    def test_sim_log_not_written_on_timeout(self):
+        """When budget is exhausted, no entry is added to sim_log."""
+        log: list[str] = []
+        def raise_timeout():
+            raise TimeoutError("budget exceeded")
+        tools = _make_tools(
+            _ironclad(), seed=42, budget_checker=raise_timeout, sim_log=log,
+        )
+        tools[0]("monster")
+        assert len(log) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -291,13 +318,6 @@ class TestStrategyAgent:
         mock.return_value.return_value = mock_result
         return mock
 
-    def test_timeout_triggers_forced_pick(self):
-        """Budget of 0s forces immediate fallback."""
-        agent = StrategyAgent(timeout_seconds=0)
-        pick = agent.pick_card(_ironclad(), ["Anger", "Feed", "Inflame"],
-                               _upcoming(), seed=42)
-        assert pick == "Feed"
-
     def test_exception_triggers_forced_pick(self):
         """LM error falls back to forced pick."""
         agent = StrategyAgent()
@@ -308,6 +328,30 @@ class TestStrategyAgent:
                 _upcoming(), seed=42,
             )
             assert pick == "Carnage"  # uncommon forced pick
+
+    def test_timeout_exhausted_then_llm_pick(self):
+        """When tools exhaust budget, LLM still gets to make a final pick."""
+        agent = StrategyAgent(timeout_seconds=0)
+        with patch("sts_agent.strategy.llm_agent.dspy.ReAct",
+                   self._mock_react("Feed")):
+            pick = agent.pick_card(
+                _ironclad(), ["Anger", "Feed", "Inflame"],
+                _upcoming(), seed=42,
+            )
+            # LLM picks Feed despite budget being exhausted at tool level
+            assert pick == "Feed"
+
+    def test_timeout_exhausted_llm_fails_forced_pick(self):
+        """When budget is exhausted AND LLM returns invalid pick → forced pick."""
+        agent = StrategyAgent(timeout_seconds=0)
+        with patch("sts_agent.strategy.llm_agent.dspy.ReAct",
+                   self._mock_react("NonExistentCard")):
+            pick = agent.pick_card(
+                _ironclad(), ["Anger", "Inflame", "Flex"],
+                _upcoming(), seed=42,
+            )
+            # Falls back to forced pick — Inflame is uncommon
+            assert pick == "Inflame"
 
     def test_invalid_pick_falls_back(self):
         """LLM returning an invalid pick falls back to forced pick."""
@@ -425,20 +469,19 @@ class TestRunAct1:
 
 
 class TestSignatureEncounterPools:
-    """CardPickSignature docstring must list canonical encounter names."""
+    """CardPickSignature must include the possible_encounters input field
+    and reference it in the docstring so the LLM knows to use it."""
 
-    def test_mentions_weak_pool_entries(self):
-        doc = CardPickSignature.__doc__ or ""
-        for enc in ("cultist", "jaw_worm"):
-            assert enc in doc, f"Expected '{enc}' in CardPickSignature docstring"
+    def test_has_possible_encounters_field(self):
+        assert "possible_encounters" in CardPickSignature.model_fields
 
-    def test_mentions_elite_pool_entries(self):
+    def test_docstring_mentions_encounter_id(self):
         doc = CardPickSignature.__doc__ or ""
-        assert "Gremlin Nob" in doc
+        assert "encounter_id" in doc, "Expected 'encounter_id' in docstring (tools accept it)"
 
-    def test_mentions_boss_pool_entries(self):
+    def test_docstring_mentions_possible_encounters(self):
         doc = CardPickSignature.__doc__ or ""
-        assert "hexaghost" in doc
+        assert "possible_encounters" in doc, "Expected 'possible_encounters' in docstring"
 
 
 # ---------------------------------------------------------------------------

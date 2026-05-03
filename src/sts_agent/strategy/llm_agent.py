@@ -33,7 +33,7 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 import dspy
 import mlflow
@@ -41,9 +41,10 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 
 from sts_env.run.character import Character
+from sts_env.run.rooms import RestChoice, RestResult
 
 from .base import BaseStrategyAgent
-from .simulate import SimResult, simulate_encounter, simulate_with_card
+from .simulate import SimResult, simulate_encounter, simulate_with_card, simulate_with_upgrade
 
 if TYPE_CHECKING:
     from sts_env.run.map import StSMap
@@ -192,46 +193,104 @@ def _format_result(label: str, result: SimResult) -> str:
     )
 
 
+def _format_possible_encounters(data: dict | None) -> str:
+    """Format possible_encounters dict as a human-readable string for the LLM."""
+    if data is None:
+        return "(encounter tracking not available)"
+    lines = []
+    if data.get("monster_weak"):
+        lines.append(f"weak: {data['monster_weak']}")
+    lines.append(f"strong: {data.get('monster_strong', [])}")
+    lines.append(f"elite: {data.get('elite', [])}")
+    lines.append(f"boss: {data.get('boss', '?')}")
+    return "\n".join(lines)
+
+
 def _make_tools(
     character: Character,
     seed: int,
     budget_checker: callable,
+    max_simulations: int = 100,
+    max_nodes: int = 1000,
+    sim_log: list[str] | None = None,
 ) -> list:
     """Create tool callables bound to the current decision context.
 
     Each tool checks the remaining time budget before running a simulation.
+    When budget is exhausted, the tool returns a message instead of raising,
+    so the LLM can make a final decision using results collected so far.
+
+    Parameters
+    ----------
+    character:
+        Character state (deep-copied by simulate helpers).
+    seed:
+        Master seed for deterministic simulations.
+    budget_checker:
+        Callable that returns None if budget remains, or raises TimeoutError.
+    max_simulations:
+        MCTS rollouts per tool call.
+    max_nodes:
+        MCTS node-expansion budget per tool call.
+    sim_log:
+        Optional list that accumulates formatted simulation results, so
+        the final-decision prompt can include all prior results.
     """
 
-    def simulate_upcoming(room_type: str) -> str:
+    def simulate_upcoming(room_type: str, encounter_id: str = "") -> str:
         """Simulate an upcoming encounter of the given room type with the current deck.
 
         Args:
             room_type: Room type read from the map view — one of 'monster', 'elite', 'boss'.
+            encounter_id: Optional specific encounter ID from possible_encounters
+                (e.g. 'Lagavulin', 'cultist', 'hexaghost'). If empty, samples from the pool.
         Returns:
             Human-readable simulation result (survived, damage, HP, turns).
         """
-        budget_checker()
+        try:
+            budget_checker()
+        except TimeoutError:
+            return (
+                "SIMULATION BUDGET EXHAUSTED — no more simulations available. "
+                "Make your pick now based on the results you already have."
+            )
+        label = f"Baseline ({encounter_id})" if encounter_id else f"Baseline ({room_type})"
         result = simulate_encounter(
-            character, room_type, "", seed * 1000,
-            max_nodes=5000, simulations=5000,
+            character, room_type, encounter_id, seed * 1000,
+            max_nodes=max_nodes, simulations=max_simulations,
         )
-        return _format_result(f"Baseline ({room_type})", result)
+        formatted = _format_result(label, result)
+        if sim_log is not None:
+            sim_log.append(formatted)
+        return formatted
 
-    def try_card(card_id: str, room_type: str) -> str:
+    def try_card(card_id: str, room_type: str, encounter_id: str = "") -> str:
         """Simulate an encounter with a hypothetical card added to the deck.
 
         Args:
             card_id: The card ID to evaluate (one of the reward choices).
             room_type: Room type read from the map view — one of 'monster', 'elite', 'boss'.
+            encounter_id: Optional specific encounter ID from possible_encounters
+                (e.g. 'Lagavulin', 'cultist', 'hexaghost'). If empty, samples from the pool.
         Returns:
             Human-readable simulation result for the card + encounter.
         """
-        budget_checker()
+        try:
+            budget_checker()
+        except TimeoutError:
+            return (
+                "SIMULATION BUDGET EXHAUSTED — no more simulations available. "
+                "Make your pick now based on the results you already have."
+            )
         result = simulate_with_card(
-            character, card_id, room_type, "", seed * 1000,
-            max_nodes=5000, simulations=5000,
+            character, card_id, room_type, encounter_id, seed * 1000,
+            max_nodes=max_nodes, simulations=max_simulations,
         )
-        return _format_result(f"With {card_id} vs {room_type}", result)
+        label = f"With {card_id} vs {encounter_id}" if encounter_id else f"With {card_id} vs {room_type}"
+        formatted = _format_result(label, result)
+        if sim_log is not None:
+            sim_log.append(formatted)
+        return formatted
 
     return [simulate_upcoming, try_card]
 
@@ -255,12 +314,8 @@ class CardPickSignature(dspy.Signature):
     3. Deck synergy — attack density, block consistency.
     4. Upcoming difficulty — elites and boss need stronger cards.
 
-    Act 1 encounter pool (canonical encounter ids):
-    - Hallway weak: cultist, jaw_worm, two_louses, small_slimes
-    - Hallway strong: gremlin_gang, lots_of_slimes, red_slaver, exordium_thugs,
-      exordium_wildlife, blue_slaver, looter, large_slime, three_louse, two_fungi_beasts
-    - Elites: Gremlin Nob, Lagavulin, Three Sentries
-    - Bosses: slime_boss, guardian, hexaghost
+    Simulation tools accept an optional encounter_id to target a specific enemy.
+    Use the possible_encounters field to see which encounters are still possible.
 
     Map symbols: M=monster, E=elite, B=boss, R=rest, ?=event, $=shop, T=treasure.
     Current position is marked with @ in the map view. Upcoming reachable rooms
@@ -279,6 +334,14 @@ class CardPickSignature(dspy.Signature):
             "ASCII map of the act. @ = current position; "
             "M/E/B/R/?/$/ T = upcoming reachable rooms. "
             "Pass 'monster', 'elite', or 'boss' to the simulation tools based on what you see ahead."
+        )
+    )
+    possible_encounters: str = dspy.InputField(
+        desc=(
+            "Encounters still possible based on what you've seen so far. "
+            "Format: 'weak: [ids], strong: [ids], elite: [ids], boss: id'. "
+            "Use these IDs as the encounter_id parameter in simulation tools "
+            "to target specific enemies."
         )
     )
     reasoning: str = dspy.OutputField(
@@ -317,6 +380,121 @@ def _format_map_view(
     )
 
 
+def _make_rest_tools(
+    character: Character,
+    check_budget: Callable[[], None],
+    *,
+    max_simulations: int = 100,
+    max_nodes: int = 1000,
+    sim_log: list[str] | None = None,
+) -> list:
+    """Create simulation tools for the rest-site decision.
+
+    Tools are the same ``simulate_upcoming`` and ``try_card`` as card-pick,
+    plus a ``try_upgrade`` tool that simulates with one card upgraded.
+    """
+    import random as _random
+
+    seed = _random.randint(0, 2**31)
+
+    def simulate_upcoming(room_type: str, encounter_id: str = "") -> str:
+        """Simulate an upcoming encounter with the current deck.
+
+        Args:
+            room_type: Room type: 'monster', 'elite', or 'boss'.
+            encounter_id: Optional specific encounter from possible_encounters.
+        """
+        try:
+            check_budget()
+        except TimeoutError:
+            return (
+                "SIMULATION BUDGET EXHAUSTED — Make your pick now based "
+                "on the results you already have."
+            )
+        result = simulate_encounter(
+            character, room_type, encounter_id, seed,
+            max_nodes=max_nodes, simulations=max_simulations,
+        )
+        formatted = _format_result(f"Baseline vs {encounter_id or room_type}", result)
+        if sim_log is not None:
+            sim_log.append(formatted)
+        return formatted
+
+    def try_upgrade(card_id: str, room_type: str, encounter_id: str = "") -> str:
+        """Simulate an encounter with a card upgraded in the deck.
+
+        Replaces the first unupgraded copy of card_id with its upgraded
+        version (card_id + '+') and runs a simulation.
+
+        Args:
+            card_id: Card to upgrade (must be in upgradeable_cards list).
+            room_type: Room type: 'monster', 'elite', or 'boss'.
+            encounter_id: Optional specific encounter from possible_encounters.
+        """
+        try:
+            check_budget()
+        except TimeoutError:
+            return (
+                "SIMULATION BUDGET EXHAUSTED — Make your pick now based "
+                "on the results you already have."
+            )
+        result = simulate_with_upgrade(
+            character, card_id, room_type, encounter_id, seed,
+            max_nodes=max_nodes, simulations=max_simulations,
+        )
+        label = f"With {card_id}+ vs {encounter_id or room_type}"
+        formatted = _format_result(label, result)
+        if sim_log is not None:
+            sim_log.append(formatted)
+        return formatted
+
+    return [simulate_upcoming, try_upgrade]
+
+
+# ---------------------------------------------------------------------------
+# Rest site signature
+# ---------------------------------------------------------------------------
+
+
+class RestPickSignature(dspy.Signature):
+    """You are a Slay the Spire strategy expert deciding what to do at a Rest Site.
+
+    You can either REST (heal 30% of max HP) or UPGRADE one card in your deck.
+
+    Use the simulation tools to evaluate whether upgrading a specific card
+    improves your survival in upcoming encounters more than healing would.
+    Consider your current HP ratio, upcoming difficulty, and which upgrade
+    gives the biggest power spike.
+
+    Card upgrade effects are shown in each card's 'upgrade' field.
+    The try_upgrade tool simulates with one card upgraded (replacing the
+    unupgraded copy in deck). Compare results against simulate_upcoming
+    (no upgrade) to see the delta.
+
+    Simulation tools accept an optional encounter_id to target a specific
+    enemy from the possible_encounters list.
+
+    Output format: "REST" to heal, or "UPGRADE <card_id>" to upgrade a card.
+    """
+
+
+    character_state: str = dspy.InputField(
+        desc="Current HP, max HP, deck composition, relics, potions, and gold."
+    )
+    upgradeable_cards: list[str] = dspy.InputField(
+        desc="List of card IDs in deck that can still be upgraded (no + suffix)."
+    )
+    map_view: str = dspy.InputField(
+        desc="ASCII map of remaining floors with room types and current position."
+    )
+    possible_encounters: str = dspy.InputField(
+        desc="Possible remaining encounters by pool (weak/strong/elite/boss)."
+    )
+    pick: str = dspy.OutputField(
+        desc='"REST" or "UPGRADE <card_id>".'
+    )
+
+
 # ---------------------------------------------------------------------------
 # Strategy Agent
 # ---------------------------------------------------------------------------
@@ -334,10 +512,14 @@ class StrategyAgent(BaseStrategyAgent):
     timeout_seconds:
         Wall-clock budget per card pick decision (default 300 s = 5 min).
     model:
-        LM model name (default ``"glm-5.1"``).
+        LM model name (default ``"deepseek-v4-flash"``).
     seed:
         Forwarded to :class:`BaseStrategyAgent` for the inherited random
         decisions (Neow, route, rest, events, shop, boss relic).
+    max_simulations:
+        MCTS simulation budget per tool call (default 100).
+    max_nodes:
+        MCTS node-expansion budget per tool call (default 1000).
 
     Usage
     -----
@@ -353,12 +535,17 @@ class StrategyAgent(BaseStrategyAgent):
         timeout_seconds: int = DEFAULT_TIMEOUT,
         model: str = DEFAULT_MODEL,
         seed: int | None = None,
+        max_simulations: int = 100,
+        max_nodes: int = 1000,
     ) -> None:
         super().__init__(seed=seed)
         self.timeout = timeout_seconds
         self.model = model
+        self.max_simulations = max_simulations
+        self.max_nodes = max_nodes
         self._start_time: float = 0.0
         self._timed_out: bool = False
+        self._sim_log: list[str] = []
 
     # -- budget enforcement --------------------------------------------------
 
@@ -406,6 +593,11 @@ class StrategyAgent(BaseStrategyAgent):
         current_position:
             ``(floor, x)`` of the node just completed, used to mark the map.
 
+        The orchestrator sets ``self.possible_encounters`` before calling
+        this method.  It contains possible remaining encounters derived from
+        open knowledge (pools + rules + encounters seen), with keys
+        ``monster_weak``, ``monster_strong``, ``elite``, ``boss``.
+
         Returns
         -------
         The picked card ID, or ``None`` if skipped.
@@ -413,9 +605,13 @@ class StrategyAgent(BaseStrategyAgent):
         ensure_lm()
         self._start_time = time.time()
         self._timed_out = False
+        self._sim_log = []
 
         card_infos = [_card_info(c) for c in card_choices]
         map_view = _format_map_view(sts_map, current_position)
+        encounters_view = _format_possible_encounters(
+            self.get_possible_encounters()
+        )
 
         span = mlflow.get_current_active_span()
         if span:
@@ -426,9 +622,15 @@ class StrategyAgent(BaseStrategyAgent):
                 "map_view": map_view[:500],  # truncate for span storage
             })
 
-        # Create context-bound tools
+        # Create context-bound tools with configurable sim budget.
+        # Tools catch TimeoutError and return a "budget exhausted" message
+        # instead of propagating the exception, so the LLM gets one final
+        # ReAct iteration to make a decision from collected results.
         tools = _make_tools(
-            character, seed, self._check_budget
+            character, seed, self._check_budget,
+            max_simulations=self.max_simulations,
+            max_nodes=self.max_nodes,
+            sim_log=self._sim_log,
         )
 
         try:
@@ -437,6 +639,7 @@ class StrategyAgent(BaseStrategyAgent):
                 character_state=character.summary(),
                 card_choices=card_infos,
                 map_view=map_view,
+                possible_encounters=encounters_view,
             )
             raw_pick: str = getattr(result, "pick", "").strip()
 
@@ -473,17 +676,12 @@ class StrategyAgent(BaseStrategyAgent):
             self._set_pick_attrs(pick, fallback=True)
             return pick
 
-        except TimeoutError:
+        except Exception as exc:
             elapsed = time.time() - self._start_time
             log.warning(
-                "Strategy timeout after %.1fs; forced pick", elapsed,
+                "Strategy agent error after %.1fs (%d sims collected): %s; forced pick",
+                elapsed, len(self._sim_log), exc,
             )
-            pick = self._forced_pick(card_infos)
-            self._set_pick_attrs(pick, fallback=True)
-            return pick
-
-        except Exception as exc:
-            log.warning("Strategy agent error: %s; forced pick", exc)
             pick = self._forced_pick(card_infos)
             self._set_pick_attrs(pick, fallback=True)
             return pick
@@ -499,6 +697,7 @@ class StrategyAgent(BaseStrategyAgent):
             "fallback": fallback,
             "elapsed_seconds": round(elapsed, 2),
             "timed_out": self._timed_out,
+            "sim_count": len(self._sim_log),
         })
 
     # -- deterministic fallback ----------------------------------------------
@@ -516,3 +715,74 @@ class StrategyAgent(BaseStrategyAgent):
             if info.rarity == "uncommon":
                 return info.card_id
         return card_choices[0].card_id if card_choices else None
+
+    # -- rest site entry point ------------------------------------------------
+
+    @mlflow.trace(name="pick_rest_choice")
+    def pick_rest_choice(
+        self,
+        character: Character,
+        **kwargs: object,
+    ) -> RestResult:
+        """Decide REST vs UPGRADE at a rest site using LLM + simulation.
+
+        Uses ``self.get_possible_encounters()`` to get fresh encounter info.
+        """
+        ensure_lm()
+        self._start_time = time.time()
+        self._timed_out = False
+        self._sim_log = []
+
+        # Gather upgradeable cards (unupgraded, with an upgrade delta)
+        from sts_env.combat.cards import get_spec
+        upgradeable = sorted({
+            c for c in character.deck
+            if not c.endswith("+")
+            and get_spec(c).upgrade
+        })
+
+        sts_map = kwargs.get("sts_map")
+        current_position = kwargs.get("current_position")
+        map_view = _format_map_view(sts_map, current_position)
+        encounters_view = _format_possible_encounters(
+            self.get_possible_encounters()
+        )
+
+        tools = _make_rest_tools(
+            character, self._check_budget,
+            max_simulations=self.max_simulations,
+            max_nodes=self.max_nodes,
+            sim_log=self._sim_log,
+        )
+
+        try:
+            react = dspy.ReAct(RestPickSignature, tools=tools, max_iters=8)
+            result = react(
+                character_state=character.summary(),
+                upgradeable_cards=upgradeable,
+                map_view=map_view,
+                possible_encounters=encounters_view,
+            )
+            raw_pick: str = getattr(result, "pick", "").strip()
+
+            if raw_pick.upper().startswith("UPGRADE"):
+                parts = raw_pick.split(None, 1)
+                if len(parts) == 2:
+                    card_id = parts[1].strip()
+                    # Verify the card is actually upgradeable
+                    if card_id in upgradeable:
+                        log.info("LLM strategy rest: upgrade %s", card_id)
+                        return RestResult(
+                            choice=RestChoice.UPGRADE,
+                            card_upgraded=card_id,
+                        )
+                # Invalid upgrade target — fall through to REST
+                log.warning("LLM strategy rest: invalid upgrade target %r, healing", raw_pick)
+
+            # REST (default or explicit)
+            log.info("LLM strategy rest: healing")
+            return RestResult(choice=RestChoice.REST)
+
+        except Exception:
+            log.exception("LLM strategy rest: error, falling back to heal")
+            return RestResult(choice=RestChoice.REST)

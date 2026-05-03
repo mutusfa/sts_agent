@@ -272,6 +272,30 @@ def simulate_with_card(
     )
 
 
+def simulate_with_upgrade(
+    character: Character,
+    card_id: str,
+    encounter_type: str,
+    encounter_id: str,
+    seed: int,
+    **kwargs: object,
+) -> SimResult:
+    """Simulate an encounter with a card upgraded in the deck.
+
+    Finds the first un-upgraded copy of *card_id* and replaces it with the
+    upgraded version (``card_id + "+"``).  The original *character* is not
+    mutated.
+    """
+    char_copy = copy.deepcopy(character)
+    for i, card in enumerate(char_copy.deck):
+        if card == card_id:
+            char_copy.deck[i] = card_id + "+"
+            break
+    return simulate_encounter(
+        char_copy, encounter_type, encounter_id, seed, **kwargs
+    )
+
+
 # ---------------------------------------------------------------------------
 # Fast probe API — single act() call, returns distribution
 # ---------------------------------------------------------------------------

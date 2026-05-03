@@ -20,10 +20,11 @@ from typing import TYPE_CHECKING
 
 from sts_env.combat.rng import RNG
 from sts_env.run import relics as relics_mod
-from sts_env.run.rooms import RestChoice
+from sts_env.run.rooms import RestChoice, RestResult, _best_upgrade_target
 
 if TYPE_CHECKING:
     from sts_env.run.character import Character
+    from sts_env.run.encounter_queue import EncounterQueue
     from sts_env.run.events import EventSpec
     from sts_env.run.map import StSMap
     from sts_env.run.neow import NeowChoice, NeowOption
@@ -35,6 +36,42 @@ class BaseStrategyAgent:
 
     def __init__(self, seed: int | None = None) -> None:
         self.rng = RNG(seed if seed is not None else 0)
+        self._encounter_queue: EncounterQueue | None = None
+        self._hallway_seen: list[str] = []
+        self._elites_seen: list[str] = []
+
+    # ------------------------------------------------------------------
+    # Encounter tracking (open-knowledge query support)
+    # ------------------------------------------------------------------
+
+    def set_encounter_tracking(
+        self,
+        encounter_queue: EncounterQueue,
+        hallway_seen: list[str],
+        elites_seen: list[str],
+    ) -> None:
+        """Store references to the orchestrator's encounter state.
+
+        The orchestrator calls this once at run start.  Because *hallway_seen*
+        and *elites_seen* are the **same list objects** the orchestrator appends
+        to in-place, :meth:`get_possible_encounters` always reflects the latest
+        state without the orchestrator needing to push updates.
+        """
+        self._encounter_queue = encounter_queue
+        self._hallway_seen = hallway_seen
+        self._elites_seen = elites_seen
+
+    def get_possible_encounters(self) -> dict | None:
+        """Compute possible remaining encounters from open knowledge.
+
+        Returns ``None`` when encounter tracking has not been initialised
+        (e.g. in unit tests that bypass the orchestrator).
+        """
+        if self._encounter_queue is None:
+            return None
+        return self._encounter_queue.possible_encounters(
+            self._hallway_seen, self._elites_seen,
+        )
 
     # ------------------------------------------------------------------
     # Neow's blessing
@@ -108,16 +145,28 @@ class BaseStrategyAgent:
     # Rest sites
     # ------------------------------------------------------------------
 
-    def pick_rest_choice(self, character: Character) -> RestChoice:
-        """Pick REST or UPGRADE uniformly at random, filtered by relics."""
+    def pick_rest_choice(
+        self,
+        character: Character,
+        **kwargs: object,
+    ) -> RestResult:
+        """Pick REST or UPGRADE uniformly at random, filtered by relics.
+
+        If UPGRADE is chosen, selects target via heuristic priority order.
+        """
         allowed: list[RestChoice] = []
         if relics_mod.can_rest(character.relics):
             allowed.append(RestChoice.REST)
         if relics_mod.can_upgrade(character.relics):
             allowed.append(RestChoice.UPGRADE)
         if not allowed:
-            return RestChoice.REST
-        return self.rng.choice(allowed)
+            return RestResult(choice=RestChoice.REST)
+        choice: RestChoice = self.rng.choice(allowed)
+        if choice == RestChoice.UPGRADE:
+            target = _best_upgrade_target(character)
+            if target is not None:
+                return RestResult(choice=RestChoice.UPGRADE, card_upgraded=target)
+        return RestResult(choice=RestChoice.REST)
 
     # ------------------------------------------------------------------
     # Events
