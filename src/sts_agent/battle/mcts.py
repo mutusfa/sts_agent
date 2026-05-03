@@ -20,25 +20,35 @@ edge statistics accumulate genuine RNG variance rather than replaying one
 fixed trajectory.  The planner PRNG is seeded from the constructor ``seed``
 argument, keeping the whole thing reproducible.
 
-Value model
------------
-We minimise ``terminal_score`` (damage taken, doubled on death).  Each edge
-stores running statistics sufficient to compute mean, std, and worst-case:
+Value model — lexicographic two-tier objective
+----------------------------------------------
+Priority 1: minimise damage taken while surviving (death_rate = 0).
+Priority 2: if survival is unreachable, maximise enemy damage dealt.
 
-    n       visit count
-    _sum    Σ terminal_score
-    _sum_sq Σ terminal_score²
-    _max    max terminal_score seen
+Each edge tracks two separate pools:
+
+  alive pool  → running stats of damage_taken for rollouts where player survived.
+  dead pool   → running stats of enemy_damage_dealt for rollouts where player died.
+  ucb_score   → tier-encoded scalar used only for UCB in-tree exploration:
+                  alive rollout → damage_taken
+                  dead  rollout → start_hp + 1 + (total_enemy_hp − enemy_dmg_dealt)
+                Both ranges never overlap, preserving ordinal correctness for UCB.
+
+Final root selection and PV descent use a lexicographic key (lower = better):
+
+    (round(death_rate, 3), mean_damage_alive, -mean_enemy_dmg_dead)
+
+Rounding to 3 decimal places buckets noise below 0.1 %, so a single unlucky
+rollout in 10 000 sims (death_rate=0.0001 → 0.0) does not flip the alive tier.
 
 UCB selection (lower-is-better variant)
 ----------------------------------------
 At a fully-expanded node, choose the action that minimises:
 
-    mean(a) − c · sqrt(ln N_parent / n_a)
+    ucb_mean(a) − c · sqrt(ln N_parent / n_a)
 
-where c controls exploration width.  Default: ``start_hp`` (the range of
-terminal_score for a surviving player).  Unvisited actions are tried first
-(in ``_ordered_actions`` order so move ordering still helps).
+where c controls exploration width.  Default: ``start_hp``.  Unvisited actions
+are tried first (in ``_ordered_actions`` order so move ordering still helps).
 
 Budget
 ------
@@ -49,16 +59,17 @@ anytime algorithm.
 
 After each ``act()`` call the attribute ``last_stats`` is populated with::
 
-    mean        expected terminal_score for the chosen root action
-    std         standard deviation of terminal_scores for that action
-    max         worst-case (maximum) terminal_score for that action
-    n           visit count for the chosen root action
-    simulations actual simulations run this act()
-    nodes       total node expansions this act()
-
-mean/std/max come directly from the chosen root-edge statistics accumulated
-during the search.  Because each sim uses a freshly reseeded RNG, these
-statistics reflect genuine stochastic variance under the current policy.
+    mean              tier-encoded scalar mean for the chosen root action
+    std               std of the tier-encoded scalar
+    max               worst-case tier-encoded scalar
+    n                 total visit count for the chosen root action
+    death_rate        fraction of rollouts ending in player death
+    n_alive           rollouts where player survived
+    mean_damage_alive mean damage taken in surviving rollouts (inf if none)
+    n_dead            rollouts where player died
+    mean_enemy_dmg_dead mean enemy damage dealt in dying rollouts (nan if none)
+    simulations       actual simulations run this act()
+    nodes             total node expansions this act()
 """
 
 from __future__ import annotations
@@ -72,7 +83,7 @@ from sts_env.combat import Action, Combat
 from sts_env.combat.card import Card
 from sts_env.combat.state import ActionType
 
-from .base import _fmt_action, terminal_score
+from .base import TerminalOutcome, _fmt_action, terminal_score
 from .tree_search import _ordered_actions, _state_key_base
 
 log = logging.getLogger(__name__)
@@ -95,37 +106,126 @@ def _mcts_state_key(combat: Combat) -> tuple:
 
 @dataclass
 class _EdgeStats:
-    """Per-(parent-node, action) running statistics."""
+    """Per-(parent-node, action) running statistics.
 
-    n: int = 0
-    _sum: float = 0.0
-    _sum_sq: float = 0.0
-    _max: float = -math.inf
-    deaths: int = 0  # rollouts that ended in player death (score >= start_hp)
+    Two separate pools:
+      alive pool  — damage taken in rollouts where the player survived.
+      dead pool   — enemy damage dealt in rollouts where the player died.
+      ucb scalar  — tier-encoded scalar for UCB exploration.
+    """
 
-    def update(self, score: float, *, start_hp: float = math.inf) -> None:
-        self.n += 1
-        self._sum += score
-        self._sum_sq += score * score
-        if score > self._max:
-            self._max = score
-        if score >= start_hp:
-            self.deaths += 1
+    # Alive pool
+    n_alive: int = 0
+    _sum_alive: float = 0.0
+    _sum_sq_alive: float = 0.0
+    _max_alive: float = -math.inf
+
+    # Dead pool
+    n_dead: int = 0
+    _sum_dead: float = 0.0
+    _sum_sq_dead: float = 0.0
+    _max_dead: float = -math.inf
+
+    # Tier-encoded UCB scalar (shared)
+    _sum_ucb: float = 0.0
+    _sum_sq_ucb: float = 0.0
+    _max_ucb: float = -math.inf
+
+    @property
+    def n(self) -> int:
+        return self.n_alive + self.n_dead
+
+    @property
+    def deaths(self) -> int:
+        return self.n_dead
+
+    def update(
+        self,
+        outcome: TerminalOutcome,
+        *,
+        start_hp: float,
+        total_initial_enemy_hp: float,
+    ) -> None:
+        if not outcome.player_dead:
+            s = float(outcome.damage_taken)
+            self.n_alive += 1
+            self._sum_alive += s
+            self._sum_sq_alive += s * s
+            if s > self._max_alive:
+                self._max_alive = s
+        else:
+            s = float(outcome.enemy_damage_dealt)
+            self.n_dead += 1
+            self._sum_dead += s
+            self._sum_sq_dead += s * s
+            if s > self._max_dead:
+                self._max_dead = s
+
+        # Tier-encoded scalar: alive → damage_taken; dead → start_hp + 1 + remaining_hp
+        if not outcome.player_dead:
+            ucb = float(outcome.damage_taken)
+        else:
+            remaining = total_initial_enemy_hp - outcome.enemy_damage_dealt
+            ucb = start_hp + 1.0 + remaining
+        self._sum_ucb += ucb
+        self._sum_sq_ucb += ucb * ucb
+        if ucb > self._max_ucb:
+            self._max_ucb = ucb
+
+    # UCB scalar properties (used for in-tree exploration)
 
     @property
     def mean(self) -> float:
-        return self._sum / self.n if self.n > 0 else math.inf
+        """Tier-encoded scalar mean — used for UCB exploration."""
+        return self._sum_ucb / self.n if self.n > 0 else math.inf
 
     @property
     def std(self) -> float:
+        """Std of the tier-encoded scalar."""
         if self.n < 2:
             return 0.0
-        variance = self._sum_sq / self.n - (self._sum / self.n) ** 2
+        variance = self._sum_sq_ucb / self.n - (self._sum_ucb / self.n) ** 2
         return math.sqrt(max(0.0, variance))
 
     @property
     def max(self) -> float:
-        return self._max if self.n > 0 else math.inf
+        """Worst-case tier-encoded scalar."""
+        return self._max_ucb if self.n > 0 else math.inf
+
+    # Alive-pool properties
+
+    @property
+    def mean_damage_alive(self) -> float:
+        return self._sum_alive / self.n_alive if self.n_alive > 0 else math.inf
+
+    # Dead-pool properties
+
+    @property
+    def mean_enemy_dmg_dead(self) -> float:
+        return self._sum_dead / self.n_dead if self.n_dead > 0 else math.nan
+
+    @property
+    def death_rate(self) -> float:
+        return self.n_dead / self.n if self.n > 0 else 1.0
+
+
+def _edge_lex_key(stats: _EdgeStats) -> tuple:
+    """Lexicographic key for final root-selection and PV descent.
+
+    Lower is better:
+      (bucketed_death_rate, mean_damage_alive, -mean_enemy_dmg_dead)
+
+    Bucketing at 3 decimal places (0.1 % granularity) ensures that a single
+    unlucky rollout in > 1000 sims doesn't flip the alive-damage tier.
+    When all rollouts died (n_alive == 0), mean_damage_alive == inf — correctly
+    ranking any surviving edge above any all-dead edge.
+    When no rollouts died, neg_mean_enemy_dmg == inf (tie-break irrelevant).
+    """
+    bucketed_death_rate = round(stats.death_rate, 3)
+    neg_mean_enemy_dmg = (
+        -stats.mean_enemy_dmg_dead if stats.n_dead > 0 else math.inf
+    )
+    return (bucketed_death_rate, stats.mean_damage_alive, neg_mean_enemy_dmg)
 
 
 @dataclass
@@ -198,10 +298,10 @@ def _resolve_action(concept_key: tuple, combat: Combat) -> Action | None:
 # ---------------------------------------------------------------------------
 
 
-def _heuristic_rollout(combat: Combat) -> int:
+def _heuristic_rollout(combat: Combat) -> TerminalOutcome:
     """Play greedily (lowest _order_key first) until combat is done.
 
-    Returns terminal_score at the end state.
+    Returns a TerminalOutcome describing the terminal state.
     """
     while not combat.observe().done:
         actions = _ordered_actions(combat)
@@ -254,12 +354,15 @@ class MCTSPlanner:
         self._node_store: dict[tuple, _Node] = {}
 
     def act(self, combat: Combat) -> Action:
-        """Return the action with the lowest estimated expected damage.
+        """Return the action with the lowest lexicographic objective.
 
         The original ``combat`` is never mutated.
         """
         obs = combat.observe()
         start_hp: float = obs.player_max_hp
+        total_initial_enemy_hp: float = sum(
+            e.max_hp for e in combat._state.enemies  # type: ignore[union-attr]
+        )
 
         c = self._exploration_c if self._exploration_c is not None else start_hp
 
@@ -344,17 +447,21 @@ class MCTSPlanner:
 
             # --- Rollout ---
             rollout_combat = current_combat.clone()
-            score = _heuristic_rollout(rollout_combat)
+            outcome = _heuristic_rollout(rollout_combat)
 
             # --- Backup ---
             for node, concept_key in path:
                 if concept_key not in node.edges:
                     node.edges[concept_key] = _EdgeStats()
-                node.edges[concept_key].update(score, start_hp=start_hp)
+                node.edges[concept_key].update(
+                    outcome,
+                    start_hp=start_hp,
+                    total_initial_enemy_hp=total_initial_enemy_hp,
+                )
 
             sims_run += 1
 
-        # Choose best action at root: lowest mean
+        # Choose best action at root via lexicographic key
         best_concept_key, best_edge = self._best_root_concept(root_node)
         best_action = _resolve_action(best_concept_key, combat) or Action.end_turn()
 
@@ -362,13 +469,22 @@ class MCTSPlanner:
         pv = pv_edge if pv_edge is not None else best_edge
 
         self.last_stats = {
+            # Tier-encoded scalar stats (for log continuity)
             "mean": best_edge.mean if best_edge.n > 0 else math.nan,
             "std": best_edge.std,
             "max": best_edge.max if best_edge.n > 0 else math.nan,
             "n": float(best_edge.n),
             "deaths": float(best_edge.deaths),
+            # Lexicographic tier breakdown
+            "death_rate": best_edge.death_rate if best_edge.n > 0 else math.nan,
+            "n_alive": float(best_edge.n_alive),
+            "mean_damage_alive": best_edge.mean_damage_alive,
+            "n_dead": float(best_edge.n_dead),
+            "mean_enemy_dmg_dead": best_edge.mean_enemy_dmg_dead,
+            # Budget
             "simulations": float(sims_run),
             "nodes": float(nodes_expanded),
+            # PV
             "pv_mean": pv.mean if pv.n > 0 else math.nan,
             "pv_std": pv.std,
             "pv_max": pv.max if pv.n > 0 else math.nan,
@@ -379,13 +495,14 @@ class MCTSPlanner:
 
         log.debug(
             "T=%d MCTS done: action=%s mean=%.1f std=%.1f max=%.1f "
-            "n=%d sims=%d nodes=%d",
+            "n=%d death_rate=%.1f%% sims=%d nodes=%d",
             obs.turn,
             _fmt_action(best_action, obs.hand),
             self.last_stats["mean"],
             self.last_stats["std"],
             self.last_stats["max"],
             int(self.last_stats["n"]),
+            self.last_stats["death_rate"] * 100 if math.isfinite(self.last_stats["death_rate"]) else float("nan"),
             sims_run,
             nodes_expanded,
         )
@@ -430,7 +547,7 @@ class MCTSPlanner:
     def _pv_well_visited_edge(
         self, root: _Node, combat: Combat
     ) -> tuple[_EdgeStats | None, int]:
-        """Walk root → argmin-mean child while edge.n >= _effective_pv_min_n.
+        """Walk root → lex-best child while edge.n >= _effective_pv_min_n.
 
         Returns (deepest_edge_satisfying_min_n, depth). Falls back to None
         (caller uses chosen root edge) when no edge meets the threshold.
@@ -442,7 +559,7 @@ class MCTSPlanner:
         last_depth = 0
         depth = 0
         while node.edges:
-            key = min(node.edges, key=lambda k: node.edges[k].mean)
+            key = min(node.edges, key=lambda k: _edge_lex_key(node.edges[k]))
             edge = node.edges[key]
             if edge.n < min_n:
                 break
@@ -462,15 +579,14 @@ class MCTSPlanner:
         return last_edge, last_depth
 
     def _best_root_concept(self, root: _Node) -> tuple[tuple, _EdgeStats]:
-        """Pick the root concept key with the lowest mean score.
+        """Pick the root concept key with the best lexicographic objective.
 
         Falls back to the first untried concept key if no edges were visited.
         """
         if not root.edges:
             dummy = _EdgeStats()
-            dummy.update(math.inf)
             fallback = root.untried_action_keys[0] if root.untried_action_keys else ("END",)
             return fallback, dummy
 
-        best_key = min(root.edges, key=lambda k: root.edges[k].mean)
+        best_key = min(root.edges, key=lambda k: _edge_lex_key(root.edges[k]))
         return best_key, root.edges[best_key]

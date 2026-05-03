@@ -115,8 +115,7 @@ def test_tree_search_avoids_death():
 
 
 def test_death_penalty_ranks_death_above_worst_survival():
-    """terminal_score for any dead player must exceed that of any alive player."""
-    # Dead player: 1 HP → Dark Strike kills (damage_taken ≤ 80 start_hp, so * 2)
+    """terminal_score for a dead player must set player_dead=True and report damage."""
     combat_dead = Combat(
         deck=["AscendersBane"] * 10,
         enemies=["Cultist"],
@@ -127,20 +126,26 @@ def test_death_penalty_ranks_death_above_worst_survival():
     combat_dead.step(Action.end_turn())  # T0: Incantation (no dmg)
     combat_dead.step(Action.end_turn())  # T1: Dark Strike → player dead
     assert combat_dead.observe().player_dead
-    dead_score = terminal_score(combat_dead)
+    dead_outcome = terminal_score(combat_dead)
 
-    # Alive player with heavy damage (79 HP lost out of 80)
+    # Alive player with heavy damage (survive but badly hurt)
     combat_alive = _make_combat(enemy_hp=12, player_hp=80)
-    combat_alive._state.player_hp = 1  # simulate near-death but alive
-    # Manually mark as done by killing the enemy
-    combat_alive._state.enemies[0].hp = 0
-    alive_score = terminal_score(combat_alive)  # damage_taken = 0 (no step taken)
+    combat_alive._state.player_hp = 1  # near-death but alive
+    combat_alive._state.enemies[0].hp = 0  # enemy killed
+    alive_outcome = terminal_score(combat_alive)
 
-    # The meaningful comparison: dead score is double any actual damage
-    assert dead_score > 0, "Dead player must have positive penalty"
-    # More concretely: dead score = dmg * 2, alive = dmg * 1
-    raw = combat_dead.damage_taken
-    assert dead_score == raw * 2
+    assert dead_outcome.player_dead, "Dead combat must report player_dead=True"
+    assert not alive_outcome.player_dead, "Alive combat must report player_dead=False"
+    assert dead_outcome.damage_taken > 0, "Dead player must have taken positive damage"
+    # terminal_score_scalar encodes that any death outranks any survival
+    from sts_agent.battle.base import terminal_score_scalar
+    start_hp = 80.0
+    total_enemy_hp = float(sum(e.max_hp for e in combat_dead._state.enemies))
+    dead_scalar = terminal_score_scalar(combat_dead, start_hp=start_hp, total_initial_enemy_hp=total_enemy_hp)
+    alive_scalar = terminal_score_scalar(combat_alive, start_hp=start_hp, total_initial_enemy_hp=total_enemy_hp)
+    assert dead_scalar > alive_scalar, (
+        f"Dead scalar ({dead_scalar}) must exceed alive scalar ({alive_scalar})"
+    )
 
 
 # ---------------------------------------------------------------------------

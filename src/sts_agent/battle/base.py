@@ -16,18 +16,24 @@ Both return damage_taken at the end of combat.
 
 Terminal scoring
 ----------------
-terminal_score returns a penalty that is continuous even through death:
-  alive  → damage_taken
-  dead   → damage_taken * 2
+terminal_score returns a TerminalOutcome with three fields:
+  damage_taken        HP lost by the player during combat.
+  player_dead         True if the player died.
+  enemy_damage_dealt  Total HP removed from all enemies (sum of max_hp minus
+                      remaining hp; clamped to 0 for enemies that heal above
+                      their starting hp, though that is not currently possible).
 
-The doubling ensures that any surviving branch (score ≤ start_hp) ranks
-above any dying branch (score ≥ 2), while still ordering two dying branches
-by how much overkill was taken.
+The old scalar *2 doubling hack is replaced by lexicographic priority in MCTS.
+For callers that need a single scalar, terminal_score_scalar encodes the same
+two-tier preference without the doubling:
+  alive → damage_taken
+  dead  → start_hp + 1 + (total_initial_enemy_hp − enemy_damage_dealt)
 """
 
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Protocol
 
 from sts_env.combat import Action, Combat, Observation
@@ -35,6 +41,15 @@ from sts_env.combat.card import Card
 from sts_env.combat.state import ActionType
 
 log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class TerminalOutcome:
+    """Structured result of a terminal combat state."""
+
+    damage_taken: int
+    player_dead: bool
+    enemy_damage_dealt: int
 
 
 class BattleAgent(Protocol):
@@ -51,11 +66,43 @@ class BattlePlanner(Protocol):
         ...
 
 
-def terminal_score(combat: Combat) -> int:
-    """Score a terminal combat state.  Lower is better (less HP lost)."""
+def terminal_score(combat: Combat) -> TerminalOutcome:
+    """Score a terminal combat state.
+
+    Returns a TerminalOutcome with damage_taken, player_dead, and
+    enemy_damage_dealt (total HP removed from all enemies).
+    """
     obs = combat.observe()
-    multiplier = 2 if obs.player_dead else 1
-    return combat.damage_taken * multiplier
+    enemy_damage_dealt = sum(
+        max(0, e.max_hp - e.hp) for e in combat._state.enemies  # type: ignore[union-attr]
+    )
+    return TerminalOutcome(
+        damage_taken=combat.damage_taken,
+        player_dead=obs.player_dead,
+        enemy_damage_dealt=enemy_damage_dealt,
+    )
+
+
+def terminal_score_scalar(
+    combat: Combat,
+    *,
+    start_hp: float,
+    total_initial_enemy_hp: float,
+) -> float:
+    """Tier-encoded scalar for callers that need a single comparable number.
+
+    Tier 1 (alive): damage_taken  — range [0, start_hp].
+    Tier 2 (dead):  start_hp + 1 + (total_initial_enemy_hp − enemy_damage_dealt)
+                    — always > start_hp; lower means more enemy damage dealt.
+
+    The two tiers never overlap, so any surviving outcome sorts below any dying
+    outcome without the old *2 hack.
+    """
+    outcome = terminal_score(combat)
+    if not outcome.player_dead:
+        return float(outcome.damage_taken)
+    remaining_enemy_hp = total_initial_enemy_hp - outcome.enemy_damage_dealt
+    return start_hp + 1.0 + remaining_enemy_hp
 
 
 # ---------------------------------------------------------------------------

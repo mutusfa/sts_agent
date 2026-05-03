@@ -61,7 +61,7 @@ from sts_env.combat import Action, Combat
 from sts_env.combat.state import ActionType
 from sts_env.combat.card import Card
 
-from .base import _fmt_action, terminal_score
+from .base import _fmt_action, terminal_score_scalar
 
 log = logging.getLogger(__name__)
 
@@ -255,6 +255,12 @@ class TreeSearchPlanner:
 
         The original ``combat`` is *never* mutated — all rollouts use clones.
         """
+        obs = combat.observe()
+        start_hp: float = obs.player_max_hp
+        total_initial_enemy_hp: float = sum(
+            e.max_hp for e in combat._state.enemies  # type: ignore[union-attr]
+        )
+
         counter = _Counter(self.max_nodes)
         tt: dict[tuple, int | float] | None = (
             {} if self.use_transposition_table else None
@@ -268,7 +274,10 @@ class TreeSearchPlanner:
         for action in actions:
             clone = combat.clone()
             clone.step(action)
-            score = _min_score(clone, counter, best_score, tt, self.use_move_ordering)
+            score = _min_score(
+                clone, counter, best_score, tt, self.use_move_ordering,
+                start_hp=start_hp, total_initial_enemy_hp=total_initial_enemy_hp,
+            )
             if score < best_score:
                 best_score = score
                 best_action = action
@@ -312,6 +321,9 @@ def _min_score(
     cutoff: int | float = math.inf,
     tt: dict[tuple, int | float] | None = None,
     use_move_ordering: bool = True,
+    *,
+    start_hp: float = math.inf,
+    total_initial_enemy_hp: float = 0.0,
 ) -> int | float:
     """Recursive DFS with alpha-pruning, optional transposition table, and
     optional move ordering.
@@ -333,6 +345,10 @@ def _min_score(
     use_move_ordering:
         When True, use _ordered_actions (card-tier + low-HP-target ordering).
         When False, use plain _dedupe_actions order.
+    start_hp:
+        Player's max HP at the start of combat — used for tier encoding.
+    total_initial_enemy_hp:
+        Sum of all enemies' max_hp at the start of combat — used for tier encoding.
     """
     counter.tick()
 
@@ -341,7 +357,11 @@ def _min_score(
         return cutoff
 
     if combat.observe().done:
-        return terminal_score(combat)
+        return terminal_score_scalar(
+            combat,
+            start_hp=start_hp,
+            total_initial_enemy_hp=total_initial_enemy_hp,
+        )
 
     # Transposition table lookup — only valid for exact scores stored earlier.
     key: tuple | None = None
@@ -355,7 +375,10 @@ def _min_score(
     for action in _actions(combat):
         clone = combat.clone()
         clone.step(action)
-        score = _min_score(clone, counter, best, tt, use_move_ordering)
+        score = _min_score(
+            clone, counter, best, tt, use_move_ordering,
+            start_hp=start_hp, total_initial_enemy_hp=total_initial_enemy_hp,
+        )
         if score < best:
             best = score
         if best == 0:

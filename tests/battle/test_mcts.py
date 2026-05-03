@@ -13,7 +13,8 @@ from sts_env.combat import Combat
 from sts_env.combat.encounters import IRONCLAD_STARTER
 
 from sts_agent.battle import MCTSPlanner, run_planner
-from sts_agent.battle.mcts import _mcts_state_key
+from sts_agent.battle.base import TerminalOutcome
+from sts_agent.battle.mcts import _EdgeStats, _edge_lex_key, _mcts_state_key
 
 
 # ---------------------------------------------------------------------------
@@ -317,3 +318,82 @@ def test_pv_falls_back_to_root_edge_when_budget_tiny():
     # pv stats must still be finite and sane
     assert stats["pv_n"] > 0
     assert math.isfinite(stats["pv_mean"])
+
+
+# ---------------------------------------------------------------------------
+# 10. Lexicographic priority: survival > enemy damage
+# ---------------------------------------------------------------------------
+
+_START_HP = 80
+_TOTAL_ENEMY_HP = 50
+
+
+def _make_outcome(*, dead: bool, damage_taken: int, enemy_dmg_dealt: int) -> TerminalOutcome:
+    return TerminalOutcome(
+        damage_taken=damage_taken,
+        player_dead=dead,
+        enemy_damage_dealt=enemy_dmg_dealt,
+    )
+
+
+def _fill_edge(outcomes: list[TerminalOutcome]) -> _EdgeStats:
+    edge = _EdgeStats()
+    for o in outcomes:
+        edge.update(o, start_hp=_START_HP, total_initial_enemy_hp=_TOTAL_ENEMY_HP)
+    return edge
+
+
+def test_lex_key_prefers_survival_over_enemy_damage():
+    """An all-survive edge must rank below (better) an all-die edge regardless of
+    how much enemy damage the dying branch deals."""
+    survive = _fill_edge(
+        [_make_outcome(dead=False, damage_taken=20, enemy_dmg_dealt=5)] * 10
+    )
+    die_high_dmg = _fill_edge(
+        [_make_outcome(dead=True, damage_taken=_START_HP, enemy_dmg_dealt=45)] * 10
+    )
+    assert _edge_lex_key(survive) < _edge_lex_key(die_high_dmg), (
+        "Surviving with 20 dmg must beat dying with 45 enemy dmg dealt"
+    )
+
+
+def test_lex_key_prefers_more_enemy_damage_when_all_die():
+    """When every rollout dies, prefer the branch that dealt the most enemy damage."""
+    high_enemy_dmg = _fill_edge(
+        [_make_outcome(dead=True, damage_taken=_START_HP, enemy_dmg_dealt=45)] * 10
+    )
+    low_enemy_dmg = _fill_edge(
+        [_make_outcome(dead=True, damage_taken=_START_HP, enemy_dmg_dealt=10)] * 10
+    )
+    assert _edge_lex_key(high_enemy_dmg) < _edge_lex_key(low_enemy_dmg), (
+        "45 enemy damage dealt must beat 10 enemy damage dealt when all branches die"
+    )
+
+
+def test_bucketed_death_rate_ignores_tiny_noise():
+    """1 death in 10 000 rollouts rounds to death_rate=0.0 — same tier as zero deaths —
+    so tier-2 (alive damage) comparison decides the winner instead."""
+    # 1 death in 10 000: round(1/10000, 3) == 0.0
+    almost_all_alive = _fill_edge(
+        [_make_outcome(dead=False, damage_taken=5, enemy_dmg_dealt=10)] * 9999
+        + [_make_outcome(dead=True, damage_taken=_START_HP, enemy_dmg_dealt=10)]
+    )
+    all_alive_high_dmg = _fill_edge(
+        [_make_outcome(dead=False, damage_taken=50, enemy_dmg_dealt=10)] * 10000
+    )
+    # Both round to 0.0 death rate; tier-2 picks lower alive damage (5 < 50).
+    assert _edge_lex_key(almost_all_alive) < _edge_lex_key(all_alive_high_dmg), (
+        "1/10000 death rate rounds to 0 — alive-damage (5) should beat alive-damage (50)"
+    )
+
+
+def test_last_stats_exposes_tier_breakdown():
+    """After act(), last_stats must contain the lexicographic tier fields."""
+    combat = _make_combat()
+    planner = MCTSPlanner(simulations=50, seed=0)
+    planner.act(combat)
+
+    required = {"death_rate", "n_alive", "mean_damage_alive", "n_dead", "mean_enemy_dmg_dead"}
+    assert required.issubset(planner.last_stats), (
+        f"Missing tier-breakdown keys: {required - set(planner.last_stats)}"
+    )
