@@ -72,6 +72,33 @@ _ACT1_POOLS: dict[str, list[tuple[str, str]]] = {
 _ACT1_POOLS["monster"] = _ACT1_POOLS["easy"] + _ACT1_POOLS["hard"]
 
 
+def get_encounter_pool(
+    room_type: str, encounter_id: str
+) -> list[tuple[str, str]] | None:
+    """Return the pool for this encounter, or ``None`` if it is a specific encounter.
+
+    A reference is considered a *pool* when *encounter_id* is empty (use
+    *room_type* as the pool key) or when *encounter_id* is itself a pool
+    key (e.g. the LLM passed ``"monster"`` or ``"elite"`` literally).
+
+    Parameters
+    ----------
+    room_type:
+        Room type from the map (``"monster"``, ``"elite"``, ``"boss"``, …).
+    encounter_id:
+        The encounter identifier supplied by the caller.  May be empty,
+        a pool key, or a specific encounter ID.
+
+    Returns
+    -------
+    The pool list when the encounter is a pool reference, ``None`` when it
+    names a specific enemy.
+    """
+    if not encounter_id:
+        return _ACT1_POOLS.get(room_type)
+    return _ACT1_POOLS.get(encounter_id)  # None when encounter_id is specific
+
+
 def _resolve_enc(enc_type: str, enc_id: str, seed: int) -> tuple[str, str]:
     """Resolve a ``(enc_type, enc_id)`` pair, sampling from the pool when enc_id is empty.
 

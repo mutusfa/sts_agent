@@ -608,3 +608,119 @@ class TestPickCardMapAware:
         mv = captured_kwargs["map_view"]
         assert isinstance(mv, str)
         assert mv  # not empty — should be the "no map" stub message
+
+
+# ---------------------------------------------------------------------------
+# Pool-aware probe detection tests
+# ---------------------------------------------------------------------------
+
+
+class TestToolsPoolDetection:
+    """Tools run multi-enemy pool probes or single specific-encounter probes."""
+
+    def _call_counts_and_sims(self, tool_fn, *args):
+        """Call tool_fn(*args), return (call_count, list of simulations kwargs)."""
+        calls = []
+
+        def fake_simulate(character, enc_type, enc_id, seed, *, max_nodes, simulations):
+            calls.append(simulations)
+            return SimResult(True, 10, 0, 70, 80, 5)
+
+        with patch("sts_agent.strategy.llm_agent.simulate_encounter",
+                   side_effect=fake_simulate):
+            result = tool_fn(*args)
+        return result, calls
+
+    def test_empty_encounter_id_triggers_pool(self):
+        """No encounter_id → pool path: simulate_encounter called multiple times."""
+        tools = _make_tools(_ironclad(), seed=42, budget_checker=lambda: None)
+        _, calls = self._call_counts_and_sims(tools[0], "monster")
+        assert len(calls) > 1
+
+    def test_pool_encounter_uses_100_sims(self):
+        """Pool path uses 100 sims (base_simulations) per enemy."""
+        tools = _make_tools(_ironclad(), seed=42, budget_checker=lambda: None,
+                            max_simulations=100)
+        _, calls = self._call_counts_and_sims(tools[0], "monster")
+        assert all(n == 100 for n in calls)
+
+    def test_pool_encounter_at_most_5_enemies(self):
+        """Pool path samples at most 5 enemies even for the large monster pool."""
+        tools = _make_tools(_ironclad(), seed=42, budget_checker=lambda: None)
+        _, calls = self._call_counts_and_sims(tools[0], "monster")
+        assert len(calls) <= 5
+
+    def test_elite_pool_runs_all_three_elites(self):
+        """Elite pool has exactly 3 entries; all three should be run."""
+        tools = _make_tools(_ironclad(), seed=42, budget_checker=lambda: None)
+        _, calls = self._call_counts_and_sims(tools[0], "elite")
+        assert len(calls) == 3
+
+    def test_specific_encounter_calls_simulate_once(self):
+        """Specific encounter_id → single simulate_encounter call."""
+        tools = _make_tools(_ironclad(), seed=42, budget_checker=lambda: None)
+        _, calls = self._call_counts_and_sims(tools[0], "easy", "cultist")
+        assert len(calls) == 1
+
+    def test_specific_encounter_uses_300_sims(self):
+        """Specific encounter uses 300 sims for accuracy."""
+        tools = _make_tools(_ironclad(), seed=42, budget_checker=lambda: None)
+        _, calls = self._call_counts_and_sims(tools[0], "easy", "cultist")
+        assert calls[0] == 300
+
+    def test_encounter_id_monster_treated_as_pool(self):
+        """Passing 'monster' as encounter_id triggers pool path, not specific."""
+        tools = _make_tools(_ironclad(), seed=42, budget_checker=lambda: None)
+        _, calls = self._call_counts_and_sims(tools[0], "monster", "monster")
+        assert len(calls) > 1
+
+    def test_encounter_id_elite_treated_as_pool(self):
+        """Passing 'elite' as encounter_id triggers pool path."""
+        tools = _make_tools(_ironclad(), seed=42, budget_checker=lambda: None)
+        _, calls = self._call_counts_and_sims(tools[0], "elite", "elite")
+        assert len(calls) == 3
+
+    def test_pool_result_contains_enemy_names(self):
+        """Pool probe output contains individual enemy IDs from the sampled pool."""
+        tools = _make_tools(_ironclad(), seed=42, budget_checker=lambda: None)
+        result, _ = self._call_counts_and_sims(tools[0], "elite")
+        # Elite pool contains these three; all should appear in the output
+        assert any(name in result for name in ("Gremlin Nob", "Lagavulin", "Three Sentries"))
+
+    def test_pool_result_header_mentions_pool_type(self):
+        """Pool probe output header contains the pool name."""
+        tools = _make_tools(_ironclad(), seed=42, budget_checker=lambda: None)
+        result, _ = self._call_counts_and_sims(tools[0], "elite")
+        assert "elite" in result
+
+    def test_try_card_pool_path(self):
+        """try_card also dispatches through pool path when no specific encounter."""
+        tools = _make_tools(_ironclad(), seed=42, budget_checker=lambda: None)
+        calls = []
+
+        def fake_sim_card(character, card_id, enc_type, enc_id, seed, *, max_nodes, simulations):
+            calls.append(simulations)
+            return SimResult(True, 10, 0, 70, 80, 5)
+
+        with patch("sts_agent.strategy.llm_agent.simulate_with_card",
+                   side_effect=fake_sim_card):
+            tools[1]("Anger", "monster")
+
+        assert len(calls) > 1
+        assert all(n == 100 for n in calls)
+
+    def test_try_card_specific_uses_300_sims(self):
+        """try_card with specific encounter uses 300 sims."""
+        tools = _make_tools(_ironclad(), seed=42, budget_checker=lambda: None)
+        calls = []
+
+        def fake_sim_card(character, card_id, enc_type, enc_id, seed, *, max_nodes, simulations):
+            calls.append(simulations)
+            return SimResult(True, 10, 0, 70, 80, 5)
+
+        with patch("sts_agent.strategy.llm_agent.simulate_with_card",
+                   side_effect=fake_sim_card):
+            tools[1]("Anger", "easy", "cultist")
+
+        assert len(calls) == 1
+        assert calls[0] == 300

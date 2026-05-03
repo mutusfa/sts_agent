@@ -5,7 +5,7 @@ from __future__ import annotations
 from sts_env.run.character import Character
 
 from sts_agent.strategy import simulate_encounter, simulate_with_card, SimResult
-from sts_agent.strategy.simulate import SimDistribution
+from sts_agent.strategy.simulate import SimDistribution, _ACT1_POOLS, get_encounter_pool
 
 
 # ---------------------------------------------------------------------------
@@ -123,3 +123,53 @@ def test_simulate_with_card_has_distribution():
     )
     assert result.distribution is not None
     assert result.distribution.n > 0
+
+
+# ---------------------------------------------------------------------------
+# 6. get_encounter_pool
+# ---------------------------------------------------------------------------
+
+
+class TestGetEncounterPool:
+    """get_encounter_pool distinguishes pool references from specific encounters."""
+
+    def test_empty_encounter_id_returns_room_type_pool(self):
+        """Empty encounter_id → pool keyed by room_type."""
+        pool = get_encounter_pool("monster", "")
+        assert pool is not None
+        assert pool == _ACT1_POOLS["monster"]
+
+    def test_empty_encounter_id_elite(self):
+        """Empty encounter_id + elite room_type → elite pool."""
+        pool = get_encounter_pool("elite", "")
+        assert pool is not None
+        assert pool == _ACT1_POOLS["elite"]
+
+    def test_pool_name_as_encounter_id_returns_pool(self):
+        """Passing 'elite' as encounter_id is detected as a pool reference."""
+        pool = get_encounter_pool("elite", "elite")
+        assert pool is not None
+        assert pool == _ACT1_POOLS["elite"]
+
+    def test_monster_as_encounter_id_returns_pool(self):
+        """Passing 'monster' as encounter_id is detected as a pool reference."""
+        pool = get_encounter_pool("monster", "monster")
+        assert pool is not None
+        assert pool == _ACT1_POOLS["monster"]
+
+    def test_specific_encounter_id_returns_none(self):
+        """Specific enemy name → None (not a pool reference)."""
+        assert get_encounter_pool("easy", "cultist") is None
+
+    def test_specific_elite_returns_none(self):
+        """Specific elite enemy name → None."""
+        assert get_encounter_pool("elite", "Lagavulin") is None
+
+    def test_specific_boss_returns_none(self):
+        """Specific boss name → None."""
+        assert get_encounter_pool("boss", "hexaghost") is None
+
+    def test_pool_entries_are_tuples(self):
+        """Returned pool contains (enc_type, enc_id) tuples."""
+        pool = get_encounter_pool("elite", "")
+        assert all(isinstance(entry, tuple) and len(entry) == 2 for entry in pool)

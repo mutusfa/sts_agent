@@ -44,7 +44,14 @@ from sts_env.run.character import Character
 from sts_env.run.rooms import RestChoice, RestResult
 
 from .base import BaseStrategyAgent
-from .simulate import SimResult, simulate_encounter, simulate_with_card, simulate_with_upgrade, simulate_without_card
+from .simulate import (
+    SimResult,
+    get_encounter_pool,
+    simulate_encounter,
+    simulate_with_card,
+    simulate_with_upgrade,
+    simulate_without_card,
+)
 
 if TYPE_CHECKING:
     from sts_env.run.map import StSMap
@@ -205,6 +212,59 @@ def _format_result(label: str, result: SimResult) -> str:
     return " | ".join(parts)
 
 
+def _probe_encounter(
+    sim_fn: Callable,
+    room_type: str,
+    encounter_id: str,
+    seed: int,
+    label_prefix: str,
+    max_nodes: int,
+    base_simulations: int = 100,
+) -> str:
+    """Run simulations and return formatted results for a pool or specific encounter.
+
+    Parameters
+    ----------
+    sim_fn:
+        Callable with signature ``(enc_type, enc_id, seed, n_sims) -> SimResult``.
+        Should close over ``character`` (and any card mutations) and ``max_nodes``.
+    room_type:
+        Room type from the map (used as pool key when *encounter_id* is empty).
+    encounter_id:
+        Specific enemy ID, pool key (e.g. ``"monster"``, ``"elite"``), or empty.
+    seed:
+        RNG seed for pool sampling and each simulation.
+    label_prefix:
+        Human-readable prefix for result lines (e.g. ``"Baseline"``, ``"With Anger"``).
+    max_nodes:
+        MCTS node budget forwarded to each simulation.
+    base_simulations:
+        Rollout count used for each enemy in the pool path (default 100).
+        Specific encounters always use 300 rollouts for higher accuracy.
+
+    Returns
+    -------
+    Formatted string — multi-line for pool probes, single-line for specific.
+    """
+    import random as _random
+
+    pool = get_encounter_pool(room_type, encounter_id)
+    if pool is not None:
+        pool_label = encounter_id if encounter_id else room_type
+        rng = _random.Random(seed)
+        sample = rng.sample(pool, min(5, len(pool)))
+        lines = [
+            f"{label_prefix} — {pool_label} pool — {len(sample)} of {len(pool)} sampled:"
+        ]
+        for enc_type, enc_id in sample:
+            result = sim_fn(enc_type, enc_id, seed, base_simulations)
+            lines.append("  " + _format_result(f"{label_prefix} ({enc_id})", result))
+        return "\n".join(lines)
+    else:
+        result = sim_fn(room_type, encounter_id, seed, 3 * base_simulations)
+        return _format_result(f"{label_prefix} ({encounter_id})", result)
+
+
 def _format_possible_encounters(data: dict | None) -> str:
     """Format possible_encounters dict as a human-readable string for the LLM."""
     if data is None:
@@ -252,12 +312,18 @@ def _make_tools(
     def simulate_upcoming(room_type: str, encounter_id: str = "") -> str:
         """Simulate an upcoming encounter of the given room type with the current deck.
 
+        When encounter_id is empty or a pool name ('monster', 'elite', 'boss'), probes
+        up to 5 randomly sampled enemies from that pool (100 sims each) and reports
+        each result separately. When encounter_id is a specific enemy, runs 300 sims
+        for a more accurate result.
+
         Args:
             room_type: Room type read from the map view — one of 'monster', 'elite', 'boss'.
             encounter_id: Optional specific encounter ID from possible_encounters
-                (e.g. 'Lagavulin', 'cultist', 'hexaghost'). If empty, samples from the pool.
+                (e.g. 'Lagavulin', 'cultist', 'hexaghost'). If empty or a pool name,
+                probes the full pool.
         Returns:
-            Human-readable simulation result (survived, damage, HP, turns).
+            Human-readable simulation result(s).
         """
         try:
             budget_checker()
@@ -266,12 +332,14 @@ def _make_tools(
                 "SIMULATION BUDGET EXHAUSTED — no more simulations available. "
                 "Make your pick now based on the results you already have."
             )
-        label = f"Baseline ({encounter_id})" if encounter_id else f"Baseline ({room_type})"
-        result = simulate_encounter(
-            character, room_type, encounter_id, seed * 1000,
-            max_nodes=max_nodes, simulations=max_simulations,
+
+        def _sim_enc(et: str, ei: str, s: int, n: int) -> SimResult:
+            return simulate_encounter(character, et, ei, s, max_nodes=max_nodes, simulations=n)
+
+        formatted = _probe_encounter(
+            _sim_enc, room_type, encounter_id, seed * 1000, "Baseline",
+            max_nodes, max_simulations,
         )
-        formatted = _format_result(label, result)
         if sim_log is not None:
             sim_log.append(formatted)
         return formatted
@@ -279,13 +347,17 @@ def _make_tools(
     def try_card(card_id: str, room_type: str, encounter_id: str = "") -> str:
         """Simulate an encounter with a hypothetical card added to the deck.
 
+        When encounter_id is empty or a pool name, probes up to 5 pool enemies
+        (100 sims each). When encounter_id is specific, runs 300 sims.
+
         Args:
             card_id: The card ID to evaluate (one of the reward choices).
             room_type: Room type read from the map view — one of 'monster', 'elite', 'boss'.
             encounter_id: Optional specific encounter ID from possible_encounters
-                (e.g. 'Lagavulin', 'cultist', 'hexaghost'). If empty, samples from the pool.
+                (e.g. 'Lagavulin', 'cultist', 'hexaghost'). If empty or a pool name,
+                probes the full pool.
         Returns:
-            Human-readable simulation result for the card + encounter.
+            Human-readable simulation result(s) for the card + encounter(s).
         """
         try:
             budget_checker()
@@ -294,12 +366,14 @@ def _make_tools(
                 "SIMULATION BUDGET EXHAUSTED — no more simulations available. "
                 "Make your pick now based on the results you already have."
             )
-        result = simulate_with_card(
-            character, card_id, room_type, encounter_id, seed * 1000,
-            max_nodes=max_nodes, simulations=max_simulations,
+
+        def _sim_card(et: str, ei: str, s: int, n: int) -> SimResult:
+            return simulate_with_card(character, card_id, et, ei, s, max_nodes=max_nodes, simulations=n)
+
+        formatted = _probe_encounter(
+            _sim_card, room_type, encounter_id, seed * 1000, f"With {card_id}",
+            max_nodes, max_simulations,
         )
-        label = f"With {card_id} vs {encounter_id}" if encounter_id else f"With {card_id} vs {room_type}"
-        formatted = _format_result(label, result)
         if sim_log is not None:
             sim_log.append(formatted)
         return formatted
@@ -307,13 +381,17 @@ def _make_tools(
     def try_remove_card(card_id: str, room_type: str, encounter_id: str = "") -> str:
         """Simulate an encounter with a card removed from the deck.
 
+        When encounter_id is empty or a pool name, probes up to 5 pool enemies
+        (100 sims each). When encounter_id is specific, runs 300 sims.
+
         Args:
             card_id: The card ID to remove from the deck.
             room_type: Room type read from the map view — one of 'monster', 'elite', 'boss'.
             encounter_id: Optional specific encounter ID from possible_encounters
-                (e.g. 'Lagavulin', 'cultist', 'hexaghost'). If empty, samples from the pool.
+                (e.g. 'Lagavulin', 'cultist', 'hexaghost'). If empty or a pool name,
+                probes the full pool.
         Returns:
-            Human-readable simulation result for the deck without that card.
+            Human-readable simulation result(s) for the deck without that card.
         """
         try:
             budget_checker()
@@ -322,12 +400,14 @@ def _make_tools(
                 "SIMULATION BUDGET EXHAUSTED — no more simulations available. "
                 "Make your pick now based on the results you already have."
             )
-        result = simulate_without_card(
-            character, card_id, room_type, encounter_id, seed * 1000,
-            max_nodes=max_nodes, simulations=max_simulations,
+
+        def _sim_remove(et: str, ei: str, s: int, n: int) -> SimResult:
+            return simulate_without_card(character, card_id, et, ei, s, max_nodes=max_nodes, simulations=n)
+
+        formatted = _probe_encounter(
+            _sim_remove, room_type, encounter_id, seed * 1000, f"Without {card_id}",
+            max_nodes, max_simulations,
         )
-        label = f"Without {card_id} vs {encounter_id}" if encounter_id else f"Without {card_id} vs {room_type}"
-        formatted = _format_result(label, result)
         if sim_log is not None:
             sim_log.append(formatted)
         return formatted
@@ -443,9 +523,13 @@ def _make_rest_tools(
     def simulate_upcoming(room_type: str, encounter_id: str = "") -> str:
         """Simulate an upcoming encounter with the current deck.
 
+        When encounter_id is empty or a pool name, probes up to 5 pool enemies
+        (100 sims each). When encounter_id is specific, runs 300 sims.
+
         Args:
             room_type: Room type: 'monster', 'elite', 'boss', or 'event'.
             encounter_id: Optional specific encounter from possible_encounters.
+                If empty or a pool name, probes the full pool.
         """
         try:
             check_budget()
@@ -454,11 +538,13 @@ def _make_rest_tools(
                 "SIMULATION BUDGET EXHAUSTED — Make your pick now based "
                 "on the results you already have."
             )
-        result = simulate_encounter(
-            character, room_type, encounter_id, seed,
-            max_nodes=max_nodes, simulations=max_simulations,
+
+        def _sim_enc(et: str, ei: str, s: int, n: int) -> SimResult:
+            return simulate_encounter(character, et, ei, s, max_nodes=max_nodes, simulations=n)
+
+        formatted = _probe_encounter(
+            _sim_enc, room_type, encounter_id, seed, "Baseline", max_nodes, max_simulations,
         )
-        formatted = _format_result(f"Baseline vs {encounter_id or room_type}", result)
         if sim_log is not None:
             sim_log.append(formatted)
         return formatted
@@ -469,10 +555,14 @@ def _make_rest_tools(
         Replaces the first unupgraded copy of card_id with its upgraded
         version (card_id + '+') and runs a simulation.
 
+        When encounter_id is empty or a pool name, probes up to 5 pool enemies
+        (100 sims each). When encounter_id is specific, runs 300 sims.
+
         Args:
             card_id: Card to upgrade (must be in upgradeable_cards list).
             room_type: Room type: 'monster', 'elite', 'boss', or 'event'.
             encounter_id: Optional specific encounter from possible_encounters.
+                If empty or a pool name, probes the full pool.
         """
         try:
             check_budget()
@@ -481,12 +571,14 @@ def _make_rest_tools(
                 "SIMULATION BUDGET EXHAUSTED — Make your pick now based "
                 "on the results you already have."
             )
-        result = simulate_with_upgrade(
-            character, card_id, room_type, encounter_id, seed,
-            max_nodes=max_nodes, simulations=max_simulations,
+
+        def _sim_upgrade(et: str, ei: str, s: int, n: int) -> SimResult:
+            return simulate_with_upgrade(character, card_id, et, ei, s, max_nodes=max_nodes, simulations=n)
+
+        formatted = _probe_encounter(
+            _sim_upgrade, room_type, encounter_id, seed, f"With {card_id}+",
+            max_nodes, max_simulations,
         )
-        label = f"With {card_id}+ vs {encounter_id or room_type}"
-        formatted = _format_result(label, result)
         if sim_log is not None:
             sim_log.append(formatted)
         return formatted
@@ -496,10 +588,14 @@ def _make_rest_tools(
 
         Removes the first copy of card_id from the deck and runs a simulation.
 
+        When encounter_id is empty or a pool name, probes up to 5 pool enemies
+        (100 sims each). When encounter_id is specific, runs 300 sims.
+
         Args:
             card_id: Card to remove (must be in deck).
             room_type: Room type: 'monster', 'elite', 'boss', or 'event'.
             encounter_id: Optional specific encounter from possible_encounters.
+                If empty or a pool name, probes the full pool.
         """
         try:
             check_budget()
@@ -508,12 +604,14 @@ def _make_rest_tools(
                 "SIMULATION BUDGET EXHAUSTED — Make your pick now based "
                 "on the results you already have."
             )
-        result = simulate_without_card(
-            character, card_id, room_type, encounter_id, seed,
-            max_nodes=max_nodes, simulations=max_simulations,
+
+        def _sim_remove(et: str, ei: str, s: int, n: int) -> SimResult:
+            return simulate_without_card(character, card_id, et, ei, s, max_nodes=max_nodes, simulations=n)
+
+        formatted = _probe_encounter(
+            _sim_remove, room_type, encounter_id, seed, f"Without {card_id}",
+            max_nodes, max_simulations,
         )
-        label = f"Without {card_id} vs {encounter_id or room_type}"
-        formatted = _format_result(label, result)
         if sim_log is not None:
             sim_log.append(formatted)
         return formatted
@@ -541,9 +639,13 @@ def _make_card_removal_tools(
     def simulate_upcoming(room_type: str, encounter_id: str = "") -> str:
         """Simulate an upcoming encounter with the current deck.
 
+        When encounter_id is empty or a pool name, probes up to 5 pool enemies
+        (100 sims each). When encounter_id is specific, runs 300 sims.
+
         Args:
             room_type: Room type: 'monster', 'elite', 'boss', or 'event'.
             encounter_id: Optional specific encounter from possible_encounters.
+                If empty or a pool name, probes the full pool.
         """
         try:
             check_budget()
@@ -552,11 +654,13 @@ def _make_card_removal_tools(
                 "SIMULATION BUDGET EXHAUSTED — Make your pick now based "
                 "on the results you already have."
             )
-        result = simulate_encounter(
-            character, room_type, encounter_id, seed,
-            max_nodes=max_nodes, simulations=max_simulations,
+
+        def _sim_enc(et: str, ei: str, s: int, n: int) -> SimResult:
+            return simulate_encounter(character, et, ei, s, max_nodes=max_nodes, simulations=n)
+
+        formatted = _probe_encounter(
+            _sim_enc, room_type, encounter_id, seed, "Baseline", max_nodes, max_simulations,
         )
-        formatted = _format_result(f"Baseline vs {encounter_id or room_type}", result)
         if sim_log is not None:
             sim_log.append(formatted)
         return formatted
@@ -564,10 +668,14 @@ def _make_card_removal_tools(
     def try_remove_card(card_id: str, room_type: str, encounter_id: str = "") -> str:
         """Simulate an encounter with a card removed from the deck.
 
+        When encounter_id is empty or a pool name, probes up to 5 pool enemies
+        (100 sims each). When encounter_id is specific, runs 300 sims.
+
         Args:
             card_id: Card to remove (must be in deck_cards list).
             room_type: Room type: 'monster', 'elite', 'boss', or 'event'.
             encounter_id: Optional specific encounter from possible_encounters.
+                If empty or a pool name, probes the full pool.
         """
         try:
             check_budget()
@@ -576,11 +684,14 @@ def _make_card_removal_tools(
                 "SIMULATION BUDGET EXHAUSTED — Make your pick now based "
                 "on the results you already have."
             )
-        result = simulate_without_card(
-            character, card_id, room_type, encounter_id, seed,
-            max_nodes=max_nodes, simulations=max_simulations,
+
+        def _sim_remove(et: str, ei: str, s: int, n: int) -> SimResult:
+            return simulate_without_card(character, card_id, et, ei, s, max_nodes=max_nodes, simulations=n)
+
+        formatted = _probe_encounter(
+            _sim_remove, room_type, encounter_id, seed, f"Without {card_id}",
+            max_nodes, max_simulations,
         )
-        formatted = _format_result(f"Without {card_id} vs {encounter_id or room_type}", result)
         if sim_log is not None:
             sim_log.append(formatted)
         return formatted
