@@ -101,6 +101,9 @@ class _RunAgentAdapter:
     def pick_event_choice(self, event, character, **kwargs):
         return self._strategy.pick_event_choice(event, character, **kwargs)
 
+    def pick_card_to_remove(self, character, **kwargs):
+        return self._strategy.pick_card_to_remove(character, **kwargs)
+
     def shop(self, inventory, character):
         return self._strategy.shop(inventory, character)
 

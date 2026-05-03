@@ -181,6 +181,18 @@ class BaseStrategyAgent:
         return self.rng.randint(0, len(event.choices) - 1)
 
     # ------------------------------------------------------------------
+    # Card removal
+    # ------------------------------------------------------------------
+
+    def pick_card_to_remove(
+        self, character: Character, **kwargs: object,
+    ) -> str | None:
+        """Pick a random card to remove from the deck. None = skip."""
+        if not character.deck:
+            return None
+        return self.rng.choice(character.deck)
+
+    # ------------------------------------------------------------------
     # Shops
     # ------------------------------------------------------------------
 
