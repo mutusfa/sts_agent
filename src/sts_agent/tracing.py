@@ -16,6 +16,7 @@ Usage
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 import mlflow
@@ -38,10 +39,11 @@ def setup_tracing(
     experiment_name:
         MLflow experiment name (default ``"sts-agent"``).
     tracking_uri:
-        MLflow tracking URI.  Defaults to ``sqlite:///traces.db``
-        in the current working directory.
+        MLflow tracking URI.  Falls back to ``MLFLOW_TRACKING_URI``
+        env var, then ``sqlite:///traces.db`` in the current working
+        directory.
     """
-    uri = tracking_uri or DEFAULT_TRACKING_URI
+    uri = tracking_uri or os.environ.get("MLFLOW_TRACKING_URI") or DEFAULT_TRACKING_URI
     mlflow.set_tracking_uri(uri)
     mlflow.set_experiment(experiment_name)
 
