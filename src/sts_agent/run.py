@@ -95,8 +95,8 @@ class _RunAgentAdapter:
             character, card_choices, upcoming_encounters, seed, **kwargs
         )
 
-    def pick_rest_choice(self, character):
-        return self._strategy.pick_rest_choice(character)
+    def pick_rest_choice(self, character, **kwargs):
+        return self._strategy.pick_rest_choice(character, **kwargs)
 
     def pick_event_choice(self, event, character):
         return self._strategy.pick_event_choice(event, character)

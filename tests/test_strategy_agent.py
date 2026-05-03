@@ -464,6 +464,32 @@ class TestRunAct1:
 
 
 # ---------------------------------------------------------------------------
+# _RunAgentAdapter delegation tests
+# ---------------------------------------------------------------------------
+
+
+class TestRunAgentAdapterDelegation:
+    """Unit tests for _RunAgentAdapter kwargs forwarding."""
+
+    def test_pick_rest_choice_forwards_kwargs(self):
+        """`pick_rest_choice` forwards sts_map and current_position to the strategy."""
+        from sts_agent.run import _RunAgentAdapter
+
+        mock_planner = MagicMock()
+        mock_strategy = MagicMock()
+        adapter = _RunAgentAdapter(mock_planner, mock_strategy)
+
+        character = MagicMock(spec=Character)
+        fake_map = MagicMock()
+
+        adapter.pick_rest_choice(character, sts_map=fake_map, current_position=(2, 1))
+
+        mock_strategy.pick_rest_choice.assert_called_once_with(
+            character, sts_map=fake_map, current_position=(2, 1)
+        )
+
+
+# ---------------------------------------------------------------------------
 # CardPickSignature pool hints
 # ---------------------------------------------------------------------------
 

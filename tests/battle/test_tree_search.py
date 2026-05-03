@@ -382,6 +382,7 @@ def test_move_ordering_reduces_nodes_on_multi_enemy():
     )
 
 
+@pytest.mark.slow
 def test_move_ordering_preserves_decision():
     """Move ordering must not degrade outcome quality.
 
