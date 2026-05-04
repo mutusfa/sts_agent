@@ -517,7 +517,7 @@ class TestSignatureEncounterPools:
 class TestStandardContext:
     """Shared StandardContext base for all strategy dspy.Signatures."""
 
-    _SHARED = ("character_state", "map_view", "possible_encounters")
+    _SHARED = ("character_state", "map_view", "possible_encounters", "deck_cards")
 
     def test_base_has_shared_input_fields(self):
         for name in self._SHARED:

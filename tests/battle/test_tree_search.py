@@ -10,6 +10,7 @@ import pytest
 
 from sts_env.combat import Action, Combat
 from sts_env.combat.card import Card
+from sts_env.combat.player_state import PlayerState
 from sts_env.combat.cards import CardType, get_spec
 from sts_env.combat.state import ActionType
 
@@ -31,10 +32,9 @@ def _make_combat(seed: int = 0, enemy_hp: int = 12, player_hp: int = 80) -> Comb
     Incantation (no damage), so optimal score is 0.
     """
     combat = Combat(
-        deck=["Strike"] * 5 + ["Defend"] * 4 + ["Bash"],
-        enemies=["Cultist"],
-        seed=seed,
-        player_hp=player_hp,
+        PlayerState(deck=["Strike"] * 5 + ["Defend"] * 4 + ["Bash"], player_hp=player_hp, player_max_hp=player_hp),
+        ["Cultist"],
+        seed,
     )
     obs = combat.reset()
     combat._state.enemies[0].hp = enemy_hp
@@ -117,10 +117,9 @@ def test_tree_search_avoids_death():
 def test_death_penalty_ranks_death_above_worst_survival():
     """terminal_score for a dead player must set player_dead=True and report damage."""
     combat_dead = Combat(
-        deck=["AscendersBane"] * 10,
-        enemies=["Cultist"],
-        seed=0,
-        player_hp=1,
+        PlayerState(deck=["AscendersBane"] * 10, player_hp=1, player_max_hp=1),
+        ["Cultist"],
+        0,
     )
     combat_dead.reset()
     combat_dead.step(Action.end_turn())  # T0: Incantation (no dmg)
@@ -195,8 +194,9 @@ def test_tree_search_beats_random_on_small_combat():
 def test_tree_search_budget_exceeded():
     """SearchBudgetExceeded is raised when max_nodes=1 on a non-trivial combat."""
     from sts_env.combat.encounters import cultist
+    from sts_env.combat.player_state import PlayerState
 
-    combat = cultist(seed=0)
+    combat = cultist(0, PlayerState.ironclad_starter())
     combat.reset()
 
     planner = TreeSearchPlanner(max_nodes=1)
@@ -239,10 +239,9 @@ def test_transposition_table_reduces_nodes():
     """
     # High-HP enemy: not killable in one turn, so the search explores T1+
     combat = Combat(
-        deck=["Strike"] * 5 + ["Defend"] * 4 + ["Bash"],
-        enemies=["Cultist"],
-        seed=0,
-        player_hp=80,
+        PlayerState(deck=["Strike"] * 5 + ["Defend"] * 4 + ["Bash"], relics=[]),
+        ["Cultist"],
+        0,
     )
     combat.reset()
     combat._state.enemies[0].hp = 50
@@ -272,10 +271,9 @@ def test_node_budget_50hp_cultist():
     that would cause the search to re-expand previously seen states.
     """
     combat = Combat(
-        deck=["Strike"] * 5 + ["Defend"] * 4 + ["Bash"],
-        enemies=["Cultist"],
-        seed=0,
-        player_hp=80,
+        PlayerState(deck=["Strike"] * 5 + ["Defend"] * 4 + ["Bash"], relics=[]),
+        ["Cultist"],
+        0,
     )
     combat.reset()
     combat._state.enemies[0].hp = 50
@@ -324,10 +322,9 @@ def test_move_ordering_targets_lowest_hp_first():
     Uses two Cultists (both MadGremlins via enemies list) with different HP.
     """
     combat = Combat(
-        deck=["Strike"] * 5 + ["Defend"] * 4 + ["Bash"],
-        enemies=["MadGremlin", "MadGremlin"],
-        seed=0,
-        player_hp=80,
+        PlayerState(deck=["Strike"] * 5 + ["Defend"] * 4 + ["Bash"]),
+        ["MadGremlin", "MadGremlin"],
+        0,
     )
     combat.reset()
     combat._state.enemies[0].hp = 20
@@ -366,10 +363,9 @@ def test_move_ordering_reduces_nodes_on_multi_enemy():
             use_move_ordering=use_ordering,
         )
         combat = Combat(
-            deck=["Strike"] * 5 + ["Defend"] * 4 + ["Bash"],
-            enemies=["MadGremlin", "MadGremlin"],
-            seed=0,
-            player_hp=80,
+            PlayerState(deck=["Strike"] * 5 + ["Defend"] * 4 + ["Bash"]),
+            ["MadGremlin", "MadGremlin"],
+            0,
         )
         combat.reset()
         combat._state.enemies[0].hp = combat._state.enemies[0].max_hp = 14
@@ -480,12 +476,14 @@ class TestMeatOnTheBoneTreeSearch:
         from sts_env.combat import Action as _Action
 
         combat = Combat(
-            deck=["Defend"] * 4 + ["Strike"] * 5 + ["Bash"],
-            enemies=["Cultist"],
-            seed=0,
-            player_hp=self._PLAYER_HP,
-            player_max_hp=self._MAX_HP,
-            relics=relics,
+            PlayerState(
+                deck=["Defend"] * 4 + ["Strike"] * 5 + ["Bash"],
+                player_hp=self._PLAYER_HP,
+                player_max_hp=self._MAX_HP,
+                relics=list(relics),
+            ),
+            ["Cultist"],
+            0,
         )
         combat.reset()
         combat._state.enemies[0].hp = self._CULTIST_HP

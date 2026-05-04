@@ -34,7 +34,8 @@ import inspect
 import logging
 import sys
 
-from sts_env.combat import Combat, encounters
+from sts_env.combat import encounters
+from sts_env.combat.player_state import PlayerState
 
 from .battle import MCTSPlanner, RandomAgent, TreeSearchPlanner, run_agent, run_planner
 from .battle.tree_search import SearchBudgetExceeded
@@ -163,16 +164,12 @@ def run(argv: list[str] | None = None) -> None:
 
 
 def _run_battle(args: argparse.Namespace) -> None:
-    combat = _ENCOUNTERS[args.encounter](args.seed, player_hp=args.player_hp)
-    if args.potions:
-        # Rebuild with potions using the same deck/enemies resolved by the factory.
-        combat = Combat(
-            deck=combat._deck,  # type: ignore[union-attr]
-            enemies=combat._enemy_names,  # type: ignore[union-attr]
-            seed=args.seed,
-            player_hp=args.player_hp,
-            potions=args.potions,
-        )
+    character = PlayerState(
+        player_hp=args.player_hp,
+        player_max_hp=args.player_hp,
+        potions=list(args.potions),
+    )
+    combat = _ENCOUNTERS[args.encounter](args.seed, character)
 
     mcts_planner: MCTSPlanner | None = None
     try:

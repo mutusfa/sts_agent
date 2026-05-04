@@ -10,7 +10,7 @@ import math
 import pytest
 
 from sts_env.combat import Combat
-from sts_env.combat.encounters import IRONCLAD_STARTER
+from sts_env.combat.player_state import PlayerState
 
 from sts_agent.battle import MCTSPlanner, run_planner
 from sts_agent.battle.base import TerminalOutcome, terminal_score
@@ -29,10 +29,9 @@ def _make_combat(seed: int = 0, enemy_hp: int = 12, player_hp: int = 80) -> Comb
     Cultist T0 intent is Incantation (no damage), so optimal score is 0.
     """
     combat = Combat(
-        deck=["Strike"] * 5 + ["Defend"] * 4 + ["Bash"],
-        enemies=["Cultist"],
-        seed=seed,
-        player_hp=player_hp,
+        PlayerState(deck=["Strike"] * 5 + ["Defend"] * 4 + ["Bash"], player_hp=player_hp, player_max_hp=player_hp),
+        ["Cultist"],
+        seed,
     )
     combat.reset()
     combat._state.enemies[0].hp = enemy_hp
@@ -245,14 +244,8 @@ def test_block_potion_reduces_acid_slime_l_damage():
     optimal planner should hold off playing the potion until the right moment
     and finish with at most 26 damage taken.
     """
-    baseline = Combat(IRONCLAD_STARTER, ["AcidSlimeL", "Empty"], seed=0, player_hp=80)
-    with_potion = Combat(
-        IRONCLAD_STARTER,
-        ["AcidSlimeL", "Empty"],
-        seed=0,
-        player_hp=80,
-        potions=["BlockPotion"],
-    )
+    baseline = Combat(PlayerState(), ["AcidSlimeL", "Empty"], 0)
+    with_potion = Combat(PlayerState(potions=["BlockPotion"]), ["AcidSlimeL", "Empty"], 0)
 
     base_dmg = run_planner(MCTSPlanner(simulations=2000, seed=0), baseline)
     pot_dmg = run_planner(MCTSPlanner(simulations=2000, seed=0), with_potion)
@@ -469,12 +462,14 @@ def _make_combat_at_hp(
 ) -> Combat:
     """Cultist combat with configurable relics and HP."""
     combat = Combat(
-        deck=["Strike"] * 5 + ["Defend"] * 4 + ["Bash"],
-        enemies=["Cultist"],
-        seed=seed,
-        player_hp=player_hp,
-        player_max_hp=player_max_hp,
-        relics=relics or frozenset(),
+        PlayerState(
+            deck=["Strike"] * 5 + ["Defend"] * 4 + ["Bash"],
+            player_hp=player_hp,
+            player_max_hp=player_max_hp,
+            relics=list(relics) if relics else [],
+        ),
+        ["Cultist"],
+        seed,
     )
     combat.reset()
     combat._state.enemies[0].hp = enemy_hp
@@ -546,12 +541,14 @@ class TestMeatOnTheBonePlanner:
 
     def _combat(self, relics: frozenset[str]) -> Combat:
         combat = Combat(
-            deck=self._DECK,
-            enemies=["JawWorm"],
-            seed=0,
-            player_hp=51,
-            player_max_hp=80,
-            relics=relics,
+            PlayerState(
+                deck=list(self._DECK),
+                player_hp=51,
+                player_max_hp=80,
+                relics=list(relics),
+            ),
+            ["JawWorm"],
+            0,
         )
         combat.reset()
         # JawWorm attacks for 11 on T1 (Chomp), DEFEND on T2 (no further damage if
