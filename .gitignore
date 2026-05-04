@@ -140,3 +140,9 @@ cython_debug/
 # MLflow artifacts
 mlruns/
 *.db
+
+# MLflow local tracking server artifacts
+192.168.0.101/
+
+# Graphify output
+graphify-out/

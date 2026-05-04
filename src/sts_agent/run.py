@@ -69,7 +69,11 @@ def _run_battle(
 
 class _RunAgentAdapter:
     """Combines a battle planner/agent with a strategy agent into one object
-    satisfying RunAgentProtocol."""
+    satisfying RunAgentProtocol.
+
+    Automatically evaluates potion virtual costs before each combat (when using
+    MCTSPlanner) and injects them into the planner.
+    """
 
     def __init__(
         self,
@@ -78,8 +82,54 @@ class _RunAgentAdapter:
     ) -> None:
         self._planner = planner_or_agent
         self._strategy = strategy_agent
+        self._path: list[tuple[int, int]] = []
+        self._combat_count: int = 0
+        self._sts_map: object = None
+        self._run_seed: int = 0
+
+    def _upcoming_encounters(self) -> list[tuple[str, str]]:
+        """Derive upcoming (room_type, enc_id) from remaining path.
+
+        Approximate: uses combat count to estimate position in the path.
+        Non-combat rooms (rest, shop, event, treasure) are included since
+        the discount only needs rough distance estimates.
+        """
+        upcoming: list[tuple[str, str]] = []
+        if self._sts_map is not None:
+            # Start from a rough offset based on combat count
+            start = min(self._combat_count, len(self._path))
+            for i in range(start, len(self._path)):
+                floor_num, x_pos = self._path[i]
+                node = self._sts_map.get_node(floor_num, x_pos)
+                if node is not None:
+                    upcoming.append((node.room_type.name.lower(), ""))
+        return upcoming
 
     def run_battle(self, combat: Combat) -> int:
+        # Auto-evaluate potion costs for MCTSPlanner
+        if hasattr(self._planner, 'potion_costs') and hasattr(combat, '_state'):
+            potions = combat._state.potions  # type: ignore[union-attr]
+            if potions and not self._planner.potion_costs:
+                from .strategy.evaluate_potions import evaluate_potions
+                from sts_env.run.character import Character
+
+                # Build a minimal character for evaluate_potions.
+                char = Character(
+                    player_hp=combat._state.player_hp,  # type: ignore[union-attr]
+                    player_max_hp=combat._state.player_max_hp,  # type: ignore[union-attr]
+                    deck=[],  # deck not needed for cost computation
+                    potions=list(potions),
+                )
+                upcoming = self._upcoming_encounters()
+                self._planner.potion_costs = evaluate_potions(
+                    char, upcoming, self._run_seed,
+                    possible_encounters=(
+                        self._strategy.get_possible_encounters()
+                        if hasattr(self._strategy, 'get_possible_encounters')
+                        else None
+                    ),
+                )
+        self._combat_count += 1
         return _run_battle(self._planner, combat)
 
     # Delegate all strategy decisions to the strategy agent.
@@ -88,7 +138,12 @@ class _RunAgentAdapter:
         return self._strategy.pick_neow(options)
 
     def plan_route(self, sts_map, character, seed):
-        return self._strategy.plan_route(sts_map, character, seed)
+        path = self._strategy.plan_route(sts_map, character, seed)
+        self._path = path
+        self._path_idx = 0
+        self._sts_map = sts_map
+        self._run_seed = seed
+        return path
 
     def pick_card(self, character, card_choices, upcoming_encounters, seed, **kwargs):
         return self._strategy.pick_card(
@@ -114,6 +169,9 @@ class _RunAgentAdapter:
 
     def pick_boss_relic(self, character, choices):
         return self._strategy.pick_boss_relic(character, choices)
+
+    def pick_potion_to_discard(self, character, new_potion, **kwargs):
+        return self._strategy.pick_potion_to_discard(character, new_potion, **kwargs)
 
     def set_encounter_tracking(self, encounter_queue, hallway_seen, elites_seen):
         self._strategy.set_encounter_tracking(encounter_queue, hallway_seen, elites_seen)

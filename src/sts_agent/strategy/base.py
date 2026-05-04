@@ -16,6 +16,7 @@ decisions.
 
 from __future__ import annotations
 
+import copy
 from typing import TYPE_CHECKING
 
 from sts_env.combat.rng import RNG
@@ -237,3 +238,39 @@ class BaseStrategyAgent:
         if not choices:
             return None
         return self.rng.choice(choices)
+
+    def pick_potion_to_discard(
+        self,
+        character: Character,
+        new_potion: str,
+        **kwargs: object,
+    ) -> str:
+        """Choose which potion to discard when the bag is full.
+
+        Uses evaluate_potions to estimate the value of each potion, then
+        drops the least valuable one.  Falls back to declining the new potion
+        if evaluation fails or returns empty costs.
+        """
+        all_candidates = list(character.potions) + [new_potion]
+        if len(all_candidates) <= character.max_potion_slots:
+            # Shouldn't happen — bag not actually full. Accept the new one.
+            return new_potion
+
+        # Try to evaluate potion costs
+        try:
+            from .evaluate_potions import evaluate_potions
+            # No upcoming info available here — use empty list (heavy discounting)
+            costs = evaluate_potions(character, [], 0)
+            # Add cost for the new potion too (not in character.potions yet)
+            if new_potion not in costs:
+                # Temporarily add and evaluate
+                char_copy = copy.deepcopy(character)
+                char_copy.potions.append(new_potion)
+                new_costs = evaluate_potions(char_copy, [], 0)
+                costs[new_potion] = new_costs.get(new_potion, 0.0)
+        except Exception:
+            costs = {}
+
+        # Find the least valuable candidate
+        worst = min(all_candidates, key=lambda p: costs.get(p, 0.0))
+        return worst

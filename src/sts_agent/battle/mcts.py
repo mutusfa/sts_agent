@@ -145,9 +145,10 @@ class _EdgeStats:
         *,
         start_hp: float,
         total_initial_enemy_hp: float,
+        potion_cost: float = 0.0,
     ) -> None:
         if not outcome.player_dead:
-            s = float(outcome.damage_taken)
+            s = float(outcome.damage_taken) + potion_cost
             self.n_alive += 1
             self._sum_alive += s
             self._sum_sq_alive += s * s
@@ -161,9 +162,9 @@ class _EdgeStats:
             if s > self._max_dead:
                 self._max_dead = s
 
-        # Tier-encoded scalar: alive → damage_taken; dead → start_hp + 1 + remaining_hp
+        # Tier-encoded scalar: alive → damage_taken + potion_cost; dead → start_hp + 1 + remaining_hp
         if not outcome.player_dead:
-            ucb = float(outcome.damage_taken)
+            ucb = float(outcome.damage_taken) + potion_cost
         else:
             remaining = total_initial_enemy_hp - outcome.enemy_damage_dealt
             ucb = start_hp + 1.0 + remaining
@@ -335,6 +336,10 @@ class MCTSPlanner:
     seed:
         Seed for the internal PRNG used to reseed each simulation's combat RNG
         and to break UCB ties.  ``None`` = non-deterministic.
+    potion_costs:
+        Mapping from potion_id to virtual HP cost.  When a potion is used
+        during a rollout, its cost is added to the reward so MCTS treats
+        using a potion as "spending" HP.  Default: empty dict (potions free).
     """
 
     def __init__(
@@ -344,12 +349,14 @@ class MCTSPlanner:
         exploration_c: float | None = None,
         seed: int | None = None,
         pv_min_n: int | None = None,
+        potion_costs: dict[str, float] | None = None,
     ) -> None:
         self.simulations = simulations
         self.max_nodes = max_nodes
         self._exploration_c = exploration_c
         self._rng = random.Random(seed)
         self._pv_min_n_override = pv_min_n
+        self.potion_costs: dict[str, float] = potion_costs or {}
         self.last_stats: dict[str, float] = {}
         self._node_store: dict[tuple, _Node] = {}
 
@@ -395,6 +402,9 @@ class MCTSPlanner:
             current_combat._state.rng._rng.seed(  # type: ignore[union-attr]
                 self._rng.randint(0, 2**31 - 1)
             )
+
+            # Capture initial potions to compute virtual cost of potions used.
+            _initial_potions = list(current_combat._state.potions)  # type: ignore[union-attr]
 
             # --- Selection ---
             while not current_combat.observe().done and current_node.is_fully_expanded():
@@ -449,6 +459,20 @@ class MCTSPlanner:
             rollout_combat = current_combat.clone()
             outcome = _heuristic_rollout(rollout_combat)
 
+            # --- Compute potion virtual cost for this rollout ---
+            # Diff initial potions vs final state to find used ones.
+            _final_potions = rollout_combat._state.potions  # type: ignore[union-attr]
+            _used_counts: dict[str, int] = {}
+            for p in _initial_potions:
+                _used_counts[p] = _used_counts.get(p, 0) + 1
+            for p in _final_potions:
+                _used_counts[p] = _used_counts.get(p, 0) - 1
+            _potion_cost = sum(
+                self.potion_costs.get(p, 0.0) * cnt
+                for p, cnt in _used_counts.items()
+                if cnt > 0
+            )
+
             # --- Backup ---
             for node, concept_key in path:
                 if concept_key not in node.edges:
@@ -457,6 +481,7 @@ class MCTSPlanner:
                     outcome,
                     start_hp=start_hp,
                     total_initial_enemy_hp=total_initial_enemy_hp,
+                    potion_cost=_potion_cost,
                 )
 
             sims_run += 1
