@@ -61,7 +61,7 @@ from sts_env.combat import Action, Combat
 from sts_env.combat.state import ActionType
 from sts_env.combat.card import Card
 
-from .base import _fmt_action, terminal_score_scalar
+from .base import _fmt_action, max_relic_heal, min_effective_score, terminal_score_scalar
 
 log = logging.getLogger(__name__)
 
@@ -260,6 +260,11 @@ class TreeSearchPlanner:
         total_initial_enemy_hp: float = sum(
             e.max_hp for e in combat._state.enemies  # type: ignore[union-attr]
         )
+        state = combat._state  # type: ignore[union-attr]
+        mrl = max_relic_heal(state.relics, int(start_hp))
+        # player_hp_initial: HP at combat.reset() = current HP + damage already taken.
+        player_hp_initial = obs.player_hp + combat.damage_taken
+        min_eff = min_effective_score(state.relics, player_hp_initial, int(start_hp))
 
         counter = _Counter(self.max_nodes)
         tt: dict[tuple, int | float] | None = (
@@ -277,12 +282,14 @@ class TreeSearchPlanner:
             score = _min_score(
                 clone, counter, best_score, tt, self.use_move_ordering,
                 start_hp=start_hp, total_initial_enemy_hp=total_initial_enemy_hp,
+                max_relic_heal_amount=mrl,
+                min_eff_global=min_eff,
             )
             if score < best_score:
                 best_score = score
                 best_action = action
-            if best_score == 0:
-                # Score can't go below 0 — no point exploring further.
+            if best_score <= min_eff:
+                # Optimal; effective score can't go below the global minimum.
                 break
 
         self._last_node_count = counter._count
@@ -324,6 +331,8 @@ def _min_score(
     *,
     start_hp: float = math.inf,
     total_initial_enemy_hp: float = 0.0,
+    max_relic_heal_amount: int = 0,
+    min_eff_global: int | float = 0,
 ) -> int | float:
     """Recursive DFS with alpha-pruning, optional transposition table, and
     optional move ordering.
@@ -335,9 +344,9 @@ def _min_score(
     counter:
         Shared node-expansion counter.
     cutoff:
-        Best score found so far at the parent level.  Since damage_taken is
-        monotonically non-decreasing, any node whose damage_taken >= cutoff
-        can only produce terminal scores >= cutoff and is pruned immediately.
+        Best score found so far at the parent level.  ``cutoff`` is in
+        *effective_damage_taken* units (raw damage minus post-combat relic heals).
+        A branch is pruned when its effective-score lower bound cannot beat cutoff.
     tt:
         Transposition table mapping state key → exact minimum score.  ``None``
         disables memoisation.  Only exact results (score < cutoff) are stored;
@@ -349,11 +358,22 @@ def _min_score(
         Player's max HP at the start of combat — used for tier encoding.
     total_initial_enemy_hp:
         Sum of all enemies' max_hp at the start of combat — used for tier encoding.
+    max_relic_heal_amount:
+        Upper bound on post-combat relic heals (from ``max_relic_heal()``).
+    min_eff_global:
+        Global lower bound on effective_damage_taken (from ``min_effective_score()``).
+        Equals 0 when no relics can heal.  The state-specific effective lower
+        bound is ``max(raw - max_relic_heal_amount, min_eff_global)``; once this
+        equals ``min_eff_global`` the entire remaining tree is at best ``min_eff_global``.
     """
     counter.tick()
 
-    # Alpha-prune: this branch is already at least as bad as the best we know.
-    if combat.damage_taken >= cutoff:
+    # Alpha-prune: this branch's effective lower bound cannot beat cutoff.
+    #   effective_lb = max(raw - mrl, min_eff_global)
+    # Prune when effective_lb >= cutoff, i.e. the best achievable here can't
+    # improve on what we've already found.
+    raw = combat.damage_taken
+    if max(raw - max_relic_heal_amount, min_eff_global) >= cutoff:
         return cutoff
 
     if combat.observe().done:
@@ -378,11 +398,13 @@ def _min_score(
         score = _min_score(
             clone, counter, best, tt, use_move_ordering,
             start_hp=start_hp, total_initial_enemy_hp=total_initial_enemy_hp,
+            max_relic_heal_amount=max_relic_heal_amount,
+            min_eff_global=min_eff_global,
         )
         if score < best:
             best = score
-        if best == 0:
-            break  # optimal; prune remaining siblings
+        if best <= min_eff_global:
+            break  # optimal; can't do better than the global minimum
 
     # Cache only exact results (not pruned lower-bounds).
     if tt is not None and key is not None and best < cutoff:

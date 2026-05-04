@@ -439,3 +439,90 @@ def test_transposition_table_preserves_decision():
             assert card_tt.card_id == card_no_tt.card_id, (
                 f"TT chose different card: {card_tt.card_id} vs {card_no_tt.card_id}"
             )
+
+
+# ---------------------------------------------------------------------------
+# MeatOnTheBone: pruning must not use raw damage_taken against effective cutoff
+# ---------------------------------------------------------------------------
+
+
+class TestMeatOnTheBoneTreeSearch:
+    """TreeSearchPlanner must not prune branches whose raw damage exceeds the
+    current cutoff when a post-combat relic heal can bring the effective score
+    below that cutoff.
+
+    Setup
+    -----
+    player_hp=44, max_hp=80.  MeatOnTheBone heals 12 when ending combat at
+    ≤ 50 % of max_hp (≤ 40 HP).  The combat is advanced past T0 (Cultist
+    Incantation, no damage) with a single END_TURN so that T1 starts with
+    Cultist intent = Dark Strike (6 dmg).
+
+    The T1 hand is then forced to [Defend]*5 and the draw pile to [Strike]*5
+    so that move ordering tries Defend before END_TURN — exactly the ordering
+    that triggers the pruning bug:
+
+      1. Defend path: 3 Defends absorb all 6 dmg → raw=0, hp=44>40, no heal.
+         effective=0. Sets cutoff=0.
+      2. END_TURN path: take 6 → hp=38≤40 → MeatOnTheBone heals 12.
+         effective=-6.
+         Old prune: raw 6 >= cutoff 0  → pruned (wrong).
+         Fixed prune: max(6-12, min_eff=-8) = -6 >= 0 → not pruned (correct).
+
+    T2 draws Strikes and kills the Cultist before its next attack.
+    """
+
+    _PLAYER_HP = 44
+    _MAX_HP = 80
+    _CULTIST_HP = 12  # 2 Strikes kill it in T2
+
+    def _combat(self, relics: frozenset[str]) -> Combat:
+        from sts_env.combat import Action as _Action
+
+        combat = Combat(
+            deck=["Defend"] * 4 + ["Strike"] * 5 + ["Bash"],
+            enemies=["Cultist"],
+            seed=0,
+            player_hp=self._PLAYER_HP,
+            player_max_hp=self._MAX_HP,
+            relics=relics,
+        )
+        combat.reset()
+        combat._state.enemies[0].hp = self._CULTIST_HP
+        combat._state.enemies[0].max_hp = self._CULTIST_HP
+        # Consume T0 (Incantation, no damage) so T1 intent = Dark Strike (6 dmg).
+        combat.step(_Action.end_turn())
+        # Force T1 hand to all-Defend so Defend (tier 52) is tried before
+        # END_TURN (tier 60), reproducing the move-ordering that triggers the bug.
+        # Strikes in the draw pile let T2 finish the Cultist before it attacks.
+        combat._state.piles.hand = [Card("Defend")] * 5
+        combat._state.piles.draw = [Card("Strike")] * 5
+        combat._state.piles.discard = []
+        return combat
+
+    def test_with_meat_on_bone_picks_end_turn(self):
+        """With MeatOnTheBone, END_TURN (effective=-6) must beat Defend (effective=0).
+
+        Without the fix, raw 6 >= cutoff 0 (set by the 3-Defend path) prunes
+        the END_TURN branch entirely, causing the planner to return a Defend.
+        With the fix the prune is bypassed and END_TURN is correctly chosen.
+        """
+        combat = self._combat(frozenset({"MeatOnTheBone"}))
+        action = TreeSearchPlanner().act(combat)
+        assert action.action_type == ActionType.END_TURN, (
+            "With MeatOnTheBone, END_TURN (effective=-6) must beat the best "
+            "Defend line (effective=0), but planner returned "
+            f"action_type={action.action_type}"
+        )
+
+    def test_without_meat_on_bone_prefers_defend(self):
+        """Without MeatOnTheBone, 3 Defends (raw=0) beats END_TURN (raw=6)."""
+        combat = self._combat(frozenset())
+        action = TreeSearchPlanner().act(combat)
+        assert action.action_type == ActionType.PLAY_CARD, (
+            "Without MeatOnTheBone, blocking reduces raw damage from 6 to 0; "
+            f"planner should play Defend, got action_type={action.action_type}"
+        )
+        assert combat._state.piles.hand[action.hand_index].card_id == "Defend", (
+            "Without MeatOnTheBone, planner should play Defend to reduce raw damage"
+        )

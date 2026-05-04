@@ -13,7 +13,7 @@ from sts_env.combat import Combat
 from sts_env.combat.encounters import IRONCLAD_STARTER
 
 from sts_agent.battle import MCTSPlanner, run_planner
-from sts_agent.battle.base import TerminalOutcome
+from sts_agent.battle.base import TerminalOutcome, terminal_score
 from sts_agent.battle.mcts import _EdgeStats, _edge_lex_key, _mcts_state_key
 
 
@@ -287,7 +287,7 @@ def test_pv_n_meets_min_n_when_depth_positive():
 
     stats = planner.last_stats
     if stats["pv_depth"] > 0:
-        min_n = max(10, int(500 ** 0.5))  # default formula: max(10, sqrt(simulations))
+        min_n = max(10, int(500**0.5))  # default formula: max(10, sqrt(simulations))
         assert stats["pv_n"] >= min_n, (
             f"pv_n={stats['pv_n']} < min_n={min_n} but pv_depth={stats['pv_depth']}"
         )
@@ -328,11 +328,14 @@ _START_HP = 80
 _TOTAL_ENEMY_HP = 50
 
 
-def _make_outcome(*, dead: bool, damage_taken: int, enemy_dmg_dealt: int) -> TerminalOutcome:
+def _make_outcome(
+    *, dead: bool, damage_taken: int, enemy_dmg_dealt: int
+) -> TerminalOutcome:
     return TerminalOutcome(
         damage_taken=damage_taken,
         player_dead=dead,
         enemy_damage_dealt=enemy_dmg_dealt,
+        effective_damage_taken=damage_taken,
     )
 
 
@@ -393,7 +396,222 @@ def test_last_stats_exposes_tier_breakdown():
     planner = MCTSPlanner(simulations=50, seed=0)
     planner.act(combat)
 
-    required = {"death_rate", "n_alive", "mean_damage_alive", "n_dead", "mean_enemy_dmg_dead"}
+    required = {
+        "death_rate",
+        "n_alive",
+        "mean_damage_alive",
+        "n_dead",
+        "mean_enemy_dmg_dead",
+    }
     assert required.issubset(planner.last_stats), (
         f"Missing tier-breakdown keys: {required - set(planner.last_stats)}"
     )
+
+
+# ---------------------------------------------------------------------------
+# 11. Post-combat relic heals: effective_damage_taken
+# ---------------------------------------------------------------------------
+
+
+def _make_combat_at_hp(
+    player_hp: int,
+    player_max_hp: int = 80,
+    relics: frozenset[str] | None = None,
+    enemy_hp: int = 12,
+    seed: int = 0,
+) -> Combat:
+    """Cultist combat with configurable relics and HP."""
+    combat = Combat(
+        deck=["Strike"] * 5 + ["Defend"] * 4 + ["Bash"],
+        enemies=["Cultist"],
+        seed=seed,
+        player_hp=player_hp,
+        player_max_hp=player_max_hp,
+        relics=relics or frozenset(),
+    )
+    combat.reset()
+    combat._state.enemies[0].hp = enemy_hp
+    combat._state.enemies[0].max_hp = enemy_hp
+    return combat
+
+
+def _drive_to_terminal(combat: Combat) -> None:
+    """Play greedily until combat is done."""
+    from sts_agent.battle.tree_search import _ordered_actions
+
+    while not combat.observe().done:
+        combat.step(_ordered_actions(combat)[0])
+
+
+class TestEffectiveDamageTaken:
+    """terminal_score must compute effective_damage_taken via post-combat relic heals."""
+
+    def test_no_relics_effective_equals_raw(self):
+        combat = _make_combat_at_hp(80, relics=frozenset())
+        _drive_to_terminal(combat)
+        outcome = terminal_score(combat)
+        assert outcome.effective_damage_taken == outcome.damage_taken
+
+    def test_burning_blood_absorbs_damage_below_6(self):
+        # Start at 6 hp missing; 12 hp cultist is killed without taking a single hit
+        combat = _make_combat_at_hp(74, relics=frozenset({"BurningBlood"}), enemy_hp=12)
+        _drive_to_terminal(combat)
+        outcome = terminal_score(combat)
+        # We don't take any damage during the combat and at the end we heal for 6
+        expected = -6
+        assert outcome.effective_damage_taken == expected
+
+    def test_player_dead_effective_equals_raw(self):
+        # When player dies, post-combat relics don't fire — effective == damage_taken
+        outcome = TerminalOutcome(
+            damage_taken=80,
+            player_dead=True,
+            enemy_damage_dealt=10,
+            effective_damage_taken=80,
+        )
+        assert outcome.effective_damage_taken == outcome.damage_taken
+
+
+# ---------------------------------------------------------------------------
+# 12. MCTSPlanner prefers MeatOnTheBone trigger line
+# ---------------------------------------------------------------------------
+
+
+class TestMeatOnTheBonePlanner:
+    """MCTSPlanner must avoid playing Defend when MeatOnTheBone makes the damage free.
+
+    Setup: player_hp=51, max_hp=80, JawWorm hp=19 (can't be killed T1, killed T2 before
+    its DEFEND intent fires).  JawWorm attacks for 11 on turn 1; T2 intent is DEFEND
+    (no attack) so the player takes at most one hit.
+
+    Two lines on T1:
+    - Play Defend first: gain 5 block, end turn → take 11-5=6 → hp=45 (>40) → no trigger
+      → effective=6.  Energy on Defend was "wasted" — the 6 HP will not be healed back.
+    - Play Strike (or END_TURN): take full 11 → hp=40 (≤40) → MeatOnTheBone fires →
+      effective=11-12= -1.
+
+    With MeatOnTheBone the planner should pick Strike (not Defend), because spending energy
+    on a Defend card yields higher effective damage than just absorbing the hit.
+    Without MeatOnTheBone the planner should pick Defend (raw 6 < raw 11).
+    """
+
+    _DECK = ["Defend"] * 4 + ["Strike"] * 5 + ["Bash"]
+
+    def _combat(self, relics: frozenset[str]) -> Combat:
+        combat = Combat(
+            deck=self._DECK,
+            enemies=["JawWorm"],
+            seed=0,
+            player_hp=51,
+            player_max_hp=80,
+            relics=relics,
+        )
+        combat.reset()
+        # JawWorm attacks for 11 on T1 (Chomp), DEFEND on T2 (no further damage if
+        # killed before DEFEND fires).  Setting hp=19 ensures the starter deck can
+        # always kill it on T2 (≥20 total attack damage available) but NOT on T1
+        # (3 Strikes = 18 < 19).
+        combat._state.enemies[0].hp = 19
+        combat._state.enemies[0].max_hp = 19
+        return combat
+
+    @pytest.mark.slow
+    def test_with_meat_on_bone_avoids_defend(self):
+        """With MeatOnTheBone, planner should NOT play Defend first — effective damage
+        of the Defend line (6) exceeds the no-Defend line (0 after heal)."""
+        combat = self._combat(frozenset({"MeatOnTheBone"}))
+        planner = MCTSPlanner(simulations=100, seed=42)
+        action = planner.act(combat)
+        chosen_card = (
+            combat._state.piles.hand[action.hand_index].card_id
+            if action.action_type.name == "PLAY_CARD"
+            else None
+        )
+        assert chosen_card != "Defend", (
+            "With MeatOnTheBone, playing Defend wastes energy and keeps hp above "
+            "the heal threshold — planner should prefer Strike or END_TURN. "
+            f"chosen={chosen_card}, last_stats={planner.last_stats}"
+        )
+
+    @pytest.mark.slow
+    def test_without_meat_on_bone_prefers_defend(self):
+        """Without MeatOnTheBone, planner should play Defend first to reduce raw
+        damage (6 < 11)."""
+        combat = self._combat(frozenset())
+        planner = MCTSPlanner(simulations=100, seed=42)
+        action = planner.act(combat)
+        chosen_card = (
+            combat._state.piles.hand[action.hand_index].card_id
+            if action.action_type.name == "PLAY_CARD"
+            else None
+        )
+        assert chosen_card == "Defend", (
+            f"Without MeatOnTheBone, Defend reduces raw damage from 11 to 6. "
+            f"chosen={chosen_card}, last_stats={planner.last_stats}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 13. Budget telemetry keys
+# ---------------------------------------------------------------------------
+
+
+class TestBudgetTelemetry:
+    """last_stats must expose per-act() budget counters for pruning analysis."""
+
+    TELEMETRY_KEYS = {
+        "sel_depth_mean",
+        "sel_depth_max",
+        "terminal_during_selection_frac",
+        "would_alpha_cut_at_rollout_frac",
+        "root_visit_top1_frac",
+        "root_visit_top2_frac",
+    }
+
+    def test_keys_present(self):
+        """All telemetry keys must appear in last_stats after act()."""
+        combat = _make_combat()
+        planner = MCTSPlanner(simulations=20, seed=0)
+        planner.act(combat)
+        assert self.TELEMETRY_KEYS.issubset(planner.last_stats), (
+            f"Missing telemetry keys: {self.TELEMETRY_KEYS - set(planner.last_stats)}"
+        )
+
+    def test_sel_depth_mean_in_range(self):
+        """sel_depth_mean must be in [0, sel_depth_max]; sel_depth_max >= 0."""
+        combat = _make_combat()
+        planner = MCTSPlanner(simulations=100, seed=0)
+        planner.act(combat)
+        stats = planner.last_stats
+        assert stats["sel_depth_mean"] >= 0
+        assert stats["sel_depth_max"] >= 0
+        assert stats["sel_depth_mean"] <= stats["sel_depth_max"] + 1e-9
+
+    def test_fracs_in_unit_interval(self):
+        """Fraction keys must be in [0, 1]."""
+        combat = _make_combat()
+        planner = MCTSPlanner(simulations=50, seed=0)
+        planner.act(combat)
+        stats = planner.last_stats
+        for key in (
+            "terminal_during_selection_frac",
+            "would_alpha_cut_at_rollout_frac",
+            "root_visit_top1_frac",
+            "root_visit_top2_frac",
+        ):
+            assert 0.0 <= stats[key] <= 1.0, f"{key}={stats[key]} out of [0, 1]"
+
+    def test_root_visit_top2_ge_top1(self):
+        """top2 fraction >= top1 fraction (top2 includes at least as many visits)."""
+        combat = _make_combat()
+        planner = MCTSPlanner(simulations=50, seed=0)
+        planner.act(combat)
+        stats = planner.last_stats
+        assert stats["root_visit_top2_frac"] >= stats["root_visit_top1_frac"] - 1e-9
+
+    def test_would_alpha_cut_frac_zero_with_one_sim(self):
+        """With simulations=1, no prior alive sample exists, so cut fraction must be 0."""
+        combat = _make_combat()
+        planner = MCTSPlanner(simulations=1, seed=0)
+        planner.act(combat)
+        assert planner.last_stats["would_alpha_cut_at_rollout_frac"] == 0.0

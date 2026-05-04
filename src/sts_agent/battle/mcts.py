@@ -22,21 +22,26 @@ argument, keeping the whole thing reproducible.
 
 Value model — lexicographic two-tier objective
 ----------------------------------------------
-Priority 1: minimise damage taken while surviving (death_rate = 0).
+Priority 1: minimise effective_damage_taken while surviving (death_rate = 0).
 Priority 2: if survival is unreachable, maximise enemy damage dealt.
+
+effective_damage_taken accounts for post-combat relic heals (BurningBlood, MeatOnTheBone,
+etc.): it is damage_taken minus whatever would be healed back at the end of combat.
+Negative values are valid — they represent a net-gain combat (more HP healed than lost).
+This lets the planner correctly price in "free" damage that will be fully recovered.
 
 Each edge tracks two separate pools:
 
-  alive pool  → running stats of damage_taken for rollouts where player survived.
+  alive pool  → running stats of effective_damage_taken for rollouts where player survived.
   dead pool   → running stats of enemy_damage_dealt for rollouts where player died.
   ucb_score   → tier-encoded scalar used only for UCB in-tree exploration:
-                  alive rollout → damage_taken
+                  alive rollout → effective_damage_taken
                   dead  rollout → start_hp + 1 + (total_enemy_hp − enemy_dmg_dealt)
                 Both ranges never overlap, preserving ordinal correctness for UCB.
 
 Final root selection and PV descent use a lexicographic key (lower = better):
 
-    (round(death_rate, 3), mean_damage_alive, -mean_enemy_dmg_dead)
+    (round(death_rate, 3), mean_effective_damage_alive, -mean_enemy_dmg_dead)
 
 Rounding to 3 decimal places buckets noise below 0.1 %, so a single unlucky
 rollout in 10 000 sims (death_rate=0.0001 → 0.0) does not flip the alive tier.
@@ -109,7 +114,7 @@ class _EdgeStats:
     """Per-(parent-node, action) running statistics.
 
     Two separate pools:
-      alive pool  — damage taken in rollouts where the player survived.
+      alive pool  — effective_damage_taken in rollouts where the player survived.
       dead pool   — enemy damage dealt in rollouts where the player died.
       ucb scalar  — tier-encoded scalar for UCB exploration.
     """
@@ -148,7 +153,7 @@ class _EdgeStats:
         potion_cost: float = 0.0,
     ) -> None:
         if not outcome.player_dead:
-            s = float(outcome.damage_taken) + potion_cost
+            s = float(outcome.effective_damage_taken) + potion_cost
             self.n_alive += 1
             self._sum_alive += s
             self._sum_sq_alive += s * s
@@ -164,7 +169,7 @@ class _EdgeStats:
 
         # Tier-encoded scalar: alive → damage_taken + potion_cost; dead → start_hp + 1 + remaining_hp
         if not outcome.player_dead:
-            ucb = float(outcome.damage_taken) + potion_cost
+            ucb = float(outcome.effective_damage_taken) + potion_cost
         else:
             remaining = total_initial_enemy_hp - outcome.enemy_damage_dealt
             ucb = start_hp + 1.0 + remaining
@@ -193,7 +198,7 @@ class _EdgeStats:
         """Worst-case tier-encoded scalar."""
         return self._max_ucb if self.n > 0 else math.inf
 
-    # Alive-pool properties
+    # Alive-pool properties (effective_damage_taken — relic heals subtracted)
 
     @property
     def mean_damage_alive(self) -> float:
@@ -223,9 +228,7 @@ def _edge_lex_key(stats: _EdgeStats) -> tuple:
     When no rollouts died, neg_mean_enemy_dmg == inf (tie-break irrelevant).
     """
     bucketed_death_rate = round(stats.death_rate, 3)
-    neg_mean_enemy_dmg = (
-        -stats.mean_enemy_dmg_dead if stats.n_dead > 0 else math.inf
-    )
+    neg_mean_enemy_dmg = -stats.mean_enemy_dmg_dead if stats.n_dead > 0 else math.inf
     return (bucketed_death_rate, stats.mean_damage_alive, neg_mean_enemy_dmg)
 
 
@@ -368,7 +371,8 @@ class MCTSPlanner:
         obs = combat.observe()
         start_hp: float = obs.player_max_hp
         total_initial_enemy_hp: float = sum(
-            e.max_hp for e in combat._state.enemies  # type: ignore[union-attr]
+            e.max_hp
+            for e in combat._state.enemies  # type: ignore[union-attr]
         )
 
         c = self._exploration_c if self._exploration_c is not None else start_hp
@@ -407,7 +411,9 @@ class MCTSPlanner:
             _initial_potions = list(current_combat._state.potions)  # type: ignore[union-attr]
 
             # --- Selection ---
-            while not current_combat.observe().done and current_node.is_fully_expanded():
+            while (
+                not current_combat.observe().done and current_node.is_fully_expanded()
+            ):
                 concept_key = self._select_concept_key(current_node, c)
                 action = _resolve_action(concept_key, current_combat)
                 if action is None:
@@ -416,6 +422,10 @@ class MCTSPlanner:
                     concept_key = ("END",)
                 path.append((current_node, concept_key))
                 current_combat.step(action)
+                # Some actions are not fully deterministic without tracking rng.
+                # Say, we could have tried to draw cards from a state that is identical
+                # in all but rng to the current state. Due to rng differences, we might
+                # have ended up in a different state.
                 child_key = _mcts_state_key(current_combat)
                 if child_key not in node_store:
                     child_node = _Node(
@@ -433,7 +443,10 @@ class MCTSPlanner:
                     current_node = node_store[child_key]
 
             # --- Expansion ---
-            if not current_combat.observe().done and not current_node.is_fully_expanded():
+            if (
+                not current_combat.observe().done
+                and not current_node.is_fully_expanded()
+            ):
                 concept_key = current_node.untried_action_keys.pop(0)
                 action = _resolve_action(concept_key, current_combat)
                 if action is None:
@@ -527,7 +540,9 @@ class MCTSPlanner:
             self.last_stats["std"],
             self.last_stats["max"],
             int(self.last_stats["n"]),
-            self.last_stats["death_rate"] * 100 if math.isfinite(self.last_stats["death_rate"]) else float("nan"),
+            self.last_stats["death_rate"] * 100
+            if math.isfinite(self.last_stats["death_rate"])
+            else float("nan"),
             sims_run,
             nodes_expanded,
         )
@@ -610,7 +625,9 @@ class MCTSPlanner:
         """
         if not root.edges:
             dummy = _EdgeStats()
-            fallback = root.untried_action_keys[0] if root.untried_action_keys else ("END",)
+            fallback = (
+                root.untried_action_keys[0] if root.untried_action_keys else ("END",)
+            )
             return fallback, dummy
 
         best_key = min(root.edges, key=lambda k: _edge_lex_key(root.edges[k]))

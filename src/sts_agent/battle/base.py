@@ -39,17 +39,27 @@ from typing import Protocol
 from sts_env.combat import Action, Combat, Observation
 from sts_env.combat.card import Card
 from sts_env.combat.state import ActionType
+from sts_env.run import relics as _relics
 
 log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
 class TerminalOutcome:
-    """Structured result of a terminal combat state."""
+    """Structured result of a terminal combat state.
+
+    damage_taken         Raw HP lost during combat (start_hp - end_hp).  Can be negative
+                         when in-combat heals (e.g. Feed) net-increase HP above start.
+    effective_damage_taken  damage_taken minus post-combat relic heals (BurningBlood,
+                         MeatOnTheBone, etc.).  Negative when combined in-combat and
+                         relic heals produce a net HP gain.
+                         Equals damage_taken when the player died (no post-combat heal fires).
+    """
 
     damage_taken: int
     player_dead: bool
     enemy_damage_dealt: int
+    effective_damage_taken: int
 
 
 class BattleAgent(Protocol):
@@ -66,20 +76,88 @@ class BattlePlanner(Protocol):
         ...
 
 
+class _RelicProbe:
+    """Minimal duck-type satisfying CombatEndTarget for post-combat relic simulation."""
+
+    def __init__(self, relics: frozenset[str], player_hp: int, player_max_hp: int) -> None:
+        self.relics = list(relics)
+        self.player_hp = player_hp
+        self.player_max_hp = player_max_hp
+
+    def heal(self, amount: int) -> None:
+        self.player_hp = min(self.player_max_hp, self.player_hp + amount)
+
+
+def max_relic_heal(relics: frozenset[str], player_max_hp: int) -> int:
+    """Maximum HP that post-combat relics can heal at the end of combat.
+
+    Simulates on_combat_end with player_hp=1 so every threshold-gated heal
+    (e.g. MeatOnTheBone: heal 12 when hp ≤ 50% max) fires.  The result is an
+    upper bound on the heal that any surviving path can receive, used by
+    TreeSearchPlanner to adjust its alpha-pruning threshold.
+    """
+    probe = _RelicProbe(relics=relics, player_hp=1, player_max_hp=player_max_hp)
+    _relics.on_combat_end(probe)
+    return probe.player_hp - 1
+
+
+def min_effective_score(
+    relics: frozenset[str], player_hp_start: int, player_max_hp: int
+) -> int:
+    """Minimum possible effective_damage_taken over all surviving combat outcomes.
+
+    For each possible ending HP in [0, player_hp_start], simulates post-combat
+    relic heals and computes effective = raw - heals.  The minimum over all
+    these values is a global lower bound on any surviving outcome's score.
+
+    This is used by TreeSearchPlanner as a tighter alpha-pruning threshold:
+    once a path achieves this score it is optimal and all remaining siblings
+    can be pruned.  For no-relic combats this returns 0 (no healing possible).
+    """
+    best = 0  # minimum raw damage is 0 (kill without taking a hit)
+    for hp_end in range(0, player_hp_start + 1):
+        raw = player_hp_start - hp_end
+        probe = _RelicProbe(
+            relics=relics, player_hp=hp_end, player_max_hp=player_max_hp
+        )
+        _relics.on_combat_end(probe)
+        heal = probe.player_hp - hp_end
+        effective = raw - heal
+        if effective < best:
+            best = effective
+    return best
+
+
 def terminal_score(combat: Combat) -> TerminalOutcome:
     """Score a terminal combat state.
 
-    Returns a TerminalOutcome with damage_taken, player_dead, and
-    enemy_damage_dealt (total HP removed from all enemies).
+    Returns a TerminalOutcome with damage_taken, player_dead, enemy_damage_dealt,
+    and effective_damage_taken (damage after simulating post-combat relic heals).
     """
     obs = combat.observe()
+    state = combat._state  # type: ignore[union-attr]
+    raw_damage = combat.damage_taken
     enemy_damage_dealt = sum(
-        max(0, e.max_hp - e.hp) for e in combat._state.enemies  # type: ignore[union-attr]
+        max(0, e.max_hp - e.hp) for e in state.enemies
     )
+
+    if obs.player_dead:
+        effective = raw_damage
+    else:
+        probe = _RelicProbe(
+            relics=state.relics,
+            player_hp=state.player_hp,
+            player_max_hp=state.player_max_hp,
+        )
+        _relics.on_combat_end(probe)
+        heals_applied = probe.player_hp - state.player_hp
+        effective = raw_damage - heals_applied
+
     return TerminalOutcome(
-        damage_taken=combat.damage_taken,
+        damage_taken=raw_damage,
         player_dead=obs.player_dead,
         enemy_damage_dealt=enemy_damage_dealt,
+        effective_damage_taken=effective,
     )
 
 
@@ -91,7 +169,7 @@ def terminal_score_scalar(
 ) -> float:
     """Tier-encoded scalar for callers that need a single comparable number.
 
-    Tier 1 (alive): damage_taken  — range [0, start_hp].
+    Tier 1 (alive): effective_damage_taken  — can be negative (net-gain combat).
     Tier 2 (dead):  start_hp + 1 + (total_initial_enemy_hp − enemy_damage_dealt)
                     — always > start_hp; lower means more enemy damage dealt.
 
@@ -100,7 +178,7 @@ def terminal_score_scalar(
     """
     outcome = terminal_score(combat)
     if not outcome.player_dead:
-        return float(outcome.damage_taken)
+        return float(outcome.effective_damage_taken)
     remaining_enemy_hp = total_initial_enemy_hp - outcome.enemy_damage_dealt
     return start_hp + 1.0 + remaining_enemy_hp
 
