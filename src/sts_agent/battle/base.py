@@ -60,6 +60,7 @@ class TerminalOutcome:
     player_dead: bool
     enemy_damage_dealt: int
     effective_damage_taken: int
+    max_hp_gained: int = 0
 
 
 class BattleAgent(Protocol):
@@ -158,6 +159,7 @@ def terminal_score(combat: Combat) -> TerminalOutcome:
         player_dead=obs.player_dead,
         enemy_damage_dealt=enemy_damage_dealt,
         effective_damage_taken=effective,
+        max_hp_gained=combat.max_hp_gained,
     )
 
 

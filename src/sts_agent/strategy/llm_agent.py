@@ -195,18 +195,28 @@ def ensure_lm() -> None:
 
 def _format_result(label: str, result: SimResult) -> str:
     """Render a :class:`SimResult` as a compact string for the LLM."""
-    status = "SURVIVED" if result.survived else "DIED"
-    if result.distribution is not None:
-        dmg_field = f"damage_taken={result.distribution.damage_spread}"
+    d = result.distribution
+    if d is not None:
+        exp_dmg = d.expected_damage
+        exp_hp = d.start_hp - exp_dmg
+        parts = [
+            label,
+            f"damage_taken={d.damage_spread}",
+            f"final_hp={exp_hp:.0f}±{d.std_score:.0f}/{d.start_hp}",
+            f"turns={result.turns}",
+        ]
+        if d.max_hp_gained_mean > 0:
+            parts.insert(2, f"max_hp_gained={d.max_hp_gained_spread}")
     else:
-        dmg_field = f"damage_taken={result.damage_taken}"
-    parts = [
-        f"{label}: {status}",
-        dmg_field,
-        f"max_hp_gained={result.max_hp_gained}",
-        f"final_hp={result.final_hp}/{result.final_max_hp}",
-        f"turns={result.turns}",
-    ]
+        status = "SURVIVED" if result.survived else "DIED"
+        parts = [
+            f"{label}: {status}",
+            f"damage_taken={result.damage_taken}",
+            f"final_hp={result.final_hp}/{result.final_max_hp}",
+            f"turns={result.turns}",
+        ]
+        if result.max_hp_gained > 0:
+            parts.insert(2, f"max_hp_gained={result.max_hp_gained}")
     if result.enemy_hp_remaining > 0:
         parts.append(f"enemy_hp_remaining={result.enemy_hp_remaining}")
     return " | ".join(parts)

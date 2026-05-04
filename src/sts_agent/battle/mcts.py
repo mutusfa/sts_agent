@@ -144,6 +144,10 @@ class _EdgeStats:
     _sum_sq_ucb: float = 0.0
     _max_ucb: float = -math.inf
 
+    # Max-HP gained (all rollouts; dead rollouts contribute 0)
+    _sum_max_hp: float = 0.0
+    _sum_sq_max_hp: float = 0.0
+
     @property
     def n(self) -> int:
         return self.n_alive + self.n_dead
@@ -186,6 +190,11 @@ class _EdgeStats:
         if ucb > self._max_ucb:
             self._max_ucb = ucb
 
+        # Max-HP gained (dead rollouts contribute 0)
+        hp_gained = float(outcome.max_hp_gained) if not outcome.player_dead else 0.0
+        self._sum_max_hp += hp_gained
+        self._sum_sq_max_hp += hp_gained * hp_gained
+
     # UCB scalar properties (used for in-tree exploration)
 
     @property
@@ -217,6 +226,17 @@ class _EdgeStats:
     @property
     def mean_enemy_dmg_dead(self) -> float:
         return self._sum_dead / self.n_dead if self.n_dead > 0 else math.nan
+
+    @property
+    def mean_max_hp_gained(self) -> float:
+        return self._sum_max_hp / self.n if self.n > 0 else 0.0
+
+    @property
+    def std_max_hp_gained(self) -> float:
+        if self.n < 2:
+            return 0.0
+        variance = self._sum_sq_max_hp / self.n - (self._sum_max_hp / self.n) ** 2
+        return math.sqrt(max(0.0, variance))
 
     @property
     def death_rate(self) -> float:
@@ -579,6 +599,8 @@ class MCTSPlanner:
             "pv_n": float(pv.n),
             "pv_deaths": float(pv.deaths),
             "pv_depth": float(pv_depth),
+            "pv_max_hp_gained_mean": pv.mean_max_hp_gained,
+            "pv_max_hp_gained_std": pv.std_max_hp_gained,
         }
 
         log.debug(

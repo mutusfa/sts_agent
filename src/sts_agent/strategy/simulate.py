@@ -202,6 +202,8 @@ class SimDistribution:
     n: int
     deaths: int
     start_hp: int
+    max_hp_gained_mean: float = 0.0
+    max_hp_gained_std: float = 0.0
 
     @property
     def survival_rate(self) -> float:
@@ -235,6 +237,11 @@ class SimDistribution:
         """Human-readable spread, e.g. '40±20 (12% death)'."""
         pct = f"{self.death_rate:.0%}" if self.n > 0 else "?"
         return f"{self.expected_damage:.0f}±{self.std_score:.0f} ({pct} death)"
+
+    @property
+    def max_hp_gained_spread(self) -> str:
+        """Human-readable max-HP-gained spread, e.g. '1.2±0.4'. Only shown when mean > 0."""
+        return f"{self.max_hp_gained_mean:.1f}±{self.max_hp_gained_std:.1f}"
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +286,8 @@ def _run_planner_capture_first_act(
                 n=int(s.get("pv_n", 0)),
                 deaths=int(s.get("pv_deaths", 0)),
                 start_hp=int(obs.player_max_hp),
+                max_hp_gained_mean=float(s.get("pv_max_hp_gained_mean", 0.0)),
+                max_hp_gained_std=float(s.get("pv_max_hp_gained_std", 0.0)),
             )
         obs, _reward, _info = combat.step(action)
     return combat.damage_taken, first_distribution
@@ -467,6 +476,8 @@ def probe_encounter(
         n=int(stats.get("n", 0)),
         deaths=int(stats.get("deaths", 0)),
         start_hp=obs.player_max_hp,
+        max_hp_gained_mean=float(stats.get("pv_max_hp_gained_mean", 0.0)),
+        max_hp_gained_std=float(stats.get("pv_max_hp_gained_std", 0.0)),
     )
 
 

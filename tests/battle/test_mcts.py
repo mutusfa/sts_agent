@@ -408,6 +408,53 @@ def test_last_stats_exposes_tier_breakdown():
     )
 
 
+def test_last_stats_exposes_max_hp_gained():
+    """After act(), last_stats must contain pv_max_hp_gained_mean and pv_max_hp_gained_std."""
+    combat = _make_combat()
+    planner = MCTSPlanner(simulations=50, seed=0)
+    planner.act(combat)
+
+    stats = planner.last_stats
+    assert "pv_max_hp_gained_mean" in stats, "pv_max_hp_gained_mean missing from last_stats"
+    assert "pv_max_hp_gained_std" in stats, "pv_max_hp_gained_std missing from last_stats"
+    # Starter deck has no Feed, so no rollout gains max HP.
+    assert stats["pv_max_hp_gained_mean"] == 0.0
+    assert stats["pv_max_hp_gained_std"] == 0.0
+
+
+def test_edge_stats_max_hp_gained_zero_for_dead_rollouts():
+    """_EdgeStats.mean_max_hp_gained should treat dead rollouts as 0 hp gained."""
+    import math as _math
+
+    stats = _EdgeStats()
+    outcome_dead = TerminalOutcome(
+        damage_taken=80,
+        player_dead=True,
+        enemy_damage_dealt=10,
+        effective_damage_taken=80,
+        max_hp_gained=5,  # would-be gain, but player is dead so shouldn't count
+    )
+    stats.update(outcome_dead, start_hp=80.0, total_initial_enemy_hp=50.0)
+    assert stats.mean_max_hp_gained == 0.0, "Dead rollout should contribute 0 to max_hp_gained"
+
+
+def test_edge_stats_max_hp_gained_accumulates_alive_rollouts():
+    """_EdgeStats.mean_max_hp_gained accumulates max_hp_gained from alive rollouts."""
+    stats = _EdgeStats()
+    for gained in [4, 4, 0]:
+        outcome = TerminalOutcome(
+            damage_taken=10,
+            player_dead=False,
+            enemy_damage_dealt=40,
+            effective_damage_taken=10,
+            max_hp_gained=gained,
+        )
+        stats.update(outcome, start_hp=80.0, total_initial_enemy_hp=50.0)
+
+    assert abs(stats.mean_max_hp_gained - 8 / 3) < 1e-9
+    assert stats.std_max_hp_gained > 0.0
+
+
 # ---------------------------------------------------------------------------
 # 11. Post-combat relic heals: effective_damage_taken
 # ---------------------------------------------------------------------------
