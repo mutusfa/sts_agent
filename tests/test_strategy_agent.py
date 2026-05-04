@@ -846,3 +846,70 @@ class TestPickEventChoiceUsesReAct:
             idx = agent.pick_event_choice(event, _ironclad())
 
         assert idx == 1
+
+
+# ---------------------------------------------------------------------------
+# pick_event_choice passes event_encounters kwarg to ReAct
+# ---------------------------------------------------------------------------
+
+
+class TestPickEventChoicePassesEventEncounters:
+    """pick_event_choice must forward possible_encounters as event_encounters to ReAct."""
+
+    @pytest.fixture(autouse=True)
+    def _mock_lm(self):
+        with patch("sts_agent.strategy.llm_agent.ensure_lm"):
+            yield
+
+    def _make_event(self, possible_encounters=()):
+        event = MagicMock()
+        event.choices = [MagicMock(label="Option 0"), MagicMock(label="Option 1")]
+        event.event_id = "test_event"
+        event.description = "A test event."
+        event.possible_encounters = possible_encounters
+        return event
+
+    def _capture_kwargs(self):
+        captured: dict = {}
+
+        def fake_react_factory(sig, tools, max_iters):
+            inst = MagicMock()
+
+            def call_side_effect(**kwargs):
+                captured.update(kwargs)
+                r = MagicMock()
+                r.choice_index = "0"
+                return r
+
+            inst.side_effect = call_side_effect
+            return inst
+
+        return captured, fake_react_factory
+
+    def test_combat_event_passes_encounter_ids(self):
+        """Dead Adventurer-style event: encounter IDs forwarded as flat list."""
+        agent = StrategyAgent()
+        event = self._make_event(
+            possible_encounters=("Three Sentries", "Gremlin Nob", "lagavulin_event")
+        )
+        captured, factory = self._capture_kwargs()
+
+        with patch("sts_agent.strategy.llm_agent.dspy.ReAct", side_effect=factory):
+            agent.pick_event_choice(event, _ironclad())
+
+        assert captured["event_encounters"] == [
+            "Three Sentries",
+            "Gremlin Nob",
+            "lagavulin_event",
+        ]
+
+    def test_non_combat_event_passes_empty_list(self):
+        """Events with no combat encounters forward an empty list."""
+        agent = StrategyAgent()
+        event = self._make_event(possible_encounters=())
+        captured, factory = self._capture_kwargs()
+
+        with patch("sts_agent.strategy.llm_agent.dspy.ReAct", side_effect=factory):
+            agent.pick_event_choice(event, _ironclad())
+
+        assert captured["event_encounters"] == []

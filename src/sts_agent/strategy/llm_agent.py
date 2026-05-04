@@ -631,6 +631,11 @@ class EventPickSignature(StandardContext):
     event_choices: list[str] = dspy.InputField(
         desc="Ordered list of choice labels. Pick by index (0-based)."
     )
+    event_encounters: list[str] = dspy.InputField(
+        desc=(
+            "Encounter IDs the agent may face if a combat-triggering choice is picked."
+        )
+    )
     missing_context: str = dspy.OutputField(
         desc=(
             "What additional information would a human StS expert have that "
@@ -963,12 +968,14 @@ class StrategyAgent(BaseStrategyAgent):
         )
 
         # LLM call -------------------------------------------------------
+        event_encounters = list(getattr(event, "possible_encounters", ()) or ())
         try:
             react = dspy.ReAct(EventPickSignature, tools=tools, max_iters=8)
             result = react(
                 character_state=character.summary(),
                 event_description=f"Event: {event.event_id}\n{event.description}",
                 event_choices=choice_labels,
+                event_encounters=event_encounters,
                 map_view=map_view,
                 possible_encounters=encounters_view,
             )
