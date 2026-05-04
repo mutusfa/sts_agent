@@ -750,3 +750,99 @@ class TestToolsPoolDetection:
 
         assert len(calls) == 1
         assert calls[0] == 300
+
+
+# ---------------------------------------------------------------------------
+# Unified tool factory tests (TDD — these fail before the refactor)
+# ---------------------------------------------------------------------------
+
+
+class TestUnifiedToolFactory:
+    """_make_tools is the sole tool factory; old separate factories are gone."""
+
+    def test_make_tools_returns_four_tools(self):
+        tools = _make_tools(_ironclad(), budget_checker=lambda: None)
+        assert len(tools) == 4
+
+    def test_make_tools_tool_names(self):
+        tools = _make_tools(_ironclad(), budget_checker=lambda: None)
+        names = [t.__name__ for t in tools]
+        assert names == [
+            "simulate_upcoming",
+            "try_card",
+            "try_upgrade",
+            "try_remove_card",
+        ]
+
+    def test_make_rest_tools_does_not_exist(self):
+        assert not hasattr(llm_agent, "_make_rest_tools")
+
+    def test_make_card_removal_tools_does_not_exist(self):
+        assert not hasattr(llm_agent, "_make_card_removal_tools")
+
+    def test_try_upgrade_tool_returns_string(self):
+        """try_upgrade (index 2) runs and returns a formatted result string."""
+        tools = _make_tools(_ironclad(), budget_checker=lambda: None)
+        mock_result = SimResult(True, 5, 0, 75, 80, 3)
+        with patch("sts_agent.strategy.llm_agent.simulate_with_upgrade",
+                   return_value=mock_result):
+            result = tools[2]("Strike", "monster", "cultist")
+        assert "Strike" in result
+        assert "SURVIVED" in result
+
+    def test_try_remove_card_is_last_tool(self):
+        """try_remove_card is at index 3."""
+        tools = _make_tools(_ironclad(), budget_checker=lambda: None)
+        assert tools[3].__name__ == "try_remove_card"
+
+
+# ---------------------------------------------------------------------------
+# pick_event_choice ReAct tests (TDD — fails before the refactor)
+# ---------------------------------------------------------------------------
+
+
+class TestPickEventChoiceUsesReAct:
+    """pick_event_choice must use dspy.ReAct (not dspy.Predict)."""
+
+    @pytest.fixture(autouse=True)
+    def _mock_lm(self):
+        with patch("sts_agent.strategy.llm_agent.ensure_lm"):
+            yield
+
+    def _make_event(self, n_choices: int = 2):
+        event = MagicMock()
+        event.choices = [MagicMock(label=f"Option {i}") for i in range(n_choices)]
+        event.event_id = "test_event"
+        event.description = "A test event."
+        event.event_encounters = []
+        return event
+
+    def test_pick_event_choice_uses_react_not_predict(self):
+        agent = StrategyAgent()
+        event = self._make_event()
+
+        react_result = MagicMock()
+        react_result.choice_index = "0"
+
+        react_instance = MagicMock(return_value=react_result)
+        react_class = MagicMock(return_value=react_instance)
+
+        with patch("sts_agent.strategy.llm_agent.dspy.ReAct", react_class):
+            with patch("sts_agent.strategy.llm_agent.dspy.Predict") as mock_predict:
+                agent.pick_event_choice(event, _ironclad())
+                react_class.assert_called()
+                mock_predict.assert_not_called()
+
+    def test_pick_event_choice_returns_valid_index(self):
+        agent = StrategyAgent()
+        event = self._make_event(n_choices=3)
+
+        react_result = MagicMock()
+        react_result.choice_index = "1"
+        react_instance = MagicMock(return_value=react_result)
+        react_class = MagicMock(return_value=react_instance)
+
+        with patch("sts_agent.strategy.llm_agent.dspy.ReAct", react_class):
+            idx = agent.pick_event_choice(event, _ironclad())
+
+        assert idx == 1

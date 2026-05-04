@@ -294,24 +294,28 @@ def _format_possible_encounters(data: dict | None) -> str:
 
 def _make_tools(
     character: Character,
-    seed: int,
-    budget_checker: callable,
+    budget_checker: Callable[[], None],
+    *,
     max_simulations: int = 100,
     max_nodes: int = 1000,
     sim_log: list[str] | None = None,
+    # Legacy parameter — accepted but ignored so existing call sites that still
+    # pass seed= as a keyword don't break before they are updated.
+    seed: int | None = None,
 ) -> list:
-    """Create tool callables bound to the current decision context.
+    """Create simulation tool callables bound to the current decision context.
+
+    Returns all four tools so the LLM can use whichever are relevant:
+    ``simulate_upcoming``, ``try_card``, ``try_upgrade``, ``try_remove_card``.
 
     Each tool checks the remaining time budget before running a simulation.
-    When budget is exhausted, the tool returns a message instead of raising,
-    so the LLM can make a final decision using results collected so far.
+    When budget is exhausted the tool returns a message instead of raising, so
+    the LLM gets one final iteration to make a decision from collected results.
 
     Parameters
     ----------
     character:
         Character state (deep-copied by simulate helpers).
-    seed:
-        Master seed for deterministic simulations.
     budget_checker:
         Callable that returns None if budget remains, or raises TimeoutError.
     max_simulations:
@@ -322,9 +326,17 @@ def _make_tools(
         Optional list that accumulates formatted simulation results, so
         the final-decision prompt can include all prior results.
     """
+    import random as _random
+
+    _seed = _random.randint(0, 2**31)
+
+    _BUDGET_MSG = (
+        "SIMULATION BUDGET EXHAUSTED — no more simulations available. "
+        "Make your pick now based on the results you already have."
+    )
 
     def simulate_upcoming(room_type: str, encounter_id: str = "") -> str:
-        """Simulate an upcoming encounter of the given room type with the current deck.
+        """Simulate an upcoming encounter with the current deck.
 
         When encounter_id is empty or a pool name ('monster', 'elite', 'boss'), probes
         up to 5 randomly sampled enemies from that pool (100 sims each) and reports
@@ -342,10 +354,7 @@ def _make_tools(
         try:
             budget_checker()
         except TimeoutError:
-            return (
-                "SIMULATION BUDGET EXHAUSTED — no more simulations available. "
-                "Make your pick now based on the results you already have."
-            )
+            return _BUDGET_MSG
 
         def _sim_enc(et: str, ei: str, s: int, n: int) -> SimResult:
             return simulate_encounter(
@@ -356,7 +365,7 @@ def _make_tools(
             _sim_enc,
             room_type,
             encounter_id,
-            seed * 1000,
+            _seed,
             "Baseline",
             max_nodes,
             max_simulations,
@@ -383,10 +392,7 @@ def _make_tools(
         try:
             budget_checker()
         except TimeoutError:
-            return (
-                "SIMULATION BUDGET EXHAUSTED — no more simulations available. "
-                "Make your pick now based on the results you already have."
-            )
+            return _BUDGET_MSG
 
         def _sim_card(et: str, ei: str, s: int, n: int) -> SimResult:
             return simulate_with_card(
@@ -397,8 +403,48 @@ def _make_tools(
             _sim_card,
             room_type,
             encounter_id,
-            seed * 1000,
+            _seed,
             f"With {card_id}",
+            max_nodes,
+            max_simulations,
+        )
+        if sim_log is not None:
+            sim_log.append(formatted)
+        return formatted
+
+    def try_upgrade(card_id: str, room_type: str, encounter_id: str = "") -> str:
+        """Simulate an encounter with a card upgraded in the deck.
+
+        Replaces the first unupgraded copy of card_id with its upgraded version
+        (card_id + '+') and runs a simulation.
+
+        When encounter_id is empty or a pool name, probes up to 5 pool enemies
+        (100 sims each). When encounter_id is specific, runs 300 sims.
+
+        Args:
+            card_id: Card to upgrade (must be upgradeable — no '+' suffix).
+            room_type: Room type read from the map view — one of 'monster', 'elite', 'boss'.
+            encounter_id: Optional specific encounter ID from possible_encounters.
+                If empty or a pool name, probes the full pool.
+        Returns:
+            Human-readable simulation result(s) for the upgraded deck.
+        """
+        try:
+            budget_checker()
+        except TimeoutError:
+            return _BUDGET_MSG
+
+        def _sim_upgrade(et: str, ei: str, s: int, n: int) -> SimResult:
+            return simulate_with_upgrade(
+                character, card_id, et, ei, s, max_nodes=max_nodes, simulations=n
+            )
+
+        formatted = _probe_encounter(
+            _sim_upgrade,
+            room_type,
+            encounter_id,
+            _seed,
+            f"With {card_id}+",
             max_nodes,
             max_simulations,
         )
@@ -424,10 +470,7 @@ def _make_tools(
         try:
             budget_checker()
         except TimeoutError:
-            return (
-                "SIMULATION BUDGET EXHAUSTED — no more simulations available. "
-                "Make your pick now based on the results you already have."
-            )
+            return _BUDGET_MSG
 
         def _sim_remove(et: str, ei: str, s: int, n: int) -> SimResult:
             return simulate_without_card(
@@ -438,7 +481,7 @@ def _make_tools(
             _sim_remove,
             room_type,
             encounter_id,
-            seed * 1000,
+            _seed,
             f"Without {card_id}",
             max_nodes,
             max_simulations,
@@ -447,7 +490,7 @@ def _make_tools(
             sim_log.append(formatted)
         return formatted
 
-    return [simulate_upcoming, try_card, try_remove_card]
+    return [simulate_upcoming, try_card, try_upgrade, try_remove_card]
 
 
 # ---------------------------------------------------------------------------
@@ -557,239 +600,6 @@ def _format_map_view(
         }\n"
         "```"
     )
-
-
-def _make_rest_tools(
-    character: Character,
-    check_budget: Callable[[], None],
-    *,
-    max_simulations: int = 100,
-    max_nodes: int = 1000,
-    sim_log: list[str] | None = None,
-) -> list:
-    """Create simulation tools for the rest-site decision.
-
-    Tools are the same ``simulate_upcoming`` and ``try_card`` as card-pick,
-    plus a ``try_upgrade`` tool that simulates with one card upgraded.
-    """
-    import random as _random
-
-    seed = _random.randint(0, 2**31)
-
-    def simulate_upcoming(room_type: str, encounter_id: str = "") -> str:
-        """Simulate an upcoming encounter with the current deck.
-
-        When encounter_id is empty or a pool name, probes up to 5 pool enemies
-        (100 sims each). When encounter_id is specific, runs 300 sims.
-
-        Args:
-            room_type: Room type: 'monster', 'elite', 'boss', or 'event'.
-            encounter_id: Optional specific encounter from possible_encounters.
-                If empty or a pool name, probes the full pool.
-        """
-        try:
-            check_budget()
-        except TimeoutError:
-            return (
-                "SIMULATION BUDGET EXHAUSTED — Make your pick now based "
-                "on the results you already have."
-            )
-
-        def _sim_enc(et: str, ei: str, s: int, n: int) -> SimResult:
-            return simulate_encounter(
-                character, et, ei, s, max_nodes=max_nodes, simulations=n
-            )
-
-        formatted = _probe_encounter(
-            _sim_enc,
-            room_type,
-            encounter_id,
-            seed,
-            "Baseline",
-            max_nodes,
-            max_simulations,
-        )
-        if sim_log is not None:
-            sim_log.append(formatted)
-        return formatted
-
-    def try_upgrade(card_id: str, room_type: str, encounter_id: str = "") -> str:
-        """Simulate an encounter with a card upgraded in the deck.
-
-        Replaces the first unupgraded copy of card_id with its upgraded
-        version (card_id + '+') and runs a simulation.
-
-        When encounter_id is empty or a pool name, probes up to 5 pool enemies
-        (100 sims each). When encounter_id is specific, runs 300 sims.
-
-        Args:
-            card_id: Card to upgrade (must be in upgradeable_cards list).
-            room_type: Room type: 'monster', 'elite', 'boss', or 'event'.
-            encounter_id: Optional specific encounter from possible_encounters.
-                If empty or a pool name, probes the full pool.
-        """
-        try:
-            check_budget()
-        except TimeoutError:
-            return (
-                "SIMULATION BUDGET EXHAUSTED — Make your pick now based "
-                "on the results you already have."
-            )
-
-        def _sim_upgrade(et: str, ei: str, s: int, n: int) -> SimResult:
-            return simulate_with_upgrade(
-                character, card_id, et, ei, s, max_nodes=max_nodes, simulations=n
-            )
-
-        formatted = _probe_encounter(
-            _sim_upgrade,
-            room_type,
-            encounter_id,
-            seed,
-            f"With {card_id}+",
-            max_nodes,
-            max_simulations,
-        )
-        if sim_log is not None:
-            sim_log.append(formatted)
-        return formatted
-
-    def try_remove_card(card_id: str, room_type: str, encounter_id: str = "") -> str:
-        """Simulate an encounter with a card removed from the deck.
-
-        Removes the first copy of card_id from the deck and runs a simulation.
-
-        When encounter_id is empty or a pool name, probes up to 5 pool enemies
-        (100 sims each). When encounter_id is specific, runs 300 sims.
-
-        Args:
-            card_id: Card to remove (must be in deck).
-            room_type: Room type: 'monster', 'elite', 'boss', or 'event'.
-            encounter_id: Optional specific encounter from possible_encounters.
-                If empty or a pool name, probes the full pool.
-        """
-        try:
-            check_budget()
-        except TimeoutError:
-            return (
-                "SIMULATION BUDGET EXHAUSTED — Make your pick now based "
-                "on the results you already have."
-            )
-
-        def _sim_remove(et: str, ei: str, s: int, n: int) -> SimResult:
-            return simulate_without_card(
-                character, card_id, et, ei, s, max_nodes=max_nodes, simulations=n
-            )
-
-        formatted = _probe_encounter(
-            _sim_remove,
-            room_type,
-            encounter_id,
-            seed,
-            f"Without {card_id}",
-            max_nodes,
-            max_simulations,
-        )
-        if sim_log is not None:
-            sim_log.append(formatted)
-        return formatted
-
-    return [simulate_upcoming, try_upgrade, try_remove_card]
-
-
-def _make_card_removal_tools(
-    character: Character,
-    check_budget: Callable[[], None],
-    *,
-    max_simulations: int = 100,
-    max_nodes: int = 1000,
-    sim_log: list[str] | None = None,
-) -> list:
-    """Create simulation tools for the card-removal decision.
-
-    Provides ``simulate_upcoming`` and ``try_remove_card`` so the agent can
-    compare deck performance with and without each candidate card.
-    """
-    import random as _random
-
-    seed = _random.randint(0, 2**31)
-
-    def simulate_upcoming(room_type: str, encounter_id: str = "") -> str:
-        """Simulate an upcoming encounter with the current deck.
-
-        When encounter_id is empty or a pool name, probes up to 5 pool enemies
-        (100 sims each). When encounter_id is specific, runs 300 sims.
-
-        Args:
-            room_type: Room type: 'monster', 'elite', 'boss', or 'event'.
-            encounter_id: Optional specific encounter from possible_encounters.
-                If empty or a pool name, probes the full pool.
-        """
-        try:
-            check_budget()
-        except TimeoutError:
-            return (
-                "SIMULATION BUDGET EXHAUSTED — Make your pick now based "
-                "on the results you already have."
-            )
-
-        def _sim_enc(et: str, ei: str, s: int, n: int) -> SimResult:
-            return simulate_encounter(
-                character, et, ei, s, max_nodes=max_nodes, simulations=n
-            )
-
-        formatted = _probe_encounter(
-            _sim_enc,
-            room_type,
-            encounter_id,
-            seed,
-            "Baseline",
-            max_nodes,
-            max_simulations,
-        )
-        if sim_log is not None:
-            sim_log.append(formatted)
-        return formatted
-
-    def try_remove_card(card_id: str, room_type: str, encounter_id: str = "") -> str:
-        """Simulate an encounter with a card removed from the deck.
-
-        When encounter_id is empty or a pool name, probes up to 5 pool enemies
-        (100 sims each). When encounter_id is specific, runs 300 sims.
-
-        Args:
-            card_id: Card to remove (must be in deck_cards list).
-            room_type: Room type: 'monster', 'elite', 'boss', or 'event'.
-            encounter_id: Optional specific encounter from possible_encounters.
-                If empty or a pool name, probes the full pool.
-        """
-        try:
-            check_budget()
-        except TimeoutError:
-            return (
-                "SIMULATION BUDGET EXHAUSTED — Make your pick now based "
-                "on the results you already have."
-            )
-
-        def _sim_remove(et: str, ei: str, s: int, n: int) -> SimResult:
-            return simulate_without_card(
-                character, card_id, et, ei, s, max_nodes=max_nodes, simulations=n
-            )
-
-        formatted = _probe_encounter(
-            _sim_remove,
-            room_type,
-            encounter_id,
-            seed,
-            f"Without {card_id}",
-            max_nodes,
-            max_simulations,
-        )
-        if sim_log is not None:
-            sim_log.append(formatted)
-        return formatted
-
-    return [simulate_upcoming, try_remove_card]
 
 
 # ---------------------------------------------------------------------------
@@ -1018,7 +828,6 @@ class StrategyAgent(BaseStrategyAgent):
         # ReAct iteration to make a decision from collected results.
         tools = _make_tools(
             character,
-            seed,
             self._check_budget,
             max_simulations=self.max_simulations,
             max_nodes=self.max_nodes,
@@ -1129,6 +938,9 @@ class StrategyAgent(BaseStrategyAgent):
         Falls back to the first choice on error.
         """
         ensure_lm()
+        self._start_time = time.time()
+        self._timed_out = False
+        self._sim_log = []
 
         if not event.choices:
             return 0
@@ -1142,10 +954,18 @@ class StrategyAgent(BaseStrategyAgent):
         # Format choices with their labels
         choice_labels = [f"[{i}] {ch.label}" for i, ch in enumerate(event.choices)]
 
+        tools = _make_tools(
+            character,
+            self._check_budget,
+            max_simulations=self.max_simulations,
+            max_nodes=self.max_nodes,
+            sim_log=self._sim_log,
+        )
+
         # LLM call -------------------------------------------------------
         try:
-            predictor = dspy.Predict(EventPickSignature)
-            result = predictor(
+            react = dspy.ReAct(EventPickSignature, tools=tools, max_iters=8)
+            result = react(
                 character_state=character.summary(),
                 event_description=f"Event: {event.event_id}\n{event.description}",
                 event_choices=choice_labels,
@@ -1231,7 +1051,7 @@ class StrategyAgent(BaseStrategyAgent):
         map_view = _format_map_view(sts_map, current_position)
         encounters_view = _format_possible_encounters(self.get_possible_encounters())
 
-        tools = _make_rest_tools(
+        tools = _make_tools(
             character,
             self._check_budget,
             max_simulations=self.max_simulations,
@@ -1299,7 +1119,7 @@ class StrategyAgent(BaseStrategyAgent):
         map_view = _format_map_view(sts_map, current_position)
         encounters_view = _format_possible_encounters(self.get_possible_encounters())
 
-        tools = _make_card_removal_tools(
+        tools = _make_tools(
             character,
             self._check_budget,
             max_simulations=self.max_simulations,
