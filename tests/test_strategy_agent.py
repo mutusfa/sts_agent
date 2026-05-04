@@ -913,3 +913,82 @@ class TestPickEventChoicePassesEventEncounters:
             agent.pick_event_choice(event, _ironclad())
 
         assert captured["event_encounters"] == []
+
+
+# ---------------------------------------------------------------------------
+# pick_event_choice extra_context and reset_budget
+# ---------------------------------------------------------------------------
+
+
+class TestPickEventChoiceExtraContext:
+    """extra_context must appear in event_description forwarded to ReAct."""
+
+    @pytest.fixture(autouse=True)
+    def _mock_lm(self):
+        with patch("sts_agent.strategy.llm_agent.ensure_lm"):
+            yield
+
+    def _make_event(self):
+        event = MagicMock()
+        event.choices = [MagicMock(label="Option 0"), MagicMock(label="Option 1")]
+        event.event_id = "Match and Keep - Pick First"
+        event.description = "Pick a slot."
+        event.possible_encounters = ()
+        return event
+
+    def _capture_kwargs(self):
+        captured: dict = {}
+
+        def fake_react_factory(sig, tools, max_iters):
+            inst = MagicMock()
+
+            def call_side_effect(**kwargs):
+                captured.update(kwargs)
+                r = MagicMock()
+                r.choice_index = "0"
+                return r
+
+            inst.side_effect = call_side_effect
+            return inst
+
+        return captured, fake_react_factory
+
+    def test_extra_context_appended_to_event_description(self):
+        """When extra_context is provided it must appear in event_description."""
+        agent = StrategyAgent()
+        event = self._make_event()
+        captured, factory = self._capture_kwargs()
+
+        with patch("sts_agent.strategy.llm_agent.dspy.ReAct", side_effect=factory):
+            agent.pick_event_choice(event, _ironclad(), extra_context="pool: Strike x3")
+
+        assert "pool: Strike x3" in captured["event_description"]
+
+    def test_empty_extra_context_not_appended(self):
+        """When extra_context is empty, event_description should not have trailing Context."""
+        agent = StrategyAgent()
+        event = self._make_event()
+        captured, factory = self._capture_kwargs()
+
+        with patch("sts_agent.strategy.llm_agent.dspy.ReAct", side_effect=factory):
+            agent.pick_event_choice(event, _ironclad(), extra_context="")
+
+        assert "Context:" not in captured["event_description"]
+
+    def test_reset_budget_false_does_not_reset_start_time(self):
+        """reset_budget=False must not overwrite _start_time."""
+        agent = StrategyAgent()
+        event = self._make_event()
+        sentinel = 12345.0
+        agent._start_time = sentinel
+        agent._timed_out = False
+
+        react_result = MagicMock()
+        react_result.choice_index = "0"
+        react_instance = MagicMock(return_value=react_result)
+        react_class = MagicMock(return_value=react_instance)
+
+        with patch("sts_agent.strategy.llm_agent.dspy.ReAct", react_class):
+            agent.pick_event_choice(event, _ironclad(), reset_budget=False)
+
+        assert agent._start_time == sentinel

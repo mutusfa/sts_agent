@@ -11,6 +11,7 @@ dependencies = [
     "dspy-ai>=3.2.0",
     "mlflow>=3.4",
     "python-dotenv>=1.2.2",
+    "rapidfuzz>=3.14.5",
     "sts-env",
 ]
 

@@ -935,16 +935,31 @@ class StrategyAgent(BaseStrategyAgent):
         self,
         event: "EventSpec",
         character: Character,
+        *,
+        extra_context: str = "",
+        reset_budget: bool = True,
         **kwargs: object,
     ) -> int:
         """Choose an event branch using the LLM.
 
         Returns the 0-based index into ``event.choices``.
         Falls back to the first choice on error.
+
+        Parameters
+        ----------
+        extra_context:
+            Optional open-knowledge string appended to the event description
+            (e.g. Match and Keep pool composition or current grid state).
+        reset_budget:
+            When ``False``, the existing ``_start_time`` / ``_timed_out``
+            state is preserved so that a sequence of calls (e.g. the 10
+            slot-picks inside a single Match and Keep event) share one
+            budget window.
         """
         ensure_lm()
-        self._start_time = time.time()
-        self._timed_out = False
+        if reset_budget:
+            self._start_time = time.time()
+            self._timed_out = False
         self._sim_log = []
 
         if not event.choices:
@@ -967,13 +982,18 @@ class StrategyAgent(BaseStrategyAgent):
             sim_log=self._sim_log,
         )
 
+        # Build event description, appending extra_context if provided
+        event_description = f"Event: {event.event_id}\n{event.description}"
+        if extra_context:
+            event_description += f"\n\nContext: {extra_context}"
+
         # LLM call -------------------------------------------------------
         event_encounters = list(getattr(event, "possible_encounters", ()) or ())
         try:
             react = dspy.ReAct(EventPickSignature, tools=tools, max_iters=8)
             result = react(
                 character_state=character.summary(),
-                event_description=f"Event: {event.event_id}\n{event.description}",
+                event_description=event_description,
                 event_choices=choice_labels,
                 event_encounters=event_encounters,
                 map_view=map_view,

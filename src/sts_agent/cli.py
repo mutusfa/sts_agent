@@ -80,7 +80,6 @@ def _build_parser() -> argparse.ArgumentParser:
     battle.add_argument(
         "--encounter",
         required=True,
-        choices=list(_ENCOUNTERS),
         metavar="{" + ",".join(_ENCOUNTERS) + "}",
         help="Encounter to run (see sts_env.combat.encounters).",
     )
@@ -143,6 +142,16 @@ def run(argv: list[str] | None = None) -> None:
 
     parser = _build_parser()
     args = parser.parse_args(argv)
+
+    if args.subcommand == "battle" and args.encounter not in _ENCOUNTERS:
+        from rapidfuzz import process
+
+        matches = process.extract(args.encounter, list(_ENCOUNTERS), limit=3)
+        suggestions = ", ".join(m[0] for m in matches if m[1] >= 50)
+        msg = f"invalid choice: {args.encounter!r}"
+        if suggestions:
+            msg += f"\nDid you mean one of: {suggestions}?"
+        parser.error(msg)
 
     # Configure logging level based on -v count (capped at 2).
     verbosity = min(args.verbose, 2)

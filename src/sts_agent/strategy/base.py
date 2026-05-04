@@ -174,36 +174,24 @@ class BaseStrategyAgent:
     # ------------------------------------------------------------------
 
     def pick_event_choice(
-        self, event: EventSpec, character: Character, **kwargs: object,
+        self,
+        event: EventSpec,
+        character: Character,
+        *,
+        extra_context: str = "",
+        reset_budget: bool = True,
+        **kwargs: object,
     ) -> int:
-        """Pick a random event branch index."""
+        """Pick a random event branch index.
+
+        ``extra_context`` carries open-knowledge context for the current
+        decision (e.g. Match and Keep pool composition or grid state).
+        ``reset_budget`` is accepted for protocol compatibility and ignored
+        by the base implementation.
+        """
         if not event.choices:
             return 0
         return self.rng.randint(0, len(event.choices) - 1)
-
-    def pick_match_and_keep_pair(
-        self,
-        grid: list,
-        attempts_remaining: int,
-        extra_context: str = "",
-        **kwargs: object,
-    ) -> tuple[int, int]:
-        """Pick two random non-matched grid slots for Match and Keep.
-
-        ``extra_context`` describes the reward pool composition (open
-        knowledge).  Override in subclasses for strategic play.
-        """
-        # Find available (non-matched) indices
-        available = [
-            i for i, slot in enumerate(grid)
-            if slot.state.name != "MATCHED"
-        ]
-        if len(available) < 2:
-            return (0, 1)
-        idx1 = self.rng.choice(available)
-        remaining = [i for i in available if i != idx1]
-        idx2 = self.rng.choice(remaining)
-        return (idx1, idx2)
 
     # ------------------------------------------------------------------
     # Card removal
