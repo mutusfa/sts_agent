@@ -66,14 +66,18 @@ log = logging.getLogger(__name__)
 # Card spec model
 # ---------------------------------------------------------------------------
 
+
 # Derive numeric effect field names directly from CardSpec: int fields whose
 # default is exactly 0 (excludes hits=1, booleans False==0, cost with no default).
 def _derive_effect_fields() -> tuple[str, ...]:
     from sts_env.combat.cards import CardSpec
+
     return tuple(
-        f.name for f in dataclasses.fields(CardSpec)
+        f.name
+        for f in dataclasses.fields(CardSpec)
         if f.default == 0 and not isinstance(f.default, bool)
     )
+
 
 _EFFECT_FIELDS = _derive_effect_fields()
 
@@ -83,9 +87,9 @@ class CardInfo(BaseModel):
 
     card_id: str
     cost: int
-    card_type: str           # "attack" | "skill" | "power" | "curse" | "status"
-    rarity: str              # "basic" | "common" | "uncommon" | "rare" | "special"
-    target: str              # "single_enemy" | "all_enemies" | "none"
+    card_type: str  # "attack" | "skill" | "power" | "curse" | "status"
+    rarity: str  # "basic" | "common" | "uncommon" | "rare" | "special"
+    target: str  # "single_enemy" | "all_enemies" | "none"
     effects: dict[str, int]  # non-zero base declarative fields; hits shown only when >1
     upgrade: dict[str, int]  # upgrade deltas (empty = not upgradeable)
     exhausts: bool
@@ -344,11 +348,18 @@ def _make_tools(
             )
 
         def _sim_enc(et: str, ei: str, s: int, n: int) -> SimResult:
-            return simulate_encounter(character, et, ei, s, max_nodes=max_nodes, simulations=n)
+            return simulate_encounter(
+                character, et, ei, s, max_nodes=max_nodes, simulations=n
+            )
 
         formatted = _probe_encounter(
-            _sim_enc, room_type, encounter_id, seed * 1000, "Baseline",
-            max_nodes, max_simulations,
+            _sim_enc,
+            room_type,
+            encounter_id,
+            seed * 1000,
+            "Baseline",
+            max_nodes,
+            max_simulations,
         )
         if sim_log is not None:
             sim_log.append(formatted)
@@ -378,11 +389,18 @@ def _make_tools(
             )
 
         def _sim_card(et: str, ei: str, s: int, n: int) -> SimResult:
-            return simulate_with_card(character, card_id, et, ei, s, max_nodes=max_nodes, simulations=n)
+            return simulate_with_card(
+                character, card_id, et, ei, s, max_nodes=max_nodes, simulations=n
+            )
 
         formatted = _probe_encounter(
-            _sim_card, room_type, encounter_id, seed * 1000, f"With {card_id}",
-            max_nodes, max_simulations,
+            _sim_card,
+            room_type,
+            encounter_id,
+            seed * 1000,
+            f"With {card_id}",
+            max_nodes,
+            max_simulations,
         )
         if sim_log is not None:
             sim_log.append(formatted)
@@ -412,11 +430,18 @@ def _make_tools(
             )
 
         def _sim_remove(et: str, ei: str, s: int, n: int) -> SimResult:
-            return simulate_without_card(character, card_id, et, ei, s, max_nodes=max_nodes, simulations=n)
+            return simulate_without_card(
+                character, card_id, et, ei, s, max_nodes=max_nodes, simulations=n
+            )
 
         formatted = _probe_encounter(
-            _sim_remove, room_type, encounter_id, seed * 1000, f"Without {card_id}",
-            max_nodes, max_simulations,
+            _sim_remove,
+            room_type,
+            encounter_id,
+            seed * 1000,
+            f"Without {card_id}",
+            max_nodes,
+            max_simulations,
         )
         if sim_log is not None:
             sim_log.append(formatted)
@@ -430,7 +455,47 @@ def _make_tools(
 # ---------------------------------------------------------------------------
 
 
-class CardPickSignature(dspy.Signature):
+class StandardContext(dspy.Signature):
+    """Baseline inputs shared by every strategy LLM signature.
+
+    Values come from ``character.summary()``, the ASCII map renderer, and
+    ``_format_possible_encounters``. Simulation tools (``simulate_upcoming``,
+    ``try_card``, ``try_upgrade``, ``try_remove_card`` depending on the decision)
+    are wired at runtime by the agent; they are not fields on this signature.
+
+    When a human expert would have extra information the model lacks, event
+    decisions expose a ``missing_context`` output on :class:`EventPickSignature`
+    so we can iterate on context design.
+    """
+
+    character_state: str = dspy.InputField(
+        desc=(
+            "Single-line run state from character.summary(): HP (current/max), "
+            "Gold, Floor, Deck as card IDs, Potions, Relics."
+        )
+    )
+    map_view: str = dspy.InputField(
+        desc=(
+            "ASCII map of the act. @ = current position; "
+            "M/E/B/R/?/$/ T = upcoming reachable rooms. "
+            "Pass 'monster', 'elite', or 'boss' (and 'event' where tools allow) "
+            "as room_type to simulation tools based on what you see ahead."
+        )
+    )
+    possible_encounters: str = dspy.InputField(
+        desc=(
+            "Encounters still possible from the queue. "
+            "Format: 'weak: [ids], strong: [ids], elite: [ids], boss: id'. "
+            "Use these IDs as the encounter_id argument in simulation tools "
+            "to target specific enemies."
+        )
+    )
+    deck_cards: list[str] = dspy.InputField(
+        desc="Full list of card IDs in your deck (may contain duplicates)."
+    )
+
+
+class CardPickSignature(StandardContext):
     """You are a Slay the Spire strategy expert deciding which card to pick from combat rewards.
 
     Analyze the card choices using simulation tools to evaluate how each card
@@ -453,32 +518,11 @@ class CardPickSignature(dspy.Signature):
     E→'elite', B→'boss' as the room_type argument to simulation tools.
     """
 
-    character_state: str = dspy.InputField(
-        desc="Current character: HP, deck size, potions, relics, floor"
-    )
     # TODO: Consider including full deck composition here for deck synergy reasoning.
     #   Current design relies on simulation tools to evaluate synergy empirically.
     #   Will validate with ablation studies (with/without deck info) before committing.
     card_choices: list[CardInfo] = dspy.InputField(
         desc="Cards offered as reward — each carries full spec, upgrade deltas, and custom handler code if any"
-    )
-    map_view: str = dspy.InputField(
-        desc=(
-            "ASCII map of the act. @ = current position; "
-            "M/E/B/R/?/$/ T = upcoming reachable rooms. "
-            "Pass 'monster', 'elite', or 'boss' to the simulation tools based on what you see ahead."
-        )
-    )
-    possible_encounters: str = dspy.InputField(
-        desc=(
-            "Encounters still possible based on what you've seen so far. "
-            "Format: 'weak: [ids], strong: [ids], elite: [ids], boss: id'. "
-            "Use these IDs as the encounter_id parameter in simulation tools "
-            "to target specific enemies."
-        )
-    )
-    reasoning: str = dspy.OutputField(
-        desc="Brief analysis of each card option based on simulation results"
     )
     pick: str = dspy.OutputField(
         desc="Exact card ID to pick from the choices, or 'skip' to skip all rewards"
@@ -504,11 +548,13 @@ def _format_map_view(
     current_x = current_position[1] if current_position else None
     return (
         "```text\n"
-        f"{sts_map.render_ascii(
-            current_floor=current_floor,
-            current_x=current_x,
-            reachable_only=True,
-        )}\n"
+        f"{
+            sts_map.render_ascii(
+                current_floor=current_floor,
+                current_x=current_x,
+                reachable_only=True,
+            )
+        }\n"
         "```"
     )
 
@@ -550,10 +596,18 @@ def _make_rest_tools(
             )
 
         def _sim_enc(et: str, ei: str, s: int, n: int) -> SimResult:
-            return simulate_encounter(character, et, ei, s, max_nodes=max_nodes, simulations=n)
+            return simulate_encounter(
+                character, et, ei, s, max_nodes=max_nodes, simulations=n
+            )
 
         formatted = _probe_encounter(
-            _sim_enc, room_type, encounter_id, seed, "Baseline", max_nodes, max_simulations,
+            _sim_enc,
+            room_type,
+            encounter_id,
+            seed,
+            "Baseline",
+            max_nodes,
+            max_simulations,
         )
         if sim_log is not None:
             sim_log.append(formatted)
@@ -583,11 +637,18 @@ def _make_rest_tools(
             )
 
         def _sim_upgrade(et: str, ei: str, s: int, n: int) -> SimResult:
-            return simulate_with_upgrade(character, card_id, et, ei, s, max_nodes=max_nodes, simulations=n)
+            return simulate_with_upgrade(
+                character, card_id, et, ei, s, max_nodes=max_nodes, simulations=n
+            )
 
         formatted = _probe_encounter(
-            _sim_upgrade, room_type, encounter_id, seed, f"With {card_id}+",
-            max_nodes, max_simulations,
+            _sim_upgrade,
+            room_type,
+            encounter_id,
+            seed,
+            f"With {card_id}+",
+            max_nodes,
+            max_simulations,
         )
         if sim_log is not None:
             sim_log.append(formatted)
@@ -616,11 +677,18 @@ def _make_rest_tools(
             )
 
         def _sim_remove(et: str, ei: str, s: int, n: int) -> SimResult:
-            return simulate_without_card(character, card_id, et, ei, s, max_nodes=max_nodes, simulations=n)
+            return simulate_without_card(
+                character, card_id, et, ei, s, max_nodes=max_nodes, simulations=n
+            )
 
         formatted = _probe_encounter(
-            _sim_remove, room_type, encounter_id, seed, f"Without {card_id}",
-            max_nodes, max_simulations,
+            _sim_remove,
+            room_type,
+            encounter_id,
+            seed,
+            f"Without {card_id}",
+            max_nodes,
+            max_simulations,
         )
         if sim_log is not None:
             sim_log.append(formatted)
@@ -666,10 +734,18 @@ def _make_card_removal_tools(
             )
 
         def _sim_enc(et: str, ei: str, s: int, n: int) -> SimResult:
-            return simulate_encounter(character, et, ei, s, max_nodes=max_nodes, simulations=n)
+            return simulate_encounter(
+                character, et, ei, s, max_nodes=max_nodes, simulations=n
+            )
 
         formatted = _probe_encounter(
-            _sim_enc, room_type, encounter_id, seed, "Baseline", max_nodes, max_simulations,
+            _sim_enc,
+            room_type,
+            encounter_id,
+            seed,
+            "Baseline",
+            max_nodes,
+            max_simulations,
         )
         if sim_log is not None:
             sim_log.append(formatted)
@@ -696,11 +772,18 @@ def _make_card_removal_tools(
             )
 
         def _sim_remove(et: str, ei: str, s: int, n: int) -> SimResult:
-            return simulate_without_card(character, card_id, et, ei, s, max_nodes=max_nodes, simulations=n)
+            return simulate_without_card(
+                character, card_id, et, ei, s, max_nodes=max_nodes, simulations=n
+            )
 
         formatted = _probe_encounter(
-            _sim_remove, room_type, encounter_id, seed, f"Without {card_id}",
-            max_nodes, max_simulations,
+            _sim_remove,
+            room_type,
+            encounter_id,
+            seed,
+            f"Without {card_id}",
+            max_nodes,
+            max_simulations,
         )
         if sim_log is not None:
             sim_log.append(formatted)
@@ -710,27 +793,11 @@ def _make_card_removal_tools(
 
 
 # ---------------------------------------------------------------------------
-# Standard context — formalised across all strategy decisions
-# ---------------------------------------------------------------------------
-# Every LLM strategy decision receives this baseline context:
-#   - character_state: HP, max HP, gold, floor, deck size, potions, relics
-#   - map_view: ASCII map with current position and upcoming rooms
-#   - possible_encounters: remaining encounters by pool (weak/strong/elite/boss)
-#   - simulation tools: simulate_upcoming, try_card, try_upgrade (where relevant)
-#
-# This is the "standard context".  If a human StS expert would have additional
-# information that the agent lacks (e.g. exact deck list, specific event outcome
-# probabilities, card pool composition), the LLM should flag it in the
-# `missing_context` output field so we can iterate on the context design.
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
 # Event decision signature
 # ---------------------------------------------------------------------------
 
 
-class EventPickSignature(dspy.Signature):
+class EventPickSignature(StandardContext):
     """You are a Slay the Spire strategy expert making an event choice.
 
     You are at an event and must choose one of the presented options.  Each
@@ -750,23 +817,9 @@ class EventPickSignature(dspy.Signature):
     Current position is marked with @ in the map view.
     """
 
-    character_state: str = dspy.InputField(
-        desc="Current HP, max HP, gold, floor, deck list (card IDs), potions, relics."
-    )
-    event_description: str = dspy.InputField(
-        desc="Narrative description of the event."
-    )
+    event_description: str = dspy.InputField(desc="Narrative description of the event.")
     event_choices: list[str] = dspy.InputField(
         desc="Ordered list of choice labels. Pick by index (0-based)."
-    )
-    map_view: str = dspy.InputField(
-        desc="ASCII map of remaining floors with room types and current position."
-    )
-    possible_encounters: str = dspy.InputField(
-        desc="Possible remaining encounters by pool (weak/strong/elite/boss)."
-    )
-    reasoning: str = dspy.OutputField(
-        desc="Brief analysis of each choice given current state."
     )
     missing_context: str = dspy.OutputField(
         desc=(
@@ -776,9 +829,7 @@ class EventPickSignature(dspy.Signature):
             "Say 'none' if you have everything you need."
         )
     )
-    choice_index: str = dspy.OutputField(
-        desc="The 0-based index of the chosen option."
-    )
+    choice_index: str = dspy.OutputField(desc="The 0-based index of the chosen option.")
 
 
 # ---------------------------------------------------------------------------
@@ -786,7 +837,7 @@ class EventPickSignature(dspy.Signature):
 # ---------------------------------------------------------------------------
 
 
-class CardRemoveSignature(dspy.Signature):
+class CardRemoveSignature(StandardContext):
     """You are a Slay the Spire strategy expert choosing a card to remove from your deck.
 
     Removing a card thins your deck, making it more likely to draw your best cards.
@@ -798,21 +849,6 @@ class CardRemoveSignature(dspy.Signature):
     gives the best survival outcome.
     """
 
-    character_state: str = dspy.InputField(
-        desc="Current HP, max HP, gold, floor, deck list, potions, relics."
-    )
-    deck_cards: list[str] = dspy.InputField(
-        desc="Full list of card IDs in your deck (may contain duplicates)."
-    )
-    map_view: str = dspy.InputField(
-        desc="ASCII map of remaining floors with room types."
-    )
-    possible_encounters: str = dspy.InputField(
-        desc="Possible remaining encounters by pool."
-    )
-    reasoning: str = dspy.OutputField(
-        desc="Brief analysis of which card to remove and why."
-    )
     card_id: str = dspy.OutputField(
         desc="The exact card_id string to remove from deck, or 'skip' to cancel."
     )
@@ -823,7 +859,7 @@ class CardRemoveSignature(dspy.Signature):
 # ---------------------------------------------------------------------------
 
 
-class RestPickSignature(dspy.Signature):
+class RestPickSignature(StandardContext):
     """You are a Slay the Spire strategy expert deciding what to do at a Rest Site.
 
     You can either REST (heal 30% of max HP) or UPGRADE one card in your deck.
@@ -844,22 +880,10 @@ class RestPickSignature(dspy.Signature):
     Output format: "REST" to heal, or "UPGRADE <card_id>" to upgrade a card.
     """
 
-
-    character_state: str = dspy.InputField(
-        desc="Current HP, max HP, deck composition, relics, potions, and gold."
-    )
     upgradeable_cards: list[str] = dspy.InputField(
         desc="List of card IDs in deck that can still be upgraded (no + suffix)."
     )
-    map_view: str = dspy.InputField(
-        desc="ASCII map of remaining floors with room types and current position."
-    )
-    possible_encounters: str = dspy.InputField(
-        desc="Possible remaining encounters by pool (weak/strong/elite/boss)."
-    )
-    pick: str = dspy.OutputField(
-        desc='"REST" or "UPGRADE <card_id>".'
-    )
+    pick: str = dspy.OutputField(desc='"REST" or "UPGRADE <card_id>".')
 
 
 # ---------------------------------------------------------------------------
@@ -924,8 +948,7 @@ class StrategyAgent(BaseStrategyAgent):
         if elapsed > self.timeout:
             self._timed_out = True
             raise TimeoutError(
-                f"Strategy budget of {self.timeout}s exceeded "
-                f"(elapsed: {elapsed:.1f}s)"
+                f"Strategy budget of {self.timeout}s exceeded (elapsed: {elapsed:.1f}s)"
             )
 
     # -- main entry point ----------------------------------------------------
@@ -976,25 +999,27 @@ class StrategyAgent(BaseStrategyAgent):
 
         card_infos = [_card_info(c) for c in card_choices]
         map_view = _format_map_view(sts_map, current_position)
-        encounters_view = _format_possible_encounters(
-            self.get_possible_encounters()
-        )
+        encounters_view = _format_possible_encounters(self.get_possible_encounters())
 
         span = mlflow.get_current_active_span()
         if span:
-            span.set_attributes({
-                "character_state": character.summary(),
-                "card_choices": ", ".join(c.card_id for c in card_infos),
-                "seed": seed,
-                "map_view": map_view[:500],  # truncate for span storage
-            })
+            span.set_attributes(
+                {
+                    "character_state": character.summary(),
+                    "card_choices": ", ".join(c.card_id for c in card_infos),
+                    "seed": seed,
+                    "map_view": map_view[:500],  # truncate for span storage
+                }
+            )
 
         # Create context-bound tools with configurable sim budget.
         # Tools catch TimeoutError and return a "budget exhausted" message
         # instead of propagating the exception, so the LLM gets one final
         # ReAct iteration to make a decision from collected results.
         tools = _make_tools(
-            character, seed, self._check_budget,
+            character,
+            seed,
+            self._check_budget,
             max_simulations=self.max_simulations,
             max_nodes=self.max_nodes,
             sim_log=self._sim_log,
@@ -1030,14 +1055,16 @@ class StrategyAgent(BaseStrategyAgent):
                 ):
                     log.info(
                         "LLM strategy: fuzzy-matched '%s' → %s",
-                        raw_pick, info.card_id,
+                        raw_pick,
+                        info.card_id,
                     )
                     self._set_pick_attrs(info.card_id, fallback=False)
                     return info.card_id
 
             log.warning(
                 "LLM returned '%s' not matching choices %s; forced pick",
-                raw_pick, card_choices,
+                raw_pick,
+                card_choices,
             )
             pick = self._forced_pick(card_infos)
             self._set_pick_attrs(pick, fallback=True)
@@ -1047,7 +1074,9 @@ class StrategyAgent(BaseStrategyAgent):
             elapsed = time.time() - self._start_time
             log.warning(
                 "Strategy agent error after %.1fs (%d sims collected): %s; forced pick",
-                elapsed, len(self._sim_log), exc,
+                elapsed,
+                len(self._sim_log),
+                exc,
             )
             pick = self._forced_pick(card_infos)
             self._set_pick_attrs(pick, fallback=True)
@@ -1059,13 +1088,15 @@ class StrategyAgent(BaseStrategyAgent):
         if span is None:
             return
         elapsed = time.time() - self._start_time
-        span.set_attributes({
-            "pick": pick or "skip",
-            "fallback": fallback,
-            "elapsed_seconds": round(elapsed, 2),
-            "timed_out": self._timed_out,
-            "sim_count": len(self._sim_log),
-        })
+        span.set_attributes(
+            {
+                "pick": pick or "skip",
+                "fallback": fallback,
+                "elapsed_seconds": round(elapsed, 2),
+                "timed_out": self._timed_out,
+                "sim_count": len(self._sim_log),
+            }
+        )
 
     # -- deterministic fallback ----------------------------------------------
 
@@ -1106,9 +1137,7 @@ class StrategyAgent(BaseStrategyAgent):
         sts_map = kwargs.get("sts_map")
         current_position = kwargs.get("current_position")
         map_view = _format_map_view(sts_map, current_position)
-        encounters_view = _format_possible_encounters(
-            self.get_possible_encounters()
-        )
+        encounters_view = _format_possible_encounters(self.get_possible_encounters())
 
         # Format choices with their labels
         choice_labels = [f"[{i}] {ch.label}" for i, ch in enumerate(event.choices)]
@@ -1134,6 +1163,7 @@ class StrategyAgent(BaseStrategyAgent):
             except ValueError:
                 # Try extracting first integer from the string
                 import re
+
                 m = re.search(r"\d+", raw_choice)
                 idx = int(m.group()) if m else 0
 
@@ -1142,27 +1172,33 @@ class StrategyAgent(BaseStrategyAgent):
 
             log.info(
                 "LLM event %s: choice=%d (%s) | reasoning=%s | missing=%s",
-                event.event_id, idx, event.choices[idx].label,
-                reasoning[:120], missing[:120],
+                event.event_id,
+                idx,
+                event.choices[idx].label,
+                reasoning[:120],
+                missing[:120],
             )
 
             # Log missing context as MLflow attributes for analysis
             span = mlflow.get_current_active_span()
             if span:
-                span.set_attributes({
-                    "event_id": event.event_id,
-                    "choice_idx": idx,
-                    "choice_label": event.choices[idx].label,
-                    "reasoning": reasoning[:500],
-                    "missing_context": missing[:500],
-                    "num_choices": len(event.choices),
-                })
+                span.set_attributes(
+                    {
+                        "event_id": event.event_id,
+                        "choice_idx": idx,
+                        "choice_label": event.choices[idx].label,
+                        "reasoning": reasoning[:500],
+                        "missing_context": missing[:500],
+                        "num_choices": len(event.choices),
+                    }
+                )
 
             return idx
 
         except Exception:
             log.exception(
-                "LLM event %s: error, falling back to choice 0", event.event_id,
+                "LLM event %s: error, falling back to choice 0",
+                event.event_id,
             )
             return 0
 
@@ -1185,21 +1221,19 @@ class StrategyAgent(BaseStrategyAgent):
 
         # Gather upgradeable cards (unupgraded, with an upgrade delta)
         from sts_env.combat.cards import get_spec
-        upgradeable = sorted({
-            c for c in character.deck
-            if not c.endswith("+")
-            and get_spec(c).upgrade
-        })
+
+        upgradeable = sorted(
+            {c for c in character.deck if not c.endswith("+") and get_spec(c).upgrade}
+        )
 
         sts_map = kwargs.get("sts_map")
         current_position = kwargs.get("current_position")
         map_view = _format_map_view(sts_map, current_position)
-        encounters_view = _format_possible_encounters(
-            self.get_possible_encounters()
-        )
+        encounters_view = _format_possible_encounters(self.get_possible_encounters())
 
         tools = _make_rest_tools(
-            character, self._check_budget,
+            character,
+            self._check_budget,
             max_simulations=self.max_simulations,
             max_nodes=self.max_nodes,
             sim_log=self._sim_log,
@@ -1227,7 +1261,9 @@ class StrategyAgent(BaseStrategyAgent):
                             card_upgraded=card_id,
                         )
                 # Invalid upgrade target — fall through to REST
-                log.warning("LLM strategy rest: invalid upgrade target %r, healing", raw_pick)
+                log.warning(
+                    "LLM strategy rest: invalid upgrade target %r, healing", raw_pick
+                )
 
             # REST (default or explicit)
             log.info("LLM strategy rest: healing")
@@ -1261,12 +1297,11 @@ class StrategyAgent(BaseStrategyAgent):
         sts_map = kwargs.get("sts_map")
         current_position = kwargs.get("current_position")
         map_view = _format_map_view(sts_map, current_position)
-        encounters_view = _format_possible_encounters(
-            self.get_possible_encounters()
-        )
+        encounters_view = _format_possible_encounters(self.get_possible_encounters())
 
         tools = _make_card_removal_tools(
-            character, self._check_budget,
+            character,
+            self._check_budget,
             max_simulations=self.max_simulations,
             max_nodes=self.max_nodes,
             sim_log=self._sim_log,

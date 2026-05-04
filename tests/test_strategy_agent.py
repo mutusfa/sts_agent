@@ -21,6 +21,10 @@ from sts_agent.battle.mcts import MCTSPlanner
 from sts_agent.strategy.llm_agent import (
     CardInfo,
     CardPickSignature,
+    CardRemoveSignature,
+    EventPickSignature,
+    RestPickSignature,
+    StandardContext,
     StrategyAgent,
     _card_info,
     _format_result,
@@ -508,6 +512,28 @@ class TestSignatureEncounterPools:
     def test_docstring_mentions_possible_encounters(self):
         doc = CardPickSignature.__doc__ or ""
         assert "possible_encounters" in doc, "Expected 'possible_encounters' in docstring"
+
+
+class TestStandardContext:
+    """Shared StandardContext base for all strategy dspy.Signatures."""
+
+    _SHARED = ("character_state", "map_view", "possible_encounters")
+
+    def test_base_has_shared_input_fields(self):
+        for name in self._SHARED:
+            assert name in StandardContext.model_fields
+        assert set(StandardContext.input_fields) == set(self._SHARED)
+        assert StandardContext.output_fields == {}
+
+    def test_concrete_signatures_subclass_standard_context(self):
+        for sig in (
+            CardPickSignature,
+            EventPickSignature,
+            CardRemoveSignature,
+            RestPickSignature,
+        ):
+            assert issubclass(sig, StandardContext)
+            assert "possible_encounters" in sig.model_fields
 
 
 # ---------------------------------------------------------------------------
