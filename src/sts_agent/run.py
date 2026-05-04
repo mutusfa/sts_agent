@@ -104,6 +104,11 @@ class _RunAgentAdapter:
     def pick_card_to_remove(self, character, **kwargs):
         return self._strategy.pick_card_to_remove(character, **kwargs)
 
+    def pick_match_and_keep_pair(self, grid, attempts_remaining, **kwargs):
+        return self._strategy.pick_match_and_keep_pair(
+            grid, attempts_remaining, **kwargs
+        )
+
     def shop(self, inventory, character):
         return self._strategy.shop(inventory, character)
 
