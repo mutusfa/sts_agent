@@ -75,6 +75,14 @@ After each ``act()`` call the attribute ``last_stats`` is populated with::
     mean_enemy_dmg_dead mean enemy damage dealt in dying rollouts (nan if none)
     simulations       actual simulations run this act()
     nodes             total node expansions this act()
+    sel_depth_mean    mean len(path) at end of selection+expansion across sims
+    sel_depth_max     max len(path) across sims
+    terminal_during_selection_frac  fraction of sims that reached a done state
+                      before the rollout phase (bounds MCTS-Solver payoff)
+    would_alpha_cut_at_rollout_frac fraction of sims where damage_taken - mrl
+                      >= best_alive_so_far at rollout start (per-sim alpha-abort savings)
+    root_visit_top1_frac  fraction of root visits going to the single most-visited edge
+    root_visit_top2_frac  fraction of root visits going to the top-2 most-visited edges
 """
 
 from __future__ import annotations
@@ -88,7 +96,7 @@ from sts_env.combat import Action, Combat
 from sts_env.combat.card import Card
 from sts_env.combat.state import ActionType
 
-from .base import TerminalOutcome, _fmt_action, terminal_score
+from .base import TerminalOutcome, _fmt_action, max_relic_heal, terminal_score
 from .tree_search import _ordered_actions, _state_key_base
 
 log = logging.getLogger(__name__)
@@ -390,8 +398,18 @@ class MCTSPlanner:
             self._node_store = {root_key: root_node}
         node_store = self._node_store
 
+        state = combat._state  # type: ignore[union-attr]
+        mrl = max_relic_heal(state.relics, int(start_hp))
+
         sims_run = 0
         nodes_expanded = 0
+
+        # Telemetry counters (no algorithmic effect)
+        sel_depth_sum = 0
+        sel_depth_max_val = 0
+        terminal_in_sel = 0
+        would_cut = 0
+        best_alive_so_far: float = math.inf
 
         for _ in range(self.simulations):
             if self.max_nodes is not None and nodes_expanded >= self.max_nodes:
@@ -468,6 +486,17 @@ class MCTSPlanner:
                 else:
                     current_node = node_store[child_key]
 
+            # --- Telemetry: depth, terminal-in-sel, would-alpha-cut ---
+            depth = len(path)
+            sel_depth_sum += depth
+            if depth > sel_depth_max_val:
+                sel_depth_max_val = depth
+            _done_before_rollout = current_combat.observe().done
+            if _done_before_rollout:
+                terminal_in_sel += 1
+            elif current_combat.damage_taken - mrl >= best_alive_so_far:
+                would_cut += 1
+
             # --- Rollout ---
             rollout_combat = current_combat.clone()
             outcome = _heuristic_rollout(rollout_combat)
@@ -497,7 +526,21 @@ class MCTSPlanner:
                     potion_cost=_potion_cost,
                 )
 
+            # --- Telemetry: update best alive so far ---
+            if not outcome.player_dead:
+                eff = float(outcome.effective_damage_taken)
+                if eff < best_alive_so_far:
+                    best_alive_so_far = eff
+
             sims_run += 1
+
+        # Root visit concentration
+        _root_visits = sorted(
+            (e.n for e in root_node.edges.values()), reverse=True
+        )
+        _total_root = sum(_root_visits) or 1
+        _top1_frac = _root_visits[0] / _total_root if _root_visits else 0.0
+        _top2_frac = sum(_root_visits[:2]) / _total_root if _root_visits else 0.0
 
         # Choose best action at root via lexicographic key
         best_concept_key, best_edge = self._best_root_concept(root_node)
@@ -522,6 +565,13 @@ class MCTSPlanner:
             # Budget
             "simulations": float(sims_run),
             "nodes": float(nodes_expanded),
+            # Budget telemetry
+            "sel_depth_mean": sel_depth_sum / sims_run if sims_run > 0 else 0.0,
+            "sel_depth_max": float(sel_depth_max_val),
+            "terminal_during_selection_frac": terminal_in_sel / sims_run if sims_run > 0 else 0.0,
+            "would_alpha_cut_at_rollout_frac": would_cut / sims_run if sims_run > 0 else 0.0,
+            "root_visit_top1_frac": _top1_frac,
+            "root_visit_top2_frac": _top2_frac,
             # PV
             "pv_mean": pv.mean if pv.n > 0 else math.nan,
             "pv_std": pv.std,
