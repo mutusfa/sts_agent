@@ -198,9 +198,20 @@ def _run_battle(args: argparse.Namespace) -> None:
         f"damage={damage} turns={obs.turn} result={result}"
     )
     if mcts_planner is not None:
+        import math as _math
         stats = mcts_planner.last_stats
+        pv_n = stats["pv_n"]
+        pv_death_rate = stats["pv_deaths"] / pv_n if pv_n > 0 else float("nan")
+        pv_mean = stats["pv_mean"]
+        pv_expected_dmg = (
+            min(pv_mean, float(obs.player_max_hp))
+            if pv_n > 0 and _math.isfinite(pv_mean)
+            else float("nan")
+        )
         summary += (
-            f" mean={stats['mean']:.1f} std={stats['std']:.1f} max={stats['max']:.1f}"
+            f" dmg={pv_expected_dmg:.0f}±{stats['pv_std']:.0f}"
+            f" ({pv_death_rate:.0%} die)"
+            f" pv_depth={int(stats['pv_depth'])}"
         )
 
     print(summary)

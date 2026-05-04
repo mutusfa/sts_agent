@@ -603,20 +603,19 @@ class MCTSPlanner:
             "pv_max_hp_gained_std": pv.std_max_hp_gained,
         }
 
+        pv_death_rate = (
+            pv.deaths / pv.n if pv.n > 0 else math.nan
+        )
+        pv_expected_dmg = min(pv.mean, float(start_hp)) if pv.n > 0 else math.nan
         log.debug(
-            "T=%d MCTS done: action=%s mean=%.1f std=%.1f max=%.1f "
-            "n=%d death_rate=%.1f%% sims=%d nodes=%d",
+            "T=%d → %-16s  dmg=%s±%.0f (%s die)  pv_depth=%d  sims=%d",
             obs.turn,
             _fmt_action(best_action, obs.hand),
-            self.last_stats["mean"],
-            self.last_stats["std"],
-            self.last_stats["max"],
-            int(self.last_stats["n"]),
-            self.last_stats["death_rate"] * 100
-            if math.isfinite(self.last_stats["death_rate"])
-            else float("nan"),
+            f"{pv_expected_dmg:.0f}" if math.isfinite(pv_expected_dmg) else "?",
+            pv.std if pv.n > 0 else 0.0,
+            f"{pv_death_rate:.0%}" if math.isfinite(pv_death_rate) else "?",
+            pv_depth,
             sims_run,
-            nodes_expanded,
         )
 
         return best_action
