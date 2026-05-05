@@ -91,7 +91,7 @@ def _state_key_base(combat: Combat) -> tuple:
     s = combat._state  # type: ignore[union-attr]
     enemies_key = tuple(
         (e.name, e.hp, e.max_hp, e.block, _powers_key(e.powers),
-         tuple(e.move_history), e.misc, e.pending_split, e.is_escaping)
+         tuple(e.move_history), e.misc, e.pending_split, e.pending_mode_shift, e.is_escaping)
         for e in s.enemies
     )
     return (
