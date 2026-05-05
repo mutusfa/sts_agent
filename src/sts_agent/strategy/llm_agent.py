@@ -843,6 +843,7 @@ class StrategyAgent(BaseStrategyAgent):
             react = dspy.ReAct(CardPickSignature, tools=tools, max_iters=8)
             result = react(
                 character_state=character.summary(),
+                deck_cards=list(character.deck),
                 card_choices=card_infos,
                 map_view=map_view,
                 possible_encounters=encounters_view,
@@ -993,6 +994,7 @@ class StrategyAgent(BaseStrategyAgent):
             react = dspy.ReAct(EventPickSignature, tools=tools, max_iters=8)
             result = react(
                 character_state=character.summary(),
+                deck_cards=list(character.deck),
                 event_description=event_description,
                 event_choices=choice_labels,
                 event_encounters=event_encounters,
@@ -1090,6 +1092,7 @@ class StrategyAgent(BaseStrategyAgent):
             react = dspy.ReAct(RestPickSignature, tools=tools, max_iters=8)
             result = react(
                 character_state=character.summary(),
+                deck_cards=list(character.deck),
                 upgradeable_cards=upgradeable,
                 map_view=map_view,
                 possible_encounters=encounters_view,
