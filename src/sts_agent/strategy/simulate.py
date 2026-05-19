@@ -2,17 +2,16 @@
 
 Public API
 ----------
-simulate_encounter    — run one encounter with MCTS and return structured results.
-simulate_with_card    — convenience wrapper that adds a hypothetical card first.
-probe_encounter       — fast single-act MCTS probe returning distribution stats.
+probe_encounter       — single-act MCTS probe returning a SimDistribution.
 probe_with_card       — same but with a hypothetical card added.
+probe_with_upgrade    — same but with a card upgraded.
+probe_after_rest      — same but with the character healed first.
+probe_without_card    — same but with a card removed.
 
-The ``probe_*`` functions are an optimisation over ``simulate_*``: they only
-call ``MCTSPlanner.act()`` once (which internally runs ``simulations``
-rollouts) and return the distribution of outcomes from the root edge rather
-than replaying the full combat to completion.  This is ~5-10× faster and
-provides *better* information (a distribution over N rollouts vs a single
-deterministic play-through).
+Each probe function calls ``MCTSPlanner.act()`` exactly once, which
+internally runs ``simulations`` full-combat rollouts and captures the
+distribution of terminal scores from the root edge.  This is the most
+informative and most efficient way to evaluate a deck against an encounter.
 """
 
 from __future__ import annotations
@@ -24,8 +23,8 @@ from dataclasses import dataclass
 
 from sts_env.run.builder import build_combat
 from sts_env.run.character import Character
+from sts_env.run.rooms import rest_heal
 
-from ..battle.base import run_planner
 from ..battle.mcts import MCTSPlanner
 
 log = logging.getLogger(__name__)
@@ -136,43 +135,6 @@ def _resolve_enc(enc_type: str, enc_id: str, seed: int) -> tuple[str, str]:
 
 
 @dataclass
-class SimResult:
-    """Structured outcome of a simulated encounter.
-
-    Attributes
-    ----------
-    survived:
-        True if the player is alive when combat ends.
-    damage_taken:
-        HP lost during combat.
-    max_hp_gained:
-        Maximum HP gained during combat (e.g. from Feed).
-    final_hp:
-        Player HP at the end of combat.
-    final_max_hp:
-        Player maximum HP at the end of combat.
-    turns:
-        Number of turns the combat lasted.
-    enemy_hp_remaining:
-        Total enemy HP remaining at end of combat.  0 when the player won;
-        positive when the player died, indicating how close the fight was.
-    distribution:
-        PV score distribution from the first MCTS act() call.  Populated
-        by ``simulate_encounter`` when using ``MCTSPlanner``; ``None``
-        for other planners or when stats are unavailable.
-    """
-
-    survived: bool
-    damage_taken: int
-    max_hp_gained: int
-    final_hp: int
-    final_max_hp: int
-    turns: int
-    enemy_hp_remaining: int = 0
-    distribution: SimDistribution | None = None
-
-
-@dataclass
 class SimDistribution:
     """Statistical summary of MCTS rollout outcomes from a single act() call.
 
@@ -245,178 +207,7 @@ class SimDistribution:
 
 
 # ---------------------------------------------------------------------------
-# Simulation as player skill
-# ---------------------------------------------------------------------------
-# These functions are a stand-in for player skill / game knowledge.
-#
-# An experienced StS player can look at a deck and estimate outcomes:
-#   - "Against Gremlin Nob this deck takes ~20 damage, probably dies to
-#     Lagavulin, Sentries are free"
-#   - "I want AoE for Sentries, Lagavulin lets me set up, for Gremlin Nob
-#     I need ways to mitigate damage that aren't skill-based"
-#
-# Our MCTS simulations give us the same thing in numbers — slightly more
-# exact than a human could estimate, but the same concept: evaluate deck
-# strength against specific upcoming encounters.  The `enemy_hp_remaining`
-# field on SimResult tells the LLM *how close* a loss was, turning a
-# binary "DIED" into a graded signal like "died but left the boss at 5 HP".
-# ---------------------------------------------------------------------------
-
-
-def _run_planner_capture_first_act(
-    planner: MCTSPlanner, combat
-) -> tuple[int, SimDistribution | None]:
-    """Drive *planner* through one full combat, capturing PV stats from the first act().
-
-    Returns ``(damage_taken, distribution)`` where *distribution* is built from
-    ``planner.last_stats`` after the very first ``act()`` call — the most
-    informative point, covering the full remaining combat from the initial state.
-    Subsequent acts' stats are intentionally ignored (state has diverged).
-    """
-    obs = combat.reset()
-    first_distribution: SimDistribution | None = None
-    while not obs.done:
-        action = planner.act(combat)
-        if first_distribution is None and planner.last_stats:
-            s = planner.last_stats
-            first_distribution = SimDistribution(
-                mean_score=s.get("pv_mean", float("nan")),
-                std_score=s.get("pv_std", 0.0),
-                max_score=s.get("pv_max", float("nan")),
-                n=int(s.get("pv_n", 0)),
-                deaths=int(s.get("pv_deaths", 0)),
-                start_hp=int(obs.player_max_hp),
-                max_hp_gained_mean=float(s.get("pv_max_hp_gained_mean", 0.0)),
-                max_hp_gained_std=float(s.get("pv_max_hp_gained_std", 0.0)),
-            )
-        obs, _reward, _info = combat.step(action)
-    return combat.damage_taken, first_distribution
-
-
-def simulate_encounter(
-    character: Character,
-    encounter_type: str,
-    encounter_id: str,
-    seed: int,
-    *,
-    max_nodes: int = 10_000,
-    simulations: int = 10_000,
-) -> SimResult:
-    """Simulate a combat encounter and return the outcome.
-
-    Parameters
-    ----------
-    character:
-        A :class:`Character` whose deck / HP / potions define the player
-        state.  A deep-copy is made so the original is never mutated.
-    encounter_type:
-        ``"easy"``, ``"hard"``, ``"elite"``, ``"boss"``, ``"event"``, or ``"monster"``
-        (unknown hallway difficulty — sampled from the combined easy+hard pool).
-        ``"event"`` uses event-specific encounter variants (e.g. awake Lagavulin).
-    encounter_id:
-        Encounter identifier string (e.g. ``"cultist"``, ``"Lagavulin"``).
-        Pass an empty string to sample a representative encounter from the pool.
-    seed:
-        Combat seed for deterministic results.
-    max_nodes:
-        MCTS node-expansion budget per action.
-    simulations:
-        MCTS simulation budget per action.
-
-    Returns
-    -------
-    SimResult with survival, damage, HP, and turn information.  The
-    ``distribution`` field is populated from the PV stats of the first act().
-    """
-    encounter_type, encounter_id = _resolve_enc(encounter_type, encounter_id, seed)
-    char_copy = copy.deepcopy(character)
-    combat = build_combat(
-        encounter_type, encounter_id, seed, character=char_copy
-    )
-    planner = MCTSPlanner(simulations=simulations, max_nodes=max_nodes)
-    damage_taken, distribution = _run_planner_capture_first_act(planner, combat)
-
-    obs = combat.observe()
-    return SimResult(
-        survived=not obs.player_dead,
-        damage_taken=damage_taken,
-        max_hp_gained=combat.max_hp_gained,
-        final_hp=obs.player_hp,
-        final_max_hp=obs.player_max_hp,
-        turns=obs.turn,
-        enemy_hp_remaining=sum(e.hp for e in obs.enemies),
-        distribution=distribution,
-    )
-
-
-def simulate_with_card(
-    character: Character,
-    card_id: str,
-    encounter_type: str,
-    encounter_id: str,
-    seed: int,
-    **kwargs: object,
-) -> SimResult:
-    """Simulate an encounter with a hypothetical card added to the deck.
-
-    The original *character* is not mutated.
-    """
-    char_copy = copy.deepcopy(character)
-    char_copy.add_card(card_id)
-    return simulate_encounter(
-        char_copy, encounter_type, encounter_id, seed, **kwargs
-    )
-
-
-def simulate_with_upgrade(
-    character: Character,
-    card_id: str,
-    encounter_type: str,
-    encounter_id: str,
-    seed: int,
-    **kwargs: object,
-) -> SimResult:
-    """Simulate an encounter with a card upgraded in the deck.
-
-    Finds the first un-upgraded copy of *card_id* and replaces it with the
-    upgraded version (``card_id + "+"``).  The original *character* is not
-    mutated.
-    """
-    char_copy = copy.deepcopy(character)
-    for i, card in enumerate(char_copy.deck):
-        if card == card_id:
-            char_copy.deck[i] = card_id + "+"
-            break
-    return simulate_encounter(
-        char_copy, encounter_type, encounter_id, seed, **kwargs
-    )
-
-
-def simulate_without_card(
-    character: Character,
-    card_id: str,
-    encounter_type: str,
-    encounter_id: str,
-    seed: int,
-    **kwargs: object,
-) -> SimResult:
-    """Simulate an encounter with a card removed from the deck.
-
-    Removes the first occurrence of *card_id* from the copy's deck.
-    The original *character* is not mutated.
-    """
-    char_copy = copy.deepcopy(character)
-    for i, card in enumerate(char_copy.deck):
-        if card == card_id:
-            del char_copy.deck[i]
-            break
-    return simulate_encounter(
-        char_copy, encounter_type, encounter_id, seed, **kwargs
-    )
-
-
-# ---------------------------------------------------------------------------
-# Fast probe API — single act() call, returns distribution
+# Probe API — single act() call, returns distribution
 # ---------------------------------------------------------------------------
 
 
@@ -461,7 +252,6 @@ def probe_encounter(
         encounter_type, encounter_id, seed, character=char_copy
     )
     planner = MCTSPlanner(simulations=simulations, max_nodes=max_nodes)
-    combat.reset()
 
     # Single act() — MCTS does `simulations` full-battle rollouts internally
     planner.act(combat)
@@ -495,6 +285,69 @@ def probe_with_card(
     """
     char_copy = copy.deepcopy(character)
     char_copy.add_card(card_id)
+    return probe_encounter(
+        char_copy, encounter_type, encounter_id, seed, **kwargs
+    )
+
+
+def probe_with_upgrade(
+    character: Character,
+    card_id: str,
+    encounter_type: str,
+    encounter_id: str,
+    seed: int,
+    **kwargs: object,
+) -> SimDistribution:
+    """Probe an encounter with a card upgraded in the deck.
+
+    Replaces the first un-upgraded copy of *card_id* with ``card_id + "+"``.
+    The original *character* is not mutated.
+    """
+    char_copy = copy.deepcopy(character)
+    for i, card in enumerate(char_copy.deck):
+        if card == card_id:
+            char_copy.deck[i] = card_id + "+"
+            break
+    return probe_encounter(
+        char_copy, encounter_type, encounter_id, seed, **kwargs
+    )
+
+
+def probe_after_rest(
+    character: Character,
+    encounter_type: str,
+    encounter_id: str,
+    seed: int,
+    **kwargs: object,
+) -> SimDistribution:
+    """Probe an encounter after resting (healing 30% of max HP).
+
+    Applies the same heal logic as a real rest site visit.
+    The original *character* is not mutated.
+    """
+    char_copy = copy.deepcopy(character)
+    rest_heal(char_copy)
+    return probe_encounter(char_copy, encounter_type, encounter_id, seed, **kwargs)
+
+
+def probe_without_card(
+    character: Character,
+    card_id: str,
+    encounter_type: str,
+    encounter_id: str,
+    seed: int,
+    **kwargs: object,
+) -> SimDistribution:
+    """Probe an encounter with a card removed from the deck.
+
+    Removes the first occurrence of *card_id* from the copy's deck.
+    The original *character* is not mutated.
+    """
+    char_copy = copy.deepcopy(character)
+    for i, card in enumerate(char_copy.deck):
+        if card == card_id:
+            del char_copy.deck[i]
+            break
     return probe_encounter(
         char_copy, encounter_type, encounter_id, seed, **kwargs
     )

@@ -33,7 +33,6 @@ def _make_combat(seed: int = 0, enemy_hp: int = 12, player_hp: int = 80) -> Comb
         ["Cultist"],
         seed,
     )
-    combat.reset()
     combat._state.enemies[0].hp = enemy_hp
     combat._state.enemies[0].max_hp = enemy_hp
     return combat
@@ -93,8 +92,8 @@ def test_converges_to_killing_move():
     can attack.  Cultist T0 intent is Incantation (no damage), so the optimal
     expected score is 0 damage.
 
-    We call act() directly on the already-reset combat (not via run_planner,
-    which would call reset() again and lose our HP patch).
+    We call act() directly on the patched combat (not via run_planner,
+    which would play the whole fight and discard the planner state we inspect).
     """
     combat = _make_combat(seed=0, enemy_hp=1)
     planner = MCTSPlanner(simulations=200, seed=0)
@@ -322,13 +321,14 @@ _TOTAL_ENEMY_HP = 50
 
 
 def _make_outcome(
-    *, dead: bool, damage_taken: int, enemy_dmg_dealt: int
+    *, dead: bool, damage_taken: int, enemy_dmg_dealt: int, turns_elapsed: int = 3
 ) -> TerminalOutcome:
     return TerminalOutcome(
         damage_taken=damage_taken,
         player_dead=dead,
         enemy_damage_dealt=enemy_dmg_dealt,
         effective_damage_taken=damage_taken,
+        turns_elapsed=turns_elapsed if not dead else None,
     )
 
 
@@ -441,6 +441,7 @@ def test_edge_stats_max_hp_gained_accumulates_alive_rollouts():
             enemy_damage_dealt=40,
             effective_damage_taken=10,
             max_hp_gained=gained,
+            turns_elapsed=3,
         )
         stats.update(outcome, start_hp=80.0, total_initial_enemy_hp=50.0)
 
@@ -471,7 +472,6 @@ def _make_combat_at_hp(
         ["Cultist"],
         seed,
     )
-    combat.reset()
     combat._state.enemies[0].hp = enemy_hp
     combat._state.enemies[0].max_hp = enemy_hp
     return combat
@@ -550,7 +550,6 @@ class TestMeatOnTheBonePlanner:
             ["JawWorm"],
             0,
         )
-        combat.reset()
         # JawWorm attacks for 11 on T1 (Chomp), DEFEND on T2 (no further damage if
         # killed before DEFEND fires).  Setting hp=19 ensures the starter deck can
         # always kill it on T2 (≥20 total attack damage available) but NOT on T1

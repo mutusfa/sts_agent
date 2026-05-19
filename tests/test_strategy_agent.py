@@ -27,11 +27,11 @@ from sts_agent.strategy.llm_agent import (
     StandardContext,
     StrategyAgent,
     _card_info,
-    _format_result,
+    _format_dist,
     _make_tools,
 )
 from sts_agent.strategy import llm_agent
-from sts_agent.strategy.simulate import SimResult, _resolve_enc, _ACT1_POOLS
+from sts_agent.strategy.simulate import SimDistribution, _resolve_enc, _ACT1_POOLS
 
 
 def _choices(*card_ids: str) -> list[CardInfo]:
@@ -107,29 +107,37 @@ class TestForcedPick:
 
 
 # ---------------------------------------------------------------------------
-# _format_result tests
+# _format_dist tests
 # ---------------------------------------------------------------------------
 
 
-class TestFormatResult:
-    def test_survived(self):
-        r = SimResult(True, 10, 0, 70, 80, 5)
-        s = _format_result("Test", r)
-        assert "SURVIVED" in s
-        assert "damage_taken=10" in s
-        assert "final_hp=70/80" in s
-        assert "turns=5" in s
+def _make_dist(**kwargs) -> SimDistribution:
+    defaults = dict(mean_score=10.0, std_score=2.0, max_score=15.0, n=100, deaths=0, start_hp=80)
+    defaults.update(kwargs)
+    return SimDistribution(**defaults)
 
-    def test_died(self):
-        r = SimResult(False, 80, 0, 0, 80, 3)
-        s = _format_result("Test", r)
-        assert "DIED" in s
 
-    def test_healing(self):
-        r = SimResult(True, -5, 3, 88, 83, 8)
-        s = _format_result("Test", r)
-        assert "damage_taken=-5" in s
-        assert "max_hp_gained=3" in s
+class TestFormatDist:
+    def test_no_status_tokens(self):
+        """_format_dist never emits SURVIVED/DIED."""
+        s = _format_dist("Test", _make_dist())
+        assert "SURVIVED" not in s
+        assert "DIED" not in s
+
+    def test_damage_and_hp_present(self):
+        d = _make_dist(mean_score=10.0, std_score=2.0, start_hp=80)
+        s = _format_dist("Test", d)
+        assert "damage_taken=10±2" in s
+        assert "final_hp=70±2/80" in s
+
+    def test_max_hp_gained_shown_when_nonzero(self):
+        d = _make_dist(max_hp_gained_mean=1.5, max_hp_gained_std=0.3)
+        s = _format_dist("Test", d)
+        assert "max_hp_gained=1.5±0.3" in s
+
+    def test_max_hp_gained_omitted_when_zero(self):
+        s = _format_dist("Test", _make_dist())
+        assert "max_hp_gained" not in s
 
 
 # ---------------------------------------------------------------------------
@@ -175,42 +183,44 @@ class TestCardInfo:
 # ---------------------------------------------------------------------------
 
 
+def _mock_dist(mean=10.0, std=2.0, start_hp=80, deaths=0, n=100) -> SimDistribution:
+    return SimDistribution(
+        mean_score=mean, std_score=std, max_score=mean + std,
+        n=n, deaths=deaths, start_hp=start_hp,
+    )
+
+
 class TestTools:
-    """Test tool functions with mocked simulate_encounter/simulate_with_card."""
+    """Test tool functions with mocked probe_encounter/probe_with_card."""
 
     def test_simulate_upcoming_valid(self):
-        mock_result = SimResult(True, 10, 0, 70, 80, 5)
-        with patch("sts_agent.strategy.llm_agent.simulate_encounter",
-                   return_value=mock_result):
+        with patch("sts_agent.strategy.llm_agent.probe_encounter",
+                   return_value=_mock_dist(mean=10.0)):
             tools = _make_tools(_ironclad(), seed=42, budget_checker=lambda: None)
             result = tools[0]("monster")
-            assert "SURVIVED" in result
             assert "Baseline" in result
-            assert "damage_taken=10" in result
+            assert "damage_taken=10±2" in result
 
     def test_simulate_upcoming_label_contains_room_type(self):
-        mock_result = SimResult(True, 10, 0, 70, 80, 5)
-        with patch("sts_agent.strategy.llm_agent.simulate_encounter",
-                   return_value=mock_result):
+        with patch("sts_agent.strategy.llm_agent.probe_encounter",
+                   return_value=_mock_dist()):
             tools = _make_tools(_ironclad(), seed=42, budget_checker=lambda: None)
             result = tools[0]("elite")
             assert "elite" in result
 
     def test_try_card_valid(self):
-        mock_result = SimResult(True, 8, 0, 72, 80, 4)
-        with patch("sts_agent.strategy.llm_agent.simulate_with_card",
-                   return_value=mock_result):
+        with patch("sts_agent.strategy.llm_agent.probe_with_card",
+                   return_value=_mock_dist(mean=8.0)):
             tools = _make_tools(_ironclad(), seed=42, budget_checker=lambda: None)
             result = tools[1]("Anger", "monster")
             assert "Anger" in result
-            assert "damage_taken=8" in result
+            assert "damage_taken=8±2" in result
 
     def test_budget_checker_called(self):
         calls = []
         checker = lambda: calls.append(True)
-        mock_result = SimResult(True, 5, 0, 75, 80, 3)
-        with patch("sts_agent.strategy.llm_agent.simulate_encounter",
-                   return_value=mock_result):
+        with patch("sts_agent.strategy.llm_agent.probe_encounter",
+                   return_value=_mock_dist()):
             tools = _make_tools(_ironclad(), seed=42, budget_checker=checker)
             tools[0]("monster")
         assert len(calls) == 1
@@ -227,13 +237,17 @@ class TestTools:
     def test_sim_log_accumulates(self):
         """sim_log collects formatted results from tool calls."""
         log: list[str] = []
-        mock_result = SimResult(True, 10, 0, 70, 80, 5)
-        with patch("sts_agent.strategy.llm_agent.simulate_encounter",
-                   return_value=mock_result):
+        with patch("sts_agent.strategy.llm_agent.probe_encounter",
+                   return_value=_mock_dist()):
             tools = _make_tools(
                 _ironclad(), seed=42, budget_checker=lambda: None, sim_log=log,
             )
             tools[0]("monster")
+        with patch("sts_agent.strategy.llm_agent.probe_with_card",
+                   return_value=_mock_dist()):
+            tools = _make_tools(
+                _ironclad(), seed=42, budget_checker=lambda: None, sim_log=log,
+            )
             tools[1]("Anger", "elite")
         assert len(log) == 2
         assert "Baseline" in log[0]
@@ -645,20 +659,20 @@ class TestToolsPoolDetection:
     """Tools run multi-enemy pool probes or single specific-encounter probes."""
 
     def _call_counts_and_sims(self, tool_fn, *args):
-        """Call tool_fn(*args), return (call_count, list of simulations kwargs)."""
+        """Call tool_fn(*args), return (result, list of simulations kwargs)."""
         calls = []
 
-        def fake_simulate(character, enc_type, enc_id, seed, *, max_nodes, simulations):
+        def fake_probe(character, enc_type, enc_id, seed, *, max_nodes, simulations):
             calls.append(simulations)
-            return SimResult(True, 10, 0, 70, 80, 5)
+            return _mock_dist()
 
-        with patch("sts_agent.strategy.llm_agent.simulate_encounter",
-                   side_effect=fake_simulate):
+        with patch("sts_agent.strategy.llm_agent.probe_encounter",
+                   side_effect=fake_probe):
             result = tool_fn(*args)
         return result, calls
 
     def test_empty_encounter_id_triggers_pool(self):
-        """No encounter_id → pool path: simulate_encounter called multiple times."""
+        """No encounter_id → pool path: probe_encounter called multiple times."""
         tools = _make_tools(_ironclad(), seed=42, budget_checker=lambda: None)
         _, calls = self._call_counts_and_sims(tools[0], "monster")
         assert len(calls) > 1
@@ -682,8 +696,8 @@ class TestToolsPoolDetection:
         _, calls = self._call_counts_and_sims(tools[0], "elite")
         assert len(calls) == 3
 
-    def test_specific_encounter_calls_simulate_once(self):
-        """Specific encounter_id → single simulate_encounter call."""
+    def test_specific_encounter_calls_probe_once(self):
+        """Specific encounter_id → single probe_encounter call."""
         tools = _make_tools(_ironclad(), seed=42, budget_checker=lambda: None)
         _, calls = self._call_counts_and_sims(tools[0], "easy", "cultist")
         assert len(calls) == 1
@@ -710,7 +724,6 @@ class TestToolsPoolDetection:
         """Pool probe output contains individual enemy IDs from the sampled pool."""
         tools = _make_tools(_ironclad(), seed=42, budget_checker=lambda: None)
         result, _ = self._call_counts_and_sims(tools[0], "elite")
-        # Elite pool contains these three; all should appear in the output
         assert any(name in result for name in ("Gremlin Nob", "Lagavulin", "Three Sentries"))
 
     def test_pool_result_header_mentions_pool_type(self):
@@ -724,12 +737,12 @@ class TestToolsPoolDetection:
         tools = _make_tools(_ironclad(), seed=42, budget_checker=lambda: None)
         calls = []
 
-        def fake_sim_card(character, card_id, enc_type, enc_id, seed, *, max_nodes, simulations):
+        def fake_probe_card(character, card_id, enc_type, enc_id, seed, *, max_nodes, simulations):
             calls.append(simulations)
-            return SimResult(True, 10, 0, 70, 80, 5)
+            return _mock_dist()
 
-        with patch("sts_agent.strategy.llm_agent.simulate_with_card",
-                   side_effect=fake_sim_card):
+        with patch("sts_agent.strategy.llm_agent.probe_with_card",
+                   side_effect=fake_probe_card):
             tools[1]("Anger", "monster")
 
         assert len(calls) > 1
@@ -740,12 +753,12 @@ class TestToolsPoolDetection:
         tools = _make_tools(_ironclad(), seed=42, budget_checker=lambda: None)
         calls = []
 
-        def fake_sim_card(character, card_id, enc_type, enc_id, seed, *, max_nodes, simulations):
+        def fake_probe_card(character, card_id, enc_type, enc_id, seed, *, max_nodes, simulations):
             calls.append(simulations)
-            return SimResult(True, 10, 0, 70, 80, 5)
+            return _mock_dist()
 
-        with patch("sts_agent.strategy.llm_agent.simulate_with_card",
-                   side_effect=fake_sim_card):
+        with patch("sts_agent.strategy.llm_agent.probe_with_card",
+                   side_effect=fake_probe_card):
             tools[1]("Anger", "easy", "cultist")
 
         assert len(calls) == 1
@@ -760,9 +773,9 @@ class TestToolsPoolDetection:
 class TestUnifiedToolFactory:
     """_make_tools is the sole tool factory; old separate factories are gone."""
 
-    def test_make_tools_returns_four_tools(self):
+    def test_make_tools_returns_five_tools(self):
         tools = _make_tools(_ironclad(), budget_checker=lambda: None)
-        assert len(tools) == 4
+        assert len(tools) == 5
 
     def test_make_tools_tool_names(self):
         tools = _make_tools(_ironclad(), budget_checker=lambda: None)
@@ -772,6 +785,7 @@ class TestUnifiedToolFactory:
             "try_card",
             "try_upgrade",
             "try_remove_card",
+            "try_rest",
         ]
 
     def test_make_rest_tools_does_not_exist(self):
@@ -783,12 +797,11 @@ class TestUnifiedToolFactory:
     def test_try_upgrade_tool_returns_string(self):
         """try_upgrade (index 2) runs and returns a formatted result string."""
         tools = _make_tools(_ironclad(), budget_checker=lambda: None)
-        mock_result = SimResult(True, 5, 0, 75, 80, 3)
-        with patch("sts_agent.strategy.llm_agent.simulate_with_upgrade",
-                   return_value=mock_result):
+        with patch("sts_agent.strategy.llm_agent.probe_with_upgrade",
+                   return_value=_mock_dist(mean=5.0)):
             result = tools[2]("Strike", "monster", "cultist")
         assert "Strike" in result
-        assert "SURVIVED" in result
+        assert "damage_taken=5±2" in result
 
     def test_try_remove_card_is_last_tool(self):
         """try_remove_card is at index 3."""

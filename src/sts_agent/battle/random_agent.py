@@ -1,7 +1,7 @@
 """RandomAgent — selects a uniformly random action from valid_actions().
 
-Primary purpose: verify that the environment plumbing (reset / step /
-valid_actions / done) works end-to-end before training any learned policy.
+Primary purpose: verify that the environment plumbing (step / valid_actions / done)
+works end-to-end before training any learned policy.
 """
 
 from __future__ import annotations

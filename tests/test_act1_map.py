@@ -46,14 +46,20 @@ class TestAct1MapRun:
         # Rest sites should appear if the agent survives long enough
         # (greedy agent may die early on some seeds — that's OK for this smoke test)
 
-    def test_map_run_has_15_floors(self, agent):
+    def test_map_run_has_16_floors(self, agent):
         result = run_act1(agent, seed=42, use_map=True)
-        assert result.total_floors == 15  # map has 15 floors (0-14)
+        assert result.total_floors == 16  # 15 map floors (0-14) + boss at floor 15
 
     def test_map_run_survives_multiple_seeds(self, agent):
         for seed in [7, 42, 99]:
             result = run_act1(agent, seed=seed, use_map=True)
             assert result.floors_cleared > 0
+
+    def test_boss_is_fought_in_map_run(self, agent):
+        # seed=3: greedy agent survives to the boss (may die there — that's fine)
+        result = run_act1(agent, seed=3, use_map=True)
+        assert "boss" in result.encounter_types
+        assert any("boss/" in entry for entry in result.combat_log)
 
     def test_map_run_boss_at_end(self, agent):
         result = run_act1(agent, seed=42, use_map=True)

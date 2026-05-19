@@ -114,8 +114,6 @@ class BaseStrategyAgent:
                 break
             next_coord = self.rng.choice(node.edges)
             path.append(next_coord)
-            if next_coord[0] == 14:
-                break
             current = next_coord
         return path
 
@@ -204,6 +202,20 @@ class BaseStrategyAgent:
         if not character.deck:
             return None
         return self.rng.choice(character.deck)
+
+    def pick_card_to_transform(
+        self, character: Character, **kwargs: object,
+    ) -> str | None:
+        """Pick a random card to transform. None = skip."""
+        if not character.deck:
+            return None
+        return self.rng.choice(character.deck)
+
+    def pick_card_to_upgrade(
+        self, character: Character, **kwargs: object,
+    ) -> str | None:
+        """Pick a card to upgrade via event (prefers non-upgraded). None = skip."""
+        return _best_upgrade_target(character)
 
     # ------------------------------------------------------------------
     # Shops

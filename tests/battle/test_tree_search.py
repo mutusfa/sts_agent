@@ -25,7 +25,7 @@ from sts_agent.battle.tree_search import SearchBudgetExceeded, _ordered_actions
 
 
 def _make_combat(seed: int = 0, enemy_hp: int = 12, player_hp: int = 80) -> Combat:
-    """Starter deck vs Cultist with custom HP values (set after reset).
+    """Starter deck vs Cultist with custom HP values.
 
     Default enemy_hp=12 requires exactly two Strikes to kill (6 dmg each),
     achievable in one turn (3 energy, Strike costs 1).  Cultist T0 is
@@ -36,7 +36,6 @@ def _make_combat(seed: int = 0, enemy_hp: int = 12, player_hp: int = 80) -> Comb
         ["Cultist"],
         seed,
     )
-    obs = combat.reset()
     combat._state.enemies[0].hp = enemy_hp
     combat._state.enemies[0].max_hp = enemy_hp
     return combat
@@ -121,7 +120,6 @@ def test_death_penalty_ranks_death_above_worst_survival():
         ["Cultist"],
         0,
     )
-    combat_dead.reset()
     combat_dead.step(Action.end_turn())  # T0: Incantation (no dmg)
     combat_dead.step(Action.end_turn())  # T1: Dark Strike → player dead
     assert combat_dead.observe().player_dead
@@ -197,8 +195,6 @@ def test_tree_search_budget_exceeded():
     from sts_env.combat.player_state import PlayerState
 
     combat = cultist(0, PlayerState.ironclad_starter())
-    combat.reset()
-
     planner = TreeSearchPlanner(max_nodes=1)
     with pytest.raises(SearchBudgetExceeded):
         planner.act(combat)
@@ -243,7 +239,6 @@ def test_transposition_table_reduces_nodes():
         ["Cultist"],
         0,
     )
-    combat.reset()
     combat._state.enemies[0].hp = 50
     combat._state.enemies[0].max_hp = 50
     # Force a hand with 3 distinct card types → 6 orderings that all reach
@@ -275,7 +270,6 @@ def test_node_budget_50hp_cultist():
         ["Cultist"],
         0,
     )
-    combat.reset()
     combat._state.enemies[0].hp = 50
     combat._state.enemies[0].max_hp = 50
 
@@ -326,7 +320,6 @@ def test_move_ordering_targets_lowest_hp_first():
         ["MadGremlin", "MadGremlin"],
         0,
     )
-    combat.reset()
     combat._state.enemies[0].hp = 20
     combat._state.enemies[0].max_hp = 20
     combat._state.enemies[1].hp = 5
@@ -367,7 +360,6 @@ def test_move_ordering_reduces_nodes_on_multi_enemy():
             ["MadGremlin", "MadGremlin"],
             0,
         )
-        combat.reset()
         combat._state.enemies[0].hp = combat._state.enemies[0].max_hp = 14
         combat._state.enemies[1].hp = combat._state.enemies[1].max_hp = 8
         combat._state.piles.hand = [Card("Strike"), Card("Strike"), Card("Strike"), Card("Defend"), Card("Defend")]
@@ -401,7 +393,6 @@ def test_move_ordering_preserves_decision():
 
         def _run_damage(use_ordering: bool) -> int:
             c = combat.clone()
-            c.reset()
             p = TreeSearchPlanner(use_move_ordering=use_ordering)
             obs = c.observe()
             while not obs.done:
@@ -485,7 +476,6 @@ class TestMeatOnTheBoneTreeSearch:
             ["Cultist"],
             0,
         )
-        combat.reset()
         combat._state.enemies[0].hp = self._CULTIST_HP
         combat._state.enemies[0].max_hp = self._CULTIST_HP
         # Consume T0 (Incantation, no damage) so T1 intent = Dark Strike (6 dmg).

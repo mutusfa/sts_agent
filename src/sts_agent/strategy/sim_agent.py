@@ -277,8 +277,6 @@ class SimStrategyAgent(BaseStrategyAgent):
                 )
 
             path.append(next_coord)
-            if next_coord[0] == 14:
-                break
             current = next_coord
 
         return path

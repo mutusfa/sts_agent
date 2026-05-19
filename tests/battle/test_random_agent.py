@@ -30,7 +30,7 @@ def test_random_agent_always_returns_valid_action(ironclad_vs_cultist: Combat):
     """Over many calls, RandomAgent never picks an action outside valid_actions."""
     agent = RandomAgent(seed=42)
     combat = ironclad_vs_cultist
-    obs = combat.reset()
+    obs = combat.observe()
     for _ in range(30):
         if obs.done:
             break
@@ -54,8 +54,8 @@ def test_random_agent_same_seed_reproducible():
     agent_a = RandomAgent(seed=99)
     agent_b = RandomAgent(seed=99)
 
-    obs_a = combat_a.reset()
-    obs_b = combat_b.reset()
+    obs_a = combat_a.observe()
+    obs_b = combat_b.observe()
 
     actions_a: list[Action] = []
     actions_b: list[Action] = []
@@ -89,8 +89,8 @@ def test_random_agent_different_seeds_differ():
     agent_a = RandomAgent(seed=1)
     agent_b = RandomAgent(seed=2)
 
-    obs_a = combat_a.reset()
-    obs_b = combat_b.reset()
+    obs_a = combat_a.observe()
+    obs_b = combat_b.observe()
 
     actions_a: list[Action] = []
     actions_b: list[Action] = []

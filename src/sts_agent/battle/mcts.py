@@ -148,6 +148,10 @@ class _EdgeStats:
     _sum_max_hp: float = 0.0
     _sum_sq_max_hp: float = 0.0
 
+    # Turns to kill (alive rollouts only)
+    _sum_turns_alive: float = 0.0
+    _n_turns_alive: int = 0
+
     @property
     def n(self) -> int:
         return self.n_alive + self.n_dead
@@ -195,6 +199,11 @@ class _EdgeStats:
         self._sum_max_hp += hp_gained
         self._sum_sq_max_hp += hp_gained * hp_gained
 
+        # Turns to kill (alive rollouts only)
+        if not outcome.player_dead:
+            self._sum_turns_alive += outcome.turns_elapsed
+            self._n_turns_alive += 1
+
     # UCB scalar properties (used for in-tree exploration)
 
     @property
@@ -237,6 +246,10 @@ class _EdgeStats:
             return 0.0
         variance = self._sum_sq_max_hp / self.n - (self._sum_max_hp / self.n) ** 2
         return math.sqrt(max(0.0, variance))
+
+    @property
+    def mean_turns_alive(self) -> float:
+        return self._sum_turns_alive / self._n_turns_alive if self._n_turns_alive > 0 else math.nan
 
     @property
     def death_rate(self) -> float:
@@ -403,6 +416,9 @@ class MCTSPlanner:
             for e in combat._state.enemies  # type: ignore[union-attr]
         )
 
+        if self.potion_costs:
+            log.debug("MCTSPlanner potion_costs=%s", self.potion_costs)
+
         c = self._exploration_c if self._exploration_c is not None else start_hp
 
         root_key = _mcts_state_key(combat)
@@ -423,6 +439,8 @@ class MCTSPlanner:
 
         sims_run = 0
         nodes_expanded = 0
+        _potion_cost_total = 0.0
+        _potion_cost_n = 0
 
         # Telemetry counters (no algorithmic effect)
         sel_depth_sum = 0
@@ -534,6 +552,9 @@ class MCTSPlanner:
                 for p, cnt in _used_counts.items()
                 if cnt > 0
             )
+            if _potion_cost > 0:
+                _potion_cost_total += _potion_cost
+                _potion_cost_n += 1
 
             # --- Backup ---
             for node, concept_key in path:
@@ -599,21 +620,36 @@ class MCTSPlanner:
             "pv_n": float(pv.n),
             "pv_deaths": float(pv.deaths),
             "pv_depth": float(pv_depth),
+            "pv_kill_turn_mean": pv.mean_turns_alive,
             "pv_max_hp_gained_mean": pv.mean_max_hp_gained,
             "pv_max_hp_gained_std": pv.std_max_hp_gained,
+            # Potion penalty
+            "potion_cost_n": float(_potion_cost_n),
+            "potion_cost_mean": (
+                _potion_cost_total / _potion_cost_n if _potion_cost_n else 0.0
+            ),
         }
+
+        if self.potion_costs:
+            log.debug(
+                "T=%d potion penalty: %d/%d rollouts used potions  avg_cost=%.1f",
+                obs.turn, _potion_cost_n, sims_run,
+                _potion_cost_total / _potion_cost_n if _potion_cost_n else 0.0,
+            )
 
         pv_death_rate = (
             pv.deaths / pv.n if pv.n > 0 else math.nan
         )
         pv_expected_dmg = min(pv.mean, float(start_hp)) if pv.n > 0 else math.nan
+        pv_kill_t = pv.mean_turns_alive
         log.debug(
-            "T=%d → %-16s  dmg=%s±%.0f (%s die)  pv_depth=%d  sims=%d",
+            "T=%d → %-16s  dmg=%s±%.0f (%s die)  kill_t=%s  pv_depth=%d  sims=%d",
             obs.turn,
             _fmt_action(best_action, obs.hand),
             f"{pv_expected_dmg:.0f}" if math.isfinite(pv_expected_dmg) else "?",
             pv.std if pv.n > 0 else 0.0,
             f"{pv_death_rate:.0%}" if math.isfinite(pv_death_rate) else "?",
+            f"{pv_kill_t:.1f}" if math.isfinite(pv_kill_t) else "?",
             pv_depth,
             sims_run,
         )

@@ -46,6 +46,7 @@ __all__ = ["run_act1", "RunResult"]
 # Battle dispatch helper
 # ---------------------------------------------------------------------------
 
+
 def _run_battle(
     planner_or_agent: BattlePlanner | BattleAgent,
     combat: Combat,
@@ -66,6 +67,7 @@ def _run_battle(
 # ---------------------------------------------------------------------------
 # Adapter: (planner_or_agent, strategy_agent) → RunAgentProtocol
 # ---------------------------------------------------------------------------
+
 
 class _RunAgentAdapter:
     """Combines a battle planner/agent with a strategy agent into one object
@@ -107,7 +109,7 @@ class _RunAgentAdapter:
 
     def run_battle(self, combat: Combat) -> int:
         # Auto-evaluate potion costs for MCTSPlanner
-        if hasattr(self._planner, 'potion_costs') and hasattr(combat, '_state'):
+        if hasattr(self._planner, "potion_costs") and hasattr(combat, "_state"):
             potions = combat._state.potions  # type: ignore[union-attr]
             if potions and not self._planner.potion_costs:
                 from .strategy.evaluate_potions import evaluate_potions
@@ -122,13 +124,16 @@ class _RunAgentAdapter:
                 )
                 upcoming = self._upcoming_encounters()
                 self._planner.potion_costs = evaluate_potions(
-                    char, upcoming, self._run_seed,
+                    char,
+                    upcoming,
+                    self._run_seed,
                     possible_encounters=(
                         self._strategy.get_possible_encounters()
-                        if hasattr(self._strategy, 'get_possible_encounters')
+                        if hasattr(self._strategy, "get_possible_encounters")
                         else None
                     ),
                 )
+                log.debug("Potion costs: %s", self._planner.potion_costs)
         self._combat_count += 1
         return _run_battle(self._planner, combat)
 
@@ -159,6 +164,12 @@ class _RunAgentAdapter:
     def pick_card_to_remove(self, character, **kwargs):
         return self._strategy.pick_card_to_remove(character, **kwargs)
 
+    def pick_card_to_transform(self, character, **kwargs):
+        return self._strategy.pick_card_to_transform(character, **kwargs)
+
+    def pick_card_to_upgrade(self, character, **kwargs):
+        return self._strategy.pick_card_to_upgrade(character, **kwargs)
+
     def shop(self, inventory, character):
         return self._strategy.shop(inventory, character)
 
@@ -169,12 +180,15 @@ class _RunAgentAdapter:
         return self._strategy.pick_potion_to_discard(character, new_potion, **kwargs)
 
     def set_encounter_tracking(self, encounter_queue, hallway_seen, elites_seen):
-        self._strategy.set_encounter_tracking(encounter_queue, hallway_seen, elites_seen)
+        self._strategy.set_encounter_tracking(
+            encounter_queue, hallway_seen, elites_seen
+        )
 
 
 # ---------------------------------------------------------------------------
 # MLflow observer
 # ---------------------------------------------------------------------------
+
 
 class _MlflowObserver:
     """FloorObserver that wraps each floor in an MLflow child span.
@@ -194,14 +208,16 @@ class _MlflowObserver:
     ) -> Iterator[dict[str, Any]]:
         exc_to_reraise: BaseException | None = None
         with mlflow.start_span(name=f"floor_{floor}_{room_type}") as span:
-            span.set_attributes({
-                "floor": floor,
-                "room_type": room_type,
-                "hp_before": character.player_hp,
-                "max_hp_before": character.player_max_hp,
-                "gold_before": character.gold,
-                "deck_size_before": len(character.deck),
-            })
+            span.set_attributes(
+                {
+                    "floor": floor,
+                    "room_type": room_type,
+                    "hp_before": character.player_hp,
+                    "max_hp_before": character.player_max_hp,
+                    "gold_before": character.gold,
+                    "deck_size_before": len(character.deck),
+                }
+            )
             attrs: dict[str, Any] = {}
             try:
                 yield attrs
@@ -211,13 +227,15 @@ class _MlflowObserver:
                 span.set_attributes({"error": f"{type(exc).__name__}: {exc}"})
                 exc_to_reraise = exc
             finally:
-                span.set_attributes({
-                    "hp_after": character.player_hp,
-                    "max_hp_after": character.player_max_hp,
-                    "gold_after": character.gold,
-                    "deck_size_after": len(character.deck),
-                    **attrs,
-                })
+                span.set_attributes(
+                    {
+                        "hp_after": character.player_hp,
+                        "max_hp_after": character.player_max_hp,
+                        "gold_after": character.gold,
+                        "deck_size_after": len(character.deck),
+                        **attrs,
+                    }
+                )
         # Re-raise outside the span context so the orchestrator sees it,
         # but the MLflow span already closed cleanly (status OK).
         if exc_to_reraise is not None:
@@ -227,6 +245,7 @@ class _MlflowObserver:
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
+
 
 @mlflow.trace(name="run_act1")
 def run_act1(
@@ -261,11 +280,13 @@ def run_act1(
 
     span = mlflow.get_current_active_span()
     if span:
-        span.set_attributes({
-            "seed": seed,
-            "use_map": use_map,
-            "strategy_agent": type(strategy_agent).__name__,
-        })
+        span.set_attributes(
+            {
+                "seed": seed,
+                "use_map": use_map,
+                "strategy_agent": type(strategy_agent).__name__,
+            }
+        )
 
     agent = _RunAgentAdapter(planner_or_agent, strategy_agent)
     observer = _MlflowObserver()

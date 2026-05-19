@@ -52,6 +52,7 @@ _PROBE_MAX_NODES = 5_000
 # Target selection
 # ---------------------------------------------------------------------------
 
+
 def _select_targets(
     upcoming: list[tuple[str, str]],
     possible_encounters: dict | None,
@@ -90,6 +91,7 @@ def _select_targets(
 # Single potion evaluation
 # ---------------------------------------------------------------------------
 
+
 def _eval_single(
     character: Character,
     potion_id: str,
@@ -111,8 +113,12 @@ def _eval_single(
             continue
 
         with_result = probe_encounter(
-            char_with, enc_type, enc_id, seed,
-            simulations=_PROBE_SIMULATIONS, max_nodes=_PROBE_MAX_NODES,
+            char_with,
+            enc_type,
+            enc_id,
+            seed,
+            simulations=_PROBE_SIMULATIONS,
+            max_nodes=_PROBE_MAX_NODES,
         )
 
         # Run WITHOUT potion (remove it)
@@ -121,8 +127,12 @@ def _eval_single(
             char_without.potions.remove(potion_id)
 
         without_result = probe_encounter(
-            char_without, enc_type, enc_id, seed + 1,
-            simulations=_PROBE_SIMULATIONS, max_nodes=_PROBE_MAX_NODES,
+            char_without,
+            enc_type,
+            enc_id,
+            seed + 1,
+            simulations=_PROBE_SIMULATIONS,
+            max_nodes=_PROBE_MAX_NODES,
         )
 
         # HP saved = damage without - damage with
@@ -132,9 +142,16 @@ def _eval_single(
         hp_saved = damage_without - damage_with
 
         # Discount by distance
-        discount = FLOOR_DISCOUNT ** floors_ahead
+        discount = FLOOR_DISCOUNT**floors_ahead
         discounted = hp_saved * discount
 
+        log.debug(
+            "  %s potion=%s enc=%s/%s floors=%d  dmg_with=%.1f dmg_without=%.1f  "
+            "hp_saved=%.1f disc=%.2f -> %.1f",
+            "(new best)" if discounted > best_saving else "       ",
+            potion_id, enc_type, enc_id, floors_ahead,
+            damage_with, damage_without, hp_saved, discount, discounted,
+        )
         if discounted > best_saving:
             best_saving = discounted
 
@@ -144,6 +161,7 @@ def _eval_single(
 # ---------------------------------------------------------------------------
 # Pair evaluation
 # ---------------------------------------------------------------------------
+
 
 def _eval_pairs(
     character: Character,
@@ -172,8 +190,12 @@ def _eval_pairs(
                 # WITH both
                 char_with = copy.deepcopy(character)
                 with_result = probe_encounter(
-                    char_with, enc_type, enc_id, seed + i * 10 + j,
-                    simulations=_PROBE_SIMULATIONS, max_nodes=_PROBE_MAX_NODES,
+                    char_with,
+                    enc_type,
+                    enc_id,
+                    seed + i * 10 + j,
+                    simulations=_PROBE_SIMULATIONS,
+                    max_nodes=_PROBE_MAX_NODES,
                 )
 
                 # WITHOUT both
@@ -182,13 +204,23 @@ def _eval_pairs(
                     p for p in char_without.potions if p != p1 and p != p2
                 ]
                 without_result = probe_encounter(
-                    char_without, enc_type, enc_id, seed + i * 10 + j + 1,
-                    simulations=_PROBE_SIMULATIONS, max_nodes=_PROBE_MAX_NODES,
+                    char_without,
+                    enc_type,
+                    enc_id,
+                    seed + i * 10 + j + 1,
+                    simulations=_PROBE_SIMULATIONS,
+                    max_nodes=_PROBE_MAX_NODES,
                 )
 
-                discount = FLOOR_DISCOUNT ** floors_ahead
-                pair_hp_saved = (without_result.expected_damage - with_result.expected_damage) * discount
+                discount = FLOOR_DISCOUNT**floors_ahead
+                pair_hp_saved = (
+                    without_result.expected_damage - with_result.expected_damage
+                ) * discount
 
+                log.debug(
+                    "  pair (%s, %s) enc=%s/%s  pair_hp_saved=%.1f (best=%.1f)",
+                    p1, p2, enc_type, enc_id, pair_hp_saved, best_pair,
+                )
                 if pair_hp_saved > best_pair:
                     best_pair = pair_hp_saved
 
@@ -203,6 +235,7 @@ def _eval_pairs(
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+
 
 def evaluate_potions(
     character: Character,
@@ -234,6 +267,7 @@ def evaluate_potions(
         return {}
 
     targets = _select_targets(upcoming, possible_encounters)
+    log.debug("Targets for potion eval: %s", targets)
     costs: dict[str, float] = {}
     bag_full = len(character.potions) >= character.max_potion_slots
 

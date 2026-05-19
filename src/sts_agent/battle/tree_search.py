@@ -262,7 +262,7 @@ class TreeSearchPlanner:
         )
         state = combat._state  # type: ignore[union-attr]
         mrl = max_relic_heal(state.relics, int(start_hp))
-        # player_hp_initial: HP at combat.reset() = current HP + damage already taken.
+        # player_hp_initial: HP at combat start = current HP + damage already taken.
         player_hp_initial = obs.player_hp + combat.damage_taken
         min_eff = min_effective_score(state.relics, player_hp_initial, int(start_hp))
 

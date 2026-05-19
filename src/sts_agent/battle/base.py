@@ -10,7 +10,7 @@ BattlePlanner – receives the full Combat object so it can clone() and simulate
 
 Runner helpers
 --------------
-run_agent   – drives a BattleAgent through a full combat (reset → done).
+run_agent   – drives a BattleAgent through a full combat (observe → done).
 run_planner – same for a BattlePlanner.
 Both return damage_taken at the end of combat.
 
@@ -33,6 +33,7 @@ two-tier preference without the doubling:
 from __future__ import annotations
 
 import logging
+from collections import Counter
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -61,6 +62,7 @@ class TerminalOutcome:
     enemy_damage_dealt: int
     effective_damage_taken: int
     max_hp_gained: int = 0
+    turns_elapsed: int | None = None
 
 
 class BattleAgent(Protocol):
@@ -160,6 +162,7 @@ def terminal_score(combat: Combat) -> TerminalOutcome:
         enemy_damage_dealt=enemy_damage_dealt,
         effective_damage_taken=effective,
         max_hp_gained=combat.max_hp_gained,
+        turns_elapsed=obs.turn,
     )
 
 
@@ -192,6 +195,16 @@ def terminal_score_scalar(
 def _card_id(c) -> str:
     """Extract card_id from an observation hand item (dict or Card)."""
     return c["card_id"] if isinstance(c, dict) else c.card_id
+
+
+def _fmt_pile(cards) -> str:
+    """Format a card pile as sorted counted entries, e.g. 'Bash,Defend×3,Strike×2'."""
+    counts = Counter(_card_id(c) for c in cards)
+    return ",".join(
+        f"{name}\u00d7{n}" if n > 1 else name
+        for name, n in sorted(counts.items())
+    )
+
 
 def _fmt_action(action: Action, hand: list) -> str:
     """Compact human-readable action string."""
@@ -278,11 +291,11 @@ def _fmt_obs(obs: Observation) -> str:
 # ---------------------------------------------------------------------------
 
 def run_agent(agent: BattleAgent, combat: Combat) -> int:
-    """Drive *agent* through one full combat starting from reset().
+    """Drive *agent* through one full combat from its current initial state.
 
     Returns damage_taken at termination.
     """
-    obs = combat.reset()
+    obs = combat.observe()
 
     enemy_names = ", ".join(e.name for e in obs.enemies)
     hand_str = ",".join(_card_id(c) for c in obs.hand)
@@ -294,6 +307,13 @@ def run_agent(agent: BattleAgent, combat: Combat) -> int:
     while not obs.done:
         if obs.turn != prev_turn:
             log.debug("--- Turn %d ---", obs.turn)
+            piles = combat._state.piles  # type: ignore[union-attr]
+            log.debug(
+                "  draw=[%s] discard=[%s] exhaust=[%s]",
+                _fmt_pile(piles.draw),
+                _fmt_pile(piles.discard),
+                _fmt_pile(piles.exhaust),
+            )
             prev_turn = obs.turn
         actions = combat.valid_actions()
         action = agent.act(obs, actions)
@@ -307,11 +327,11 @@ def run_agent(agent: BattleAgent, combat: Combat) -> int:
 
 
 def run_planner(planner: BattlePlanner, combat: Combat) -> int:
-    """Drive *planner* through one full combat starting from reset().
+    """Drive *planner* through one full combat from its current initial state.
 
     Returns damage_taken at termination.
     """
-    obs = combat.reset()
+    obs = combat.observe()
 
     enemy_names = ", ".join(e.name for e in obs.enemies)
     hand_str = ",".join(_card_id(c) for c in obs.hand)
@@ -324,6 +344,13 @@ def run_planner(planner: BattlePlanner, combat: Combat) -> int:
         curr_turn = combat.observe().turn
         if curr_turn != prev_turn:
             log.debug("--- Turn %d ---", curr_turn)
+            piles = combat._state.piles  # type: ignore[union-attr]
+            log.debug(
+                "  draw=[%s] discard=[%s] exhaust=[%s]",
+                _fmt_pile(piles.draw),
+                _fmt_pile(piles.discard),
+                _fmt_pile(piles.exhaust),
+            )
             prev_turn = curr_turn
         action = planner.act(combat)
         obs_before = combat.observe()

@@ -45,12 +45,13 @@ from sts_env.run.rooms import RestChoice, RestResult
 
 from .base import BaseStrategyAgent
 from .simulate import (
-    SimResult,
+    SimDistribution,
     get_encounter_pool,
-    simulate_encounter,
-    simulate_with_card,
-    simulate_with_upgrade,
-    simulate_without_card,
+    probe_after_rest,
+    probe_encounter,
+    probe_with_card,
+    probe_with_upgrade,
+    probe_without_card,
 )
 
 if TYPE_CHECKING:
@@ -197,32 +198,16 @@ def ensure_lm() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _format_result(label: str, result: SimResult) -> str:
-    """Render a :class:`SimResult` as a compact string for the LLM."""
-    d = result.distribution
-    if d is not None:
-        exp_dmg = d.expected_damage
-        exp_hp = d.start_hp - exp_dmg
-        parts = [
-            label,
-            f"damage_taken={d.damage_spread}",
-            f"final_hp={exp_hp:.0f}±{d.std_score:.0f}/{d.start_hp}",
-            f"turns={result.turns}",
-        ]
-        if d.max_hp_gained_mean > 0:
-            parts.insert(2, f"max_hp_gained={d.max_hp_gained_spread}")
-    else:
-        status = "SURVIVED" if result.survived else "DIED"
-        parts = [
-            f"{label}: {status}",
-            f"damage_taken={result.damage_taken}",
-            f"final_hp={result.final_hp}/{result.final_max_hp}",
-            f"turns={result.turns}",
-        ]
-        if result.max_hp_gained > 0:
-            parts.insert(2, f"max_hp_gained={result.max_hp_gained}")
-    if result.enemy_hp_remaining > 0:
-        parts.append(f"enemy_hp_remaining={result.enemy_hp_remaining}")
+def _format_dist(label: str, dist: SimDistribution) -> str:
+    """Render a :class:`SimDistribution` as a compact string for the LLM."""
+    exp_dmg = dist.expected_damage
+    parts = [
+        label,
+        f"damage_taken={dist.damage_spread}",
+        f"final_hp={dist.start_hp - exp_dmg:.0f}±{dist.std_score:.0f}/{dist.start_hp}",
+    ]
+    if dist.max_hp_gained_mean > 0:
+        parts.insert(2, f"max_hp_gained={dist.max_hp_gained_spread}")
     return " | ".join(parts)
 
 
@@ -235,23 +220,23 @@ def _probe_encounter(
     max_nodes: int,
     base_simulations: int = 100,
 ) -> str:
-    """Run simulations and return formatted results for a pool or specific encounter.
+    """Run probe(s) and return formatted results for a pool or specific encounter.
 
     Parameters
     ----------
     sim_fn:
-        Callable with signature ``(enc_type, enc_id, seed, n_sims) -> SimResult``.
-        Should close over ``character`` (and any card mutations) and ``max_nodes``.
+        Callable with signature ``(enc_type, enc_id, seed, n_sims) -> SimDistribution``.
+        Should close over ``character`` (and any deck mutations) and ``max_nodes``.
     room_type:
         Room type from the map (used as pool key when *encounter_id* is empty).
     encounter_id:
         Specific enemy ID, pool key (e.g. ``"monster"``, ``"elite"``), or empty.
     seed:
-        RNG seed for pool sampling and each simulation.
+        RNG seed for pool sampling and each probe.
     label_prefix:
         Human-readable prefix for result lines (e.g. ``"Baseline"``, ``"With Anger"``).
     max_nodes:
-        MCTS node budget forwarded to each simulation.
+        MCTS node budget forwarded to each probe.
     base_simulations:
         Rollout count used for each enemy in the pool path (default 100).
         Specific encounters always use 300 rollouts for higher accuracy.
@@ -271,12 +256,12 @@ def _probe_encounter(
             f"{label_prefix} — {pool_label} pool — {len(sample)} of {len(pool)} sampled:"
         ]
         for enc_type, enc_id in sample:
-            result = sim_fn(enc_type, enc_id, seed, base_simulations)
-            lines.append("  " + _format_result(f"{label_prefix} ({enc_id})", result))
+            dist = sim_fn(enc_type, enc_id, seed, base_simulations)
+            lines.append("  " + _format_dist(f"{label_prefix} ({enc_id})", dist))
         return "\n".join(lines)
     else:
-        result = sim_fn(room_type, encounter_id, seed, 3 * base_simulations)
-        return _format_result(f"{label_prefix} ({encounter_id})", result)
+        dist = sim_fn(room_type, encounter_id, seed, 3 * base_simulations)
+        return _format_dist(f"{label_prefix} ({encounter_id})", dist)
 
 
 def _format_possible_encounters(data: dict | None) -> str:
@@ -305,8 +290,9 @@ def _make_tools(
 ) -> list:
     """Create simulation tool callables bound to the current decision context.
 
-    Returns all four tools so the LLM can use whichever are relevant:
-    ``simulate_upcoming``, ``try_card``, ``try_upgrade``, ``try_remove_card``.
+    Returns all five tools so the LLM can use whichever are relevant:
+    ``simulate_upcoming``, ``try_card``, ``try_upgrade``, ``try_remove_card``,
+    ``try_rest``.
 
     Each tool checks the remaining time budget before running a simulation.
     When budget is exhausted the tool returns a message instead of raising, so
@@ -356,8 +342,8 @@ def _make_tools(
         except TimeoutError:
             return _BUDGET_MSG
 
-        def _sim_enc(et: str, ei: str, s: int, n: int) -> SimResult:
-            return simulate_encounter(
+        def _sim_enc(et: str, ei: str, s: int, n: int) -> SimDistribution:
+            return probe_encounter(
                 character, et, ei, s, max_nodes=max_nodes, simulations=n
             )
 
@@ -394,8 +380,8 @@ def _make_tools(
         except TimeoutError:
             return _BUDGET_MSG
 
-        def _sim_card(et: str, ei: str, s: int, n: int) -> SimResult:
-            return simulate_with_card(
+        def _sim_card(et: str, ei: str, s: int, n: int) -> SimDistribution:
+            return probe_with_card(
                 character, card_id, et, ei, s, max_nodes=max_nodes, simulations=n
             )
 
@@ -434,8 +420,8 @@ def _make_tools(
         except TimeoutError:
             return _BUDGET_MSG
 
-        def _sim_upgrade(et: str, ei: str, s: int, n: int) -> SimResult:
-            return simulate_with_upgrade(
+        def _sim_upgrade(et: str, ei: str, s: int, n: int) -> SimDistribution:
+            return probe_with_upgrade(
                 character, card_id, et, ei, s, max_nodes=max_nodes, simulations=n
             )
 
@@ -472,8 +458,8 @@ def _make_tools(
         except TimeoutError:
             return _BUDGET_MSG
 
-        def _sim_remove(et: str, ei: str, s: int, n: int) -> SimResult:
-            return simulate_without_card(
+        def _sim_remove(et: str, ei: str, s: int, n: int) -> SimDistribution:
+            return probe_without_card(
                 character, card_id, et, ei, s, max_nodes=max_nodes, simulations=n
             )
 
@@ -490,7 +476,48 @@ def _make_tools(
             sim_log.append(formatted)
         return formatted
 
-    return [simulate_upcoming, try_card, try_upgrade, try_remove_card]
+    def try_rest(room_type: str, encounter_id: str = "") -> str:
+        """Simulate an upcoming encounter after resting (healing 30% of max HP).
+
+        Use this to evaluate how much resting improves your survivability compared
+        to the baseline (simulate_upcoming). The simulation starts with the
+        post-heal HP rather than your current HP.
+
+        When encounter_id is empty or a pool name, probes up to 5 pool enemies
+        (100 sims each). When encounter_id is specific, runs 300 sims.
+
+        Args:
+            room_type: Room type read from the map view — one of 'monster', 'elite', 'boss'.
+            encounter_id: Optional specific encounter ID from possible_encounters
+                (e.g. 'Lagavulin', 'cultist', 'hexaghost'). If empty or a pool name,
+                probes the full pool.
+        Returns:
+            Human-readable simulation result(s) after healing.
+        """
+        try:
+            budget_checker()
+        except TimeoutError:
+            return _BUDGET_MSG
+
+        def _sim_rest(et: str, ei: str, s: int, n: int) -> SimDistribution:
+            return probe_after_rest(
+                character, et, ei, s, max_nodes=max_nodes, simulations=n
+            )
+
+        formatted = _probe_encounter(
+            _sim_rest,
+            room_type,
+            encounter_id,
+            _seed,
+            "After rest",
+            max_nodes,
+            max_simulations,
+        )
+        if sim_log is not None:
+            sim_log.append(formatted)
+        return formatted
+
+    return [simulate_upcoming, try_card, try_upgrade, try_remove_card, try_rest]
 
 
 # ---------------------------------------------------------------------------
@@ -502,9 +529,9 @@ class StandardContext(dspy.Signature):
     """Baseline inputs shared by every strategy LLM signature.
 
     Values come from ``character.summary()``, the ASCII map renderer, and
-    ``_format_possible_encounters``. Simulation tools (``simulate_upcoming``,
-    ``try_card``, ``try_upgrade``, ``try_remove_card`` depending on the decision)
-    are wired at runtime by the agent; they are not fields on this signature.
+    ``_format_possible_encounters``.     Simulation tools (``simulate_upcoming``, ``try_card``, ``try_upgrade``,
+    ``try_remove_card``, ``try_rest`` depending on the decision) are wired at
+    runtime by the agent; they are not fields on this signature.
 
     When a human expert would have extra information the model lacks, event
     decisions expose a ``missing_context`` output on :class:`EventPickSignature`
@@ -679,16 +706,21 @@ class RestPickSignature(StandardContext):
 
     You can either REST (heal 30% of max HP) or UPGRADE one card in your deck.
 
-    Use the simulation tools to evaluate whether upgrading a specific card
-    improves your survival in upcoming encounters more than healing would.
-    Consider your current HP ratio, upcoming difficulty, and which upgrade
-    gives the biggest power spike.
+    Use the simulation tools to compare both options quantitatively:
+      - simulate_upcoming: combat at your *current* HP (baseline reference).
+      - try_rest: combat after healing 30% of max HP. Use this to measure how
+        much the extra HP improves survivability before committing to REST.
+      - try_upgrade <card_id>: combat with one card upgraded. Use this to measure
+        the power spike from upgrading before committing to UPGRADE.
+
+    Typical workflow: call simulate_upcoming once, then try_rest and/or
+    try_upgrade for the options you are seriously considering, and compare
+    the damage/survival numbers to pick the better option.
+
+    Consider your current HP ratio, upcoming encounter difficulty, and which
+    card upgrade gives the biggest power spike relative to the heal benefit.
 
     Card upgrade effects are shown in each card's 'upgrade' field.
-    The try_upgrade tool simulates with one card upgraded (replacing the
-    unupgraded copy in deck). Compare results against simulate_upcoming
-    (no upgrade) to see the delta.
-
     Simulation tools accept an optional encounter_id to target a specific
     enemy from the possible_encounters list.
 

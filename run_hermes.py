@@ -29,11 +29,18 @@ PROGRESS_FILE = Path("/tmp/sts_hermes_progress.txt")
 RESULT_FILE = Path("/tmp/sts_hermes_result.txt")
 
 
-def _setup_logging() -> None:
-    """Configure logging to file."""
+def _setup_logging(verbose: int) -> None:
+    """Configure logging to file and terminal.
+
+    verbose=0 → WARNING, verbose=1 → INFO, verbose>=2 → DEBUG.
+    """
+    level = {0: logging.WARNING, 1: logging.INFO}.get(verbose, logging.DEBUG)
+    fmt = logging.Formatter("%(name)s %(levelname)s %(message)s")
     fh = logging.FileHandler(LOG_FILE, mode="w")
-    fh.setFormatter(logging.Formatter("%(message)s"))
-    logging.basicConfig(level=logging.INFO, handlers=[fh], force=True)
+    fh.setFormatter(fmt)
+    sh = logging.StreamHandler()
+    sh.setFormatter(fmt)
+    logging.basicConfig(level=level, handlers=[fh, sh], force=True)
 
 
 def _open_progress_file():
@@ -64,6 +71,13 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=42,
         help="RNG seed (default: 42).",
+    )
+    parser.add_argument(
+        "--verbose",
+        "-v",
+        action="count",
+        default=0,
+        help="Increase verbosity (-v=INFO, -vv=DEBUG).",
     )
     return parser
 
@@ -102,19 +116,23 @@ def _write_result(result: RunResult) -> None:
 
 def _log_run_to_mlflow(result: RunResult, agent_type: str, seed: int) -> None:
     """Log run result metrics and params to the active MLflow run."""
-    mlflow.log_params({
-        "agent": agent_type,
-        "seed": str(seed),
-    })
-    mlflow.log_metrics({
-        "victory": float(result.victory),
-        "floors_cleared": float(result.floors_cleared),
-        "total_floors": float(result.total_floors),
-        "final_hp": float(result.final_hp),
-        "max_hp": float(result.max_hp),
-        "total_damage": float(result.damage_taken_total),
-        "max_hp_gained": float(result.max_hp_gained_total),
-    })
+    mlflow.log_params(
+        {
+            "agent": agent_type,
+            "seed": str(seed),
+        }
+    )
+    mlflow.log_metrics(
+        {
+            "victory": float(result.victory),
+            "floors_cleared": float(result.floors_cleared),
+            "total_floors": float(result.total_floors),
+            "final_hp": float(result.final_hp),
+            "max_hp": float(result.max_hp),
+            "total_damage": float(result.damage_taken_total),
+            "max_hp_gained": float(result.max_hp_gained_total),
+        }
+    )
 
 
 def run(argv: list[str] | None = None) -> None:
@@ -130,7 +148,7 @@ def run(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     # Setup logging and tracing
-    _setup_logging()
+    _setup_logging(args.verbose)
     setup_tracing()
     progress = _open_progress_file()
 
@@ -151,9 +169,11 @@ def run(argv: list[str] | None = None) -> None:
     progress.close()
 
     # Print summary to stdout
-    print(f"agent={args.agent} seed={args.seed} victory={result.victory} "
-          f"floors_cleared={result.floors_cleared}/{result.total_floors} "
-          f"final_hp={result.final_hp}/{result.max_hp}")
+    print(
+        f"agent={args.agent} seed={args.seed} victory={result.victory} "
+        f"floors_cleared={result.floors_cleared}/{result.total_floors} "
+        f"final_hp={result.final_hp}/{result.max_hp}"
+    )
     print(f"Run complete! Results in {RESULT_FILE}")
 
 

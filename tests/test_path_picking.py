@@ -52,12 +52,12 @@ class TestPlanRoute:
         assert path[1] == (1, 1), f"Expected REST at (1,1), got {path[1]}"
 
     def test_plan_route_on_full_act1_map(self):
-        """plan_route works on a full 15-floor map."""
+        """plan_route works on a full 15-floor map plus the boss at floor 15."""
         sts_map = generate_act1_map(seed=123)
         char = Character(player_hp=80, player_max_hp=80)
         agent = SimStrategyAgent(sim_nodes=100, sim_sims=100)
         path = agent.plan_route(sts_map, char, seed=123)
-        assert path[-1][0] == 14
+        assert path[-1][0] == 15
         for i in range(1, len(path)):
             assert path[i][0] == path[i-1][0] + 1
         for f, x in path:
@@ -70,7 +70,7 @@ class TestPlanRoute:
         char = Character(player_hp=80, player_max_hp=80)
         agent = SimStrategyAgent(sim_nodes=100, sim_sims=100)
         path = agent.plan_route(sts_map, char, seed=99)
-        assert path[-1][0] == 14
+        assert path[-1][0] == 15
         for i in range(1, len(path)):
             assert path[i][0] == path[i-1][0] + 1
         for f, x in path:

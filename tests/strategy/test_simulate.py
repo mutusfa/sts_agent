@@ -4,8 +4,14 @@ from __future__ import annotations
 
 from sts_env.run.character import Character
 
-from sts_agent.strategy import simulate_encounter, simulate_with_card, SimResult
-from sts_agent.strategy.simulate import SimDistribution, _ACT1_POOLS, get_encounter_pool
+from sts_agent.strategy.simulate import (
+    SimDistribution,
+    _ACT1_POOLS,
+    get_encounter_pool,
+    probe_after_rest,
+    probe_encounter,
+    probe_with_card,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -13,55 +19,49 @@ from sts_agent.strategy.simulate import SimDistribution, _ACT1_POOLS, get_encoun
 # ---------------------------------------------------------------------------
 
 
-def test_simulate_encounter_returns_result():
-    """simulate_encounter returns a SimResult with all expected fields."""
+def test_probe_encounter_returns_distribution():
+    """probe_encounter returns a SimDistribution with all expected fields."""
     char = Character.ironclad()
-    result = simulate_encounter(
+    dist = probe_encounter(
         char, "easy", "cultist", seed=42, max_nodes=50, simulations=50
     )
-    assert isinstance(result, SimResult)
-    assert isinstance(result.survived, bool)
-    assert isinstance(result.damage_taken, int)
-    assert isinstance(result.max_hp_gained, int)
-    assert isinstance(result.final_hp, int)
-    assert isinstance(result.final_max_hp, int)
-    assert isinstance(result.turns, int)
-    assert result.damage_taken >= 0
-    assert result.turns >= 0
+    assert isinstance(dist, SimDistribution)
+    assert dist.n > 0
+    assert dist.std_score >= 0
+    assert dist.start_hp > 0
 
 
 # ---------------------------------------------------------------------------
-# 2. Survival on easy encounter
+# 2. Survival signal on easy encounter
 # ---------------------------------------------------------------------------
 
 
-def test_simulate_encounter_survives_easy():
-    """Ironclad starter deck should survive a cultist fight."""
+def test_probe_encounter_low_death_rate_easy():
+    """Ironclad starter deck should have a low death rate against cultist."""
     char = Character.ironclad()
-    result = simulate_encounter(
+    dist = probe_encounter(
         char, "easy", "cultist", seed=0, max_nodes=50, simulations=50
     )
-    assert result.survived, (
-        f"Expected to survive cultist but died (damage_taken={result.damage_taken})"
+    assert dist.death_rate < 0.5, (
+        f"Expected low death rate vs cultist but got {dist.death_rate:.0%}"
     )
-    assert result.final_hp > 0
-    assert result.final_hp <= char.player_max_hp
+    assert dist.expected_damage <= char.player_max_hp
 
 
 # ---------------------------------------------------------------------------
-# 3. simulate_with_card adds a card
+# 3. probe_with_card — adds a card
 # ---------------------------------------------------------------------------
 
 
-def test_simulate_with_card():
-    """simulate_with_card simulates with a hypothetical extra card."""
+def test_probe_with_card():
+    """probe_with_card simulates with a hypothetical extra card."""
     char = Character.ironclad()
     original_deck_size = len(char.deck)
 
-    result = simulate_with_card(
+    dist = probe_with_card(
         char, "Strike", "easy", "cultist", seed=42, max_nodes=50, simulations=50
     )
-    assert isinstance(result, SimResult)
+    assert isinstance(dist, SimDistribution)
     # Original character should not be mutated
     assert len(char.deck) == original_deck_size
 
@@ -72,7 +72,7 @@ def test_simulate_with_card():
 
 
 def test_character_not_mutated():
-    """simulate_encounter deep-copies the character — no side effects."""
+    """probe_encounter deep-copies the character — no side effects."""
     char = Character.ironclad()
     snapshot = (
         list(char.deck),
@@ -83,7 +83,7 @@ def test_character_not_mutated():
         char.floor,
     )
 
-    simulate_encounter(char, "easy", "cultist", seed=0, max_nodes=50, simulations=50)
+    probe_encounter(char, "easy", "cultist", seed=0, max_nodes=50, simulations=50)
 
     post = (
         list(char.deck),
@@ -93,36 +93,32 @@ def test_character_not_mutated():
         char.gold,
         char.floor,
     )
-    assert snapshot == post, "Character was mutated by simulate_encounter"
+    assert snapshot == post, "Character was mutated by probe_encounter"
 
 
 # ---------------------------------------------------------------------------
-# 5. PV distribution attached to SimResult
+# 5. Distribution fields are sane
 # ---------------------------------------------------------------------------
 
 
-def test_simulate_encounter_has_distribution():
-    """simulate_encounter must attach a SimDistribution from the first act()."""
+def test_probe_encounter_distribution_fields():
+    """probe_encounter returns a distribution with sane n and std."""
     char = Character.ironclad()
-    result = simulate_encounter(
+    dist = probe_encounter(
         char, "easy", "cultist", seed=42, max_nodes=200, simulations=200
     )
-    assert result.distribution is not None, (
-        "simulate_encounter should populate SimResult.distribution"
-    )
-    assert isinstance(result.distribution, SimDistribution)
-    assert result.distribution.n > 0, "distribution.n must be positive"
-    assert result.distribution.std_score >= 0, "std must be non-negative"
+    assert dist.n > 0, "distribution.n must be positive"
+    assert dist.std_score >= 0, "std must be non-negative"
+    assert 0.0 <= dist.death_rate <= 1.0
 
 
-def test_simulate_with_card_has_distribution():
-    """simulate_with_card also propagates a distribution."""
+def test_probe_with_card_distribution_fields():
+    """probe_with_card also returns a valid distribution."""
     char = Character.ironclad()
-    result = simulate_with_card(
+    dist = probe_with_card(
         char, "Strike", "easy", "cultist", seed=42, max_nodes=200, simulations=200
     )
-    assert result.distribution is not None
-    assert result.distribution.n > 0
+    assert dist.n > 0
 
 
 # ---------------------------------------------------------------------------
@@ -173,3 +169,135 @@ class TestGetEncounterPool:
         """Returned pool contains (enc_type, enc_id) tuples."""
         pool = get_encounter_pool("elite", "")
         assert all(isinstance(entry, tuple) and len(entry) == 2 for entry in pool)
+
+
+# ---------------------------------------------------------------------------
+# 7. probe_after_rest
+# ---------------------------------------------------------------------------
+
+
+class TestProbeAfterRest:
+    """probe_after_rest heals the character before probing."""
+
+    def test_returns_distribution(self):
+        """probe_after_rest returns a SimDistribution."""
+        char = Character.ironclad()
+        dist = probe_after_rest(
+            char, "easy", "cultist", seed=42, max_nodes=50, simulations=50
+        )
+        assert isinstance(dist, SimDistribution)
+
+    def test_does_not_mutate_character(self):
+        """probe_after_rest must not change the caller's character."""
+        char = Character.ironclad()
+        hp_before = char.player_hp
+        probe_after_rest(char, "easy", "cultist", seed=0, max_nodes=50, simulations=50)
+        assert char.player_hp == hp_before
+
+    def test_healed_character_passed_to_combat(self):
+        """probe_after_rest must pass the healed character to build_combat.
+
+        We damage the character first so the 30% heal actually moves the needle,
+        then verify the HP given to build_combat is strictly higher than the
+        wounded starting HP.
+        """
+        from unittest.mock import patch
+        import sts_agent.strategy.simulate as sim_mod
+
+        char = Character.ironclad()
+        char.player_hp = char.player_max_hp // 2
+        wounded_hp = char.player_hp
+
+        captured: list[int] = []
+        real_build = sim_mod.build_combat
+
+        def capturing_build(enc_type, enc_id, seed, *, character):
+            captured.append(character.player_hp)
+            return real_build(enc_type, enc_id, seed, character=character)
+
+        with patch.object(sim_mod, "build_combat", side_effect=capturing_build):
+            probe_after_rest(char, "easy", "cultist", seed=42, max_nodes=50, simulations=10)
+
+        assert len(captured) == 1
+        assert captured[0] > wounded_hp, (
+            f"probe_after_rest should pass healed HP ({captured[0]}) "
+            f"> wounded HP ({wounded_hp}) to build_combat"
+        )
+
+    def test_full_hp_character_start_hp_matches_max(self):
+        """A character at full HP stays at max HP after rest_heal (no overheal)."""
+        char = Character.ironclad()
+        assert char.player_hp == char.player_max_hp
+
+        dist = probe_after_rest(
+            char, "easy", "cultist", seed=0, max_nodes=50, simulations=50
+        )
+        assert dist.start_hp == char.player_max_hp
+
+
+# ---------------------------------------------------------------------------
+# 8. try_rest tool in _make_tools
+# ---------------------------------------------------------------------------
+
+
+def test_try_rest_in_make_tools():
+    """_make_tools must include a callable named 'try_rest'."""
+    from sts_agent.strategy.llm_agent import _make_tools
+
+    char = Character.ironclad()
+    tools = _make_tools(char, lambda: None, max_simulations=10, max_nodes=50)
+    tool_names = [fn.__name__ for fn in tools]
+    assert "try_rest" in tool_names, (
+        f"Expected 'try_rest' in tool names, got: {tool_names}"
+    )
+
+
+def test_try_rest_tool_runs(tmp_path):
+    """try_rest tool is callable and returns a non-empty string."""
+    from sts_agent.strategy.llm_agent import _make_tools
+
+    char = Character.ironclad()
+    char.player_hp = char.player_max_hp // 2  # wound so heal is visible
+
+    tools = _make_tools(char, lambda: None, max_simulations=10, max_nodes=50)
+    try_rest_fn = next(fn for fn in tools if fn.__name__ == "try_rest")
+
+    result = try_rest_fn("easy", "cultist")
+    assert isinstance(result, str)
+    assert len(result) > 0
+    assert "After rest" in result
+
+
+# ---------------------------------------------------------------------------
+# 9. Probe-only: each tool call invokes MCTSPlanner.act() exactly once
+# ---------------------------------------------------------------------------
+
+
+def test_tool_calls_mcts_act_exactly_once():
+    """Each tool call must invoke MCTSPlanner.act() exactly once (probe-only).
+
+    The old simulate_* functions drove MCTSPlanner through the entire combat,
+    calling act() at every action step. The new probe_* API calls act() once,
+    then reads the rollout distribution from planner.last_stats. This test
+    enforces that contract for a specific-encounter tool invocation.
+    """
+    from unittest.mock import patch
+    from sts_agent.strategy.llm_agent import _make_tools
+    from sts_agent.battle.mcts import MCTSPlanner
+
+    char = Character.ironclad()
+    act_calls: list[int] = []
+    original_act = MCTSPlanner.act
+
+    def tracking_act(self, combat):
+        act_calls.append(1)
+        return original_act(self, combat)
+
+    with patch.object(MCTSPlanner, "act", tracking_act):
+        tools = _make_tools(char, lambda: None, max_simulations=10, max_nodes=50)
+        simulate_upcoming = next(fn for fn in tools if fn.__name__ == "simulate_upcoming")
+        simulate_upcoming("easy", "cultist")
+
+    assert len(act_calls) == 1, (
+        f"Expected MCTSPlanner.act() called exactly once, got {len(act_calls)}"
+    )
