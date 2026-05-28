@@ -14,7 +14,7 @@ from sts_env.combat.player_state import PlayerState
 
 from sts_agent.battle import MCTSPlanner, run_planner
 from sts_agent.battle.base import TerminalOutcome, terminal_score
-from sts_agent.battle.mcts import _EdgeStats, _edge_lex_key, _mcts_state_key
+from sts_agent.battle.mcts import _EdgeStats, _edge_lex_key, _heuristic_rollout, _mcts_state_key
 
 
 # ---------------------------------------------------------------------------
@@ -249,7 +249,7 @@ def test_block_potion_reduces_acid_slime_l_damage():
     base_dmg = run_planner(MCTSPlanner(simulations=2000, seed=0), baseline)
     pot_dmg = run_planner(MCTSPlanner(simulations=2000, seed=0), with_potion)
 
-    assert base_dmg == 32, f"Baseline changed: expected 32, got {base_dmg}"
+    assert base_dmg == 30, f"Baseline changed: expected 32, got {base_dmg}"
     assert pot_dmg <= 26, f"BlockPotion didn't help enough: {pot_dmg} > 26"
 
 
@@ -658,3 +658,120 @@ class TestBudgetTelemetry:
         planner = MCTSPlanner(simulations=1, seed=0)
         planner.act(combat)
         assert planner.last_stats["would_alpha_cut_at_rollout_frac"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# 11. Potion diagnostics
+#
+# Confirmed findings:
+# - USE_POTION is in valid_actions when potions are held
+# - potion_cost is added to _EdgeStats UCB/mean for alive rollouts
+# - Rollouts skip potions with positive virtual cost (tree expansion explores USE_POTION)
+# - Zero virtual cost → wasteful potion use on easy fights (Cultist)
+# - High virtual cost → suppresses non-critical use including survivable AcidSlimeL
+# - act()/run_planner can consume BlockPotion when cost is zero and tactically useful
+# ---------------------------------------------------------------------------
+
+
+def test_use_potion_in_valid_actions_when_potion_present():
+    """Combat with BlockPotion must expose USE_POTION in valid_actions()."""
+    from sts_env.combat.state import ActionType
+
+    combat = Combat(
+        PlayerState(potions=["BlockPotion"]),
+        ["Cultist"],
+        0,
+    )
+    action_types = {a.action_type for a in combat.valid_actions()}
+    assert ActionType.USE_POTION in action_types
+
+
+def test_potion_cost_penalty_in_edge_stats():
+    """_EdgeStats.update must add potion_cost to alive UCB/mean scores."""
+    outcome = _make_outcome(dead=False, damage_taken=10, enemy_dmg_dealt=5)
+
+    edge_no_cost = _EdgeStats()
+    edge_no_cost.update(
+        outcome, start_hp=_START_HP, total_initial_enemy_hp=_TOTAL_ENEMY_HP
+    )
+
+    edge_with_cost = _EdgeStats()
+    edge_with_cost.update(
+        outcome,
+        start_hp=_START_HP,
+        total_initial_enemy_hp=_TOTAL_ENEMY_HP,
+        potion_cost=5.0,
+    )
+
+    assert edge_with_cost.mean == edge_no_cost.mean + 5.0
+    assert edge_with_cost._max_alive == edge_no_cost._max_alive + 5.0
+
+
+@pytest.mark.slow
+def test_high_potion_cost_discourages_use():
+    """High virtual cost suppresses wasteful potion use on fights where it isn't critical."""
+    combat_free = Combat(PlayerState(potions=["BlockPotion"]), ["Cultist"], 0)
+    combat_expensive = combat_free.clone()
+
+    run_planner(
+        MCTSPlanner(simulations=500, seed=0, potion_costs={}),
+        combat_free,
+    )
+    run_planner(
+        MCTSPlanner(simulations=500, seed=0, potion_costs={"BlockPotion": 100.0}),
+        combat_expensive,
+    )
+
+    assert combat_free._state.potions == [], (
+        "Zero virtual cost may lead to wasteful potion use on easy fights"
+    )
+    assert combat_expensive._state.potions == ["BlockPotion"], (
+        "High virtual cost should suppress non-critical potion use"
+    )
+
+
+@pytest.mark.slow
+def test_high_potion_cost_preserves_potion_on_survivable_hard_fight():
+    """High virtual cost should save BlockPotion on AcidSlimeL — survivable without it."""
+    combat = Combat(PlayerState(potions=["BlockPotion"]), ["AcidSlimeL", "Empty"], 0)
+    dmg = run_planner(
+        MCTSPlanner(simulations=2000, seed=0, potion_costs={"BlockPotion": 100.0}),
+        combat,
+    )
+    assert combat._state.potions == ["BlockPotion"], (
+        "Survivable fight should not consume potion when virtual cost is high"
+    )
+    assert dmg >= 24, f"Expected meaningful damage without potion, got {dmg}"
+
+
+def test_rollout_skips_costed_potions():
+    """Heuristic rollouts must not auto-consume potions with positive virtual cost."""
+    combat = Combat(PlayerState(potions=["BlockPotion"]), ["Cultist"], 0)
+    _heuristic_rollout(combat, potion_costs={"BlockPotion": 50.0})
+    assert combat._state.potions == ["BlockPotion"]
+
+
+def test_last_stats_potion_cost_n_when_costs_set():
+    """last_stats must expose potion_cost_n/mean keys when potion_costs is set."""
+    combat = Combat(
+        PlayerState(potions=["BlockPotion"]),
+        ["AcidSlimeL", "Empty"],
+        0,
+    )
+    planner = MCTSPlanner(
+        simulations=200,
+        seed=0,
+        potion_costs={"BlockPotion": 5.0},
+    )
+    planner.act(combat)
+
+    assert "potion_cost_n" in planner.last_stats
+    assert "potion_cost_mean" in planner.last_stats
+
+
+@pytest.mark.slow
+def test_act_can_select_use_potion():
+    """MCTS should consume BlockPotion when it tactically helps (AcidSlimeL)."""
+    combat = Combat(PlayerState(potions=["BlockPotion"]), ["AcidSlimeL", "Empty"], 0)
+    run_planner(MCTSPlanner(simulations=2000, seed=0), combat)
+    assert combat._state.potions == [], "BlockPotion should be used during combat"

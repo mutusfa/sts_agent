@@ -69,6 +69,15 @@ def _run_battle(
 # ---------------------------------------------------------------------------
 
 
+def _deck_from_combat(combat: Combat) -> list[str]:
+    """Reconstruct the deck card-id list from combat piles."""
+    piles = combat._state.piles  # type: ignore[union-attr]
+    return [
+        card.card_id
+        for card in piles.draw + piles.hand + piles.discard + piles.exhaust
+    ]
+
+
 class _RunAgentAdapter:
     """Combines a battle planner/agent with a strategy agent into one object
     satisfying RunAgentProtocol.
@@ -119,7 +128,7 @@ class _RunAgentAdapter:
                 char = Character(
                     player_hp=combat._state.player_hp,  # type: ignore[union-attr]
                     player_max_hp=combat._state.player_max_hp,  # type: ignore[union-attr]
-                    deck=[],  # deck not needed for cost computation
+                    deck=_deck_from_combat(combat),
                     potions=list(potions),
                 )
                 upcoming = self._upcoming_encounters()

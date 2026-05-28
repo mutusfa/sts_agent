@@ -1,6 +1,6 @@
 """LLM-based strategy agent for card reward decisions.
 
-Uses dspy.ReAct to give the LLM simulation tools for evaluating card choices,
+Uses dspy.ReActV2 to give the LLM simulation tools for evaluating card choices,
 with a configurable timeout and deterministic forced-pick fallback.
 
 Architecture
@@ -10,7 +10,7 @@ Architecture
     Character state + card choices + upcoming encounters + map view
         │
         ▼
-    dspy.ReAct (thought → tool call → observation loop)
+    dspy.ReActV2 (thought → tool call → observation loop)
         │  tools: simulate_upcoming, try_card
         │  budget: 5 min (tools raise TimeoutError when exceeded)
         ▼
@@ -737,13 +737,28 @@ class RestPickSignature(StandardContext):
 # Strategy Agent
 # ---------------------------------------------------------------------------
 
+_REACT_V2_FAILURE_REASONS = frozenset(
+    {
+        "failed",
+        "forced_submit",
+        "parse_error",
+        "context_window_exceeded",
+        "empty_tool_calls",
+        "max_iters",
+    }
+)
+
+
+def _react_v2_failed(result: object) -> bool:
+    return getattr(result, "termination_reason", None) in _REACT_V2_FAILURE_REASONS
+
 
 class StrategyAgent(BaseStrategyAgent):
     """LLM-based card-pick agent with simulation tools and timeout.
 
     Inherits random-valid-option defaults from :class:`BaseStrategyAgent`
     for every decision except :meth:`pick_card`, which is overridden to
-    consult an LLM via dspy.ReAct.
+    consult an LLM via dspy.ReActV2.
 
     Parameters
     ----------
@@ -872,7 +887,7 @@ class StrategyAgent(BaseStrategyAgent):
         )
 
         try:
-            react = dspy.ReAct(CardPickSignature, tools=tools, max_iters=8)
+            react = dspy.ReActV2(CardPickSignature, tools=tools, max_iters=8)
             result = react(
                 character_state=character.summary(),
                 deck_cards=list(character.deck),
@@ -882,7 +897,17 @@ class StrategyAgent(BaseStrategyAgent):
             )
             raw_pick: str = getattr(result, "pick", "").strip()
 
-            if raw_pick.lower() in ("skip", "none", ""):
+            if raw_pick.lower() in ("skip", "none"):
+                log.info("LLM strategy: skipped (%s)", card_choices)
+                self._set_pick_attrs(None, fallback=False)
+                return None
+
+            if not raw_pick and _react_v2_failed(result):
+                pick = self._forced_pick(card_infos)
+                self._set_pick_attrs(pick, fallback=True)
+                return pick
+
+            if not raw_pick:
                 log.info("LLM strategy: skipped (%s)", card_choices)
                 self._set_pick_attrs(None, fallback=False)
                 return None
@@ -1023,7 +1048,7 @@ class StrategyAgent(BaseStrategyAgent):
         # LLM call -------------------------------------------------------
         event_encounters = list(getattr(event, "possible_encounters", ()) or ())
         try:
-            react = dspy.ReAct(EventPickSignature, tools=tools, max_iters=8)
+            react = dspy.ReActV2(EventPickSignature, tools=tools, max_iters=8)
             result = react(
                 character_state=character.summary(),
                 deck_cards=list(character.deck),
@@ -1121,7 +1146,7 @@ class StrategyAgent(BaseStrategyAgent):
         )
 
         try:
-            react = dspy.ReAct(RestPickSignature, tools=tools, max_iters=8)
+            react = dspy.ReActV2(RestPickSignature, tools=tools, max_iters=8)
             result = react(
                 character_state=character.summary(),
                 deck_cards=list(character.deck),
@@ -1190,7 +1215,7 @@ class StrategyAgent(BaseStrategyAgent):
         )
 
         try:
-            react = dspy.ReAct(CardRemoveSignature, tools=tools, max_iters=8)
+            react = dspy.ReActV2(CardRemoveSignature, tools=tools, max_iters=8)
             result = react(
                 character_state=character.summary(),
                 deck_cards=list(character.deck),

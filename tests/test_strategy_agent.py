@@ -339,7 +339,7 @@ class TestStrategyAgent:
     def test_exception_triggers_forced_pick(self):
         """LM error falls back to forced pick."""
         agent = StrategyAgent()
-        with patch("sts_agent.strategy.llm_agent.dspy.ReAct",
+        with patch("sts_agent.strategy.llm_agent.dspy.ReActV2",
                    side_effect=RuntimeError("LM connection failed")):
             pick = agent.pick_card(
                 _ironclad(), ["Anger", "Carnage", "Inflame"],
@@ -350,7 +350,7 @@ class TestStrategyAgent:
     def test_timeout_exhausted_then_llm_pick(self):
         """When tools exhaust budget, LLM still gets to make a final pick."""
         agent = StrategyAgent(timeout_seconds=0)
-        with patch("sts_agent.strategy.llm_agent.dspy.ReAct",
+        with patch("sts_agent.strategy.llm_agent.dspy.ReActV2",
                    self._mock_react("Feed")):
             pick = agent.pick_card(
                 _ironclad(), ["Anger", "Feed", "Inflame"],
@@ -362,7 +362,7 @@ class TestStrategyAgent:
     def test_timeout_exhausted_llm_fails_forced_pick(self):
         """When budget is exhausted AND LLM returns invalid pick → forced pick."""
         agent = StrategyAgent(timeout_seconds=0)
-        with patch("sts_agent.strategy.llm_agent.dspy.ReAct",
+        with patch("sts_agent.strategy.llm_agent.dspy.ReActV2",
                    self._mock_react("NonExistentCard")):
             pick = agent.pick_card(
                 _ironclad(), ["Anger", "Inflame", "Flex"],
@@ -374,7 +374,7 @@ class TestStrategyAgent:
     def test_invalid_pick_falls_back(self):
         """LLM returning an invalid pick falls back to forced pick."""
         agent = StrategyAgent()
-        with patch("sts_agent.strategy.llm_agent.dspy.ReAct",
+        with patch("sts_agent.strategy.llm_agent.dspy.ReActV2",
                    self._mock_react("NonExistentCard")):
             pick = agent.pick_card(
                 _ironclad(), ["Anger", "Inflame", "Flex"],
@@ -386,7 +386,7 @@ class TestStrategyAgent:
     def test_skip_returned_as_none(self):
         """LLM returning 'skip' yields None."""
         agent = StrategyAgent()
-        with patch("sts_agent.strategy.llm_agent.dspy.ReAct",
+        with patch("sts_agent.strategy.llm_agent.dspy.ReActV2",
                    self._mock_react("skip")):
             pick = agent.pick_card(
                 _ironclad(), ["Anger", "Inflame", "Flex"],
@@ -397,7 +397,7 @@ class TestStrategyAgent:
     def test_exact_match(self):
         """LLM returning exact card ID (case-insensitive) works."""
         agent = StrategyAgent()
-        with patch("sts_agent.strategy.llm_agent.dspy.ReAct",
+        with patch("sts_agent.strategy.llm_agent.dspy.ReActV2",
                    self._mock_react("anger")):
             pick = agent.pick_card(
                 _ironclad(), ["Anger", "Inflame", "Flex"],
@@ -408,7 +408,7 @@ class TestStrategyAgent:
     def test_fuzzy_match(self):
         """LLM returning a partial match still resolves."""
         agent = StrategyAgent()
-        with patch("sts_agent.strategy.llm_agent.dspy.ReAct",
+        with patch("sts_agent.strategy.llm_agent.dspy.ReActV2",
                    self._mock_react("I'll pick ShrugItOff")):
             pick = agent.pick_card(
                 _ironclad(), ["Anger", "ShrugItOff", "Flex"],
@@ -419,7 +419,7 @@ class TestStrategyAgent:
     def test_none_pick_treated_as_skip(self):
         """LLM returning empty string is treated as skip."""
         agent = StrategyAgent()
-        with patch("sts_agent.strategy.llm_agent.dspy.ReAct",
+        with patch("sts_agent.strategy.llm_agent.dspy.ReActV2",
                    self._mock_react("")):
             pick = agent.pick_card(
                 _ironclad(), ["Anger", "Inflame", "Flex"],
@@ -556,7 +556,7 @@ class TestStandardContext:
 
 
 class TestPickCardMapAware:
-    """pick_card should render a map_view and forward it to dspy.ReAct."""
+    """pick_card should render a map_view and forward it to dspy.ReActV2."""
 
     @pytest.fixture(autouse=True)
     def _mock_lm(self):
@@ -571,7 +571,7 @@ class TestPickCardMapAware:
         return mock
 
     def test_pick_card_passes_card_infos_to_react(self):
-        """card_choices passed to dspy.ReAct should be list[CardInfo] with correct ids."""
+        """card_choices passed to dspy.ReActV2 should be list[CardInfo] with correct ids."""
         agent = StrategyAgent()
         captured_kwargs: dict = {}
 
@@ -585,7 +585,7 @@ class TestPickCardMapAware:
             inst.side_effect = call_side_effect
             return inst
 
-        with patch("sts_agent.strategy.llm_agent.dspy.ReAct", side_effect=fake_react_factory):
+        with patch("sts_agent.strategy.llm_agent.dspy.ReActV2", side_effect=fake_react_factory):
             agent.pick_card(_ironclad(), ["Anger", "Inflame", "Flex"], [], seed=1)
 
         choices = captured_kwargs["card_choices"]
@@ -611,7 +611,7 @@ class TestPickCardMapAware:
             inst.side_effect = call_side_effect
             return inst
 
-        with patch("sts_agent.strategy.llm_agent.dspy.ReAct", side_effect=fake_react_factory):
+        with patch("sts_agent.strategy.llm_agent.dspy.ReActV2", side_effect=fake_react_factory):
             agent.pick_card(
                 _ironclad(), ["Anger", "Inflame", "Flex"], [], seed=1,
                 sts_map=fake_map, current_position=(0, 3),
@@ -641,7 +641,7 @@ class TestPickCardMapAware:
             inst.side_effect = call_side_effect
             return inst
 
-        with patch("sts_agent.strategy.llm_agent.dspy.ReAct", side_effect=fake_react_factory):
+        with patch("sts_agent.strategy.llm_agent.dspy.ReActV2", side_effect=fake_react_factory):
             agent.pick_card(_ironclad(), ["Anger", "Inflame", "Flex"], [], seed=1)
 
         assert "map_view" in captured_kwargs
@@ -815,7 +815,7 @@ class TestUnifiedToolFactory:
 
 
 class TestPickEventChoiceUsesReAct:
-    """pick_event_choice must use dspy.ReAct (not dspy.Predict)."""
+    """pick_event_choice must use dspy.ReActV2 (not dspy.Predict)."""
 
     @pytest.fixture(autouse=True)
     def _mock_lm(self):
@@ -840,7 +840,7 @@ class TestPickEventChoiceUsesReAct:
         react_instance = MagicMock(return_value=react_result)
         react_class = MagicMock(return_value=react_instance)
 
-        with patch("sts_agent.strategy.llm_agent.dspy.ReAct", react_class):
+        with patch("sts_agent.strategy.llm_agent.dspy.ReActV2", react_class):
             with patch("sts_agent.strategy.llm_agent.dspy.Predict") as mock_predict:
                 agent.pick_event_choice(event, _ironclad())
                 react_class.assert_called()
@@ -855,7 +855,7 @@ class TestPickEventChoiceUsesReAct:
         react_instance = MagicMock(return_value=react_result)
         react_class = MagicMock(return_value=react_instance)
 
-        with patch("sts_agent.strategy.llm_agent.dspy.ReAct", react_class):
+        with patch("sts_agent.strategy.llm_agent.dspy.ReActV2", react_class):
             idx = agent.pick_event_choice(event, _ironclad())
 
         assert idx == 1
@@ -867,7 +867,7 @@ class TestPickEventChoiceUsesReAct:
 
 
 class TestPickEventChoicePassesEventEncounters:
-    """pick_event_choice must forward possible_encounters as event_encounters to ReAct."""
+    """pick_event_choice must forward possible_encounters as event_encounters to ReActV2."""
 
     @pytest.fixture(autouse=True)
     def _mock_lm(self):
@@ -907,7 +907,7 @@ class TestPickEventChoicePassesEventEncounters:
         )
         captured, factory = self._capture_kwargs()
 
-        with patch("sts_agent.strategy.llm_agent.dspy.ReAct", side_effect=factory):
+        with patch("sts_agent.strategy.llm_agent.dspy.ReActV2", side_effect=factory):
             agent.pick_event_choice(event, _ironclad())
 
         assert captured["event_encounters"] == [
@@ -922,7 +922,7 @@ class TestPickEventChoicePassesEventEncounters:
         event = self._make_event(possible_encounters=())
         captured, factory = self._capture_kwargs()
 
-        with patch("sts_agent.strategy.llm_agent.dspy.ReAct", side_effect=factory):
+        with patch("sts_agent.strategy.llm_agent.dspy.ReActV2", side_effect=factory):
             agent.pick_event_choice(event, _ironclad())
 
         assert captured["event_encounters"] == []
@@ -934,7 +934,7 @@ class TestPickEventChoicePassesEventEncounters:
 
 
 class TestPickEventChoiceExtraContext:
-    """extra_context must appear in event_description forwarded to ReAct."""
+    """extra_context must appear in event_description forwarded to ReActV2."""
 
     @pytest.fixture(autouse=True)
     def _mock_lm(self):
@@ -972,7 +972,7 @@ class TestPickEventChoiceExtraContext:
         event = self._make_event()
         captured, factory = self._capture_kwargs()
 
-        with patch("sts_agent.strategy.llm_agent.dspy.ReAct", side_effect=factory):
+        with patch("sts_agent.strategy.llm_agent.dspy.ReActV2", side_effect=factory):
             agent.pick_event_choice(event, _ironclad(), extra_context="pool: Strike x3")
 
         assert "pool: Strike x3" in captured["event_description"]
@@ -983,7 +983,7 @@ class TestPickEventChoiceExtraContext:
         event = self._make_event()
         captured, factory = self._capture_kwargs()
 
-        with patch("sts_agent.strategy.llm_agent.dspy.ReAct", side_effect=factory):
+        with patch("sts_agent.strategy.llm_agent.dspy.ReActV2", side_effect=factory):
             agent.pick_event_choice(event, _ironclad(), extra_context="")
 
         assert "Context:" not in captured["event_description"]
@@ -1001,7 +1001,7 @@ class TestPickEventChoiceExtraContext:
         react_instance = MagicMock(return_value=react_result)
         react_class = MagicMock(return_value=react_instance)
 
-        with patch("sts_agent.strategy.llm_agent.dspy.ReAct", react_class):
+        with patch("sts_agent.strategy.llm_agent.dspy.ReActV2", react_class):
             agent.pick_event_choice(event, _ironclad(), reset_budget=False)
 
         assert agent._start_time == sentinel

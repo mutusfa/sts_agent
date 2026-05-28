@@ -262,13 +262,18 @@ def _edge_lex_key(stats: _EdgeStats) -> tuple:
     Lower is better:
       (bucketed_death_rate, mean_damage_alive, -mean_enemy_dmg_dead)
 
-    Bucketing at 3 decimal places (0.1 % granularity) ensures that a single
-    unlucky rollout in > 1000 sims doesn't flip the alive-damage tier.
+    Death rates below 5% are treated as 0 so open-loop rollout noise does not
+    force potion use when the fight is reliably survivable without one.
+    Above that threshold, round to 3 decimal places (0.1% granularity).
     When all rollouts died (n_alive == 0), mean_damage_alive == inf — correctly
     ranking any surviving edge above any all-dead edge.
     When no rollouts died, neg_mean_enemy_dmg == inf (tie-break irrelevant).
     """
-    bucketed_death_rate = round(stats.death_rate, 3)
+    dr = stats.death_rate
+    if dr < 0.05:
+        bucketed_death_rate = 0.0
+    else:
+        bucketed_death_rate = round(dr, 3)
     neg_mean_enemy_dmg = -stats.mean_enemy_dmg_dead if stats.n_dead > 0 else math.inf
     return (bucketed_death_rate, stats.mean_damage_alive, neg_mean_enemy_dmg)
 
@@ -343,13 +348,47 @@ def _resolve_action(concept_key: tuple, combat: Combat) -> Action | None:
 # ---------------------------------------------------------------------------
 
 
-def _heuristic_rollout(combat: Combat) -> TerminalOutcome:
+def _filter_potion_actions_for_rollout(
+    combat: Combat,
+    actions: list[Action],
+    potion_costs: dict[str, float],
+) -> list[Action]:
+    """Remove potion actions with positive virtual cost from rollout policy.
+
+    Greedy rollouts must not auto-consume potions — that makes every branch
+    pay the virtual cost and rewards early use on lower real damage alone.
+    Tree expansion still explores USE_POTION explicitly; survival-critical use
+    is handled via death_rate on edges that omit the potion.
+    """
+    s = combat._state  # type: ignore[union-attr]
+    filtered: list[Action] = []
+    for action in actions:
+        if action.action_type in (ActionType.USE_POTION, ActionType.DISCARD_POTION):
+            potion_id = s.potions[action.potion_index]
+            if potion_costs.get(potion_id, 0.0) > 0:
+                continue
+        filtered.append(action)
+    return filtered
+
+
+def _heuristic_rollout(
+    combat: Combat,
+    *,
+    potion_costs: dict[str, float] | None = None,
+) -> TerminalOutcome:
     """Play greedily (lowest _order_key first) until combat is done.
 
+    When *potion_costs* assigns positive virtual HP to a potion, rollouts skip
+    USE/DISCARD for that potion so counterfactual branches reflect saving it.
     Returns a TerminalOutcome describing the terminal state.
     """
+    costs = potion_costs or {}
     while not combat.observe().done:
         actions = _ordered_actions(combat)
+        if costs:
+            filtered = _filter_potion_actions_for_rollout(combat, actions, costs)
+            if filtered:
+                actions = filtered
         combat.step(actions[0])
     return terminal_score(combat)
 
@@ -537,7 +576,7 @@ class MCTSPlanner:
 
             # --- Rollout ---
             rollout_combat = current_combat.clone()
-            outcome = _heuristic_rollout(rollout_combat)
+            outcome = _heuristic_rollout(rollout_combat, potion_costs=self.potion_costs)
 
             # --- Compute potion virtual cost for this rollout ---
             # Diff initial potions vs final state to find used ones.
