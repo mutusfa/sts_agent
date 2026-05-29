@@ -24,14 +24,16 @@ from __future__ import annotations
 
 import inspect
 import logging
+from collections import Counter
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Any, Iterator
 
 import mlflow
 
 from sts_env.combat import Combat
 from sts_env.run import run_act1 as _env_run_act1
-from sts_env.run.orchestrator import RunResult  # noqa: F401 — re-exported for callers
+from sts_env.run.orchestrator import PotionRecord, RunResult  # noqa: F401 — re-exported
 from sts_env.run.character import Character
 
 from .battle.base import BattleAgent, BattlePlanner, run_agent, run_planner
@@ -39,7 +41,7 @@ from .strategy.base import BaseStrategyAgent
 
 log = logging.getLogger(__name__)
 
-__all__ = ["run_act1", "RunResult"]
+__all__ = ["run_act1", "RunResult", "PotionRecord", "format_potion_log"]
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +80,103 @@ def _deck_from_combat(combat: Combat) -> list[str]:
     ]
 
 
+# ---------------------------------------------------------------------------
+# Potion lifecycle tracking
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _PotionTracker:
+    """Track per-potion gained/spent floors across a run."""
+
+    _current_floor: int = 0
+    _entries: list[PotionRecord] | None = None
+    _spent_this_floor: Counter[str] | None = None
+    _floor_start_potions: Counter[str] | None = None
+
+    def __post_init__(self) -> None:
+        self._entries = []
+        self._spent_this_floor = Counter()
+        self._floor_start_potions = Counter()
+
+    @property
+    def entries(self) -> list[PotionRecord]:
+        assert self._entries is not None
+        return self._entries
+
+    @property
+    def current_floor(self) -> int:
+        return self._current_floor
+
+    def begin_floor(self, floor: int, potions: list[str]) -> None:
+        self._current_floor = floor
+        self._spent_this_floor = Counter()
+        self._floor_start_potions = Counter(potions)
+
+    def record_spent(self, potion_ids: list[str]) -> None:
+        assert self._spent_this_floor is not None
+        assert self._entries is not None
+        for potion_id in potion_ids:
+            self._spent_this_floor[potion_id] += 1
+            for entry in self._entries:
+                if entry.potion_id == potion_id and entry.spent_floor is None:
+                    entry.spent_floor = self._current_floor
+                    break
+            else:
+                self._entries.append(
+                    PotionRecord(
+                        potion_id=potion_id,
+                        gained_floor=0,
+                        spent_floor=self._current_floor,
+                    )
+                )
+
+    def end_floor(self, potions: list[str]) -> None:
+        assert self._floor_start_potions is not None
+        assert self._spent_this_floor is not None
+        assert self._entries is not None
+        end_counts = Counter(potions)
+        for potion_id, end_count in end_counts.items():
+            start_count = self._floor_start_potions.get(potion_id, 0)
+            spent_count = self._spent_this_floor.get(potion_id, 0)
+            gained_count = end_count - (start_count - spent_count)
+            for _ in range(max(0, gained_count)):
+                self._entries.append(
+                    PotionRecord(
+                        potion_id=potion_id,
+                        gained_floor=self._current_floor,
+                    )
+                )
+
+
+def _log_potion_summary(result: RunResult) -> None:
+    if not result.potion_log:
+        return
+    log.info("Potion log: %s", _format_potion_log(result.potion_log))
+
+
+def _format_potion_log(entries: list[PotionRecord]) -> str:
+    if not entries:
+        return "none"
+    parts: list[str] = []
+    for entry in entries:
+        if entry.spent_floor is None:
+            parts.append(
+                f"{entry.potion_id}: gained floor {entry.gained_floor}, unused"
+            )
+        else:
+            parts.append(
+                f"{entry.potion_id}: gained floor {entry.gained_floor}, "
+                f"spent floor {entry.spent_floor}"
+            )
+    return "; ".join(parts)
+
+
+def format_potion_log(result: RunResult) -> str:
+    """Format potion lifecycle entries for run summaries."""
+    return _format_potion_log(result.potion_log)
+
+
 class _RunAgentAdapter:
     """Combines a battle planner/agent with a strategy agent into one object
     satisfying RunAgentProtocol.
@@ -90,9 +189,12 @@ class _RunAgentAdapter:
         self,
         planner_or_agent: BattlePlanner | BattleAgent,
         strategy_agent: BaseStrategyAgent,
+        *,
+        potion_tracker: _PotionTracker | None = None,
     ) -> None:
         self._planner = planner_or_agent
         self._strategy = strategy_agent
+        self._potion_tracker = potion_tracker or _PotionTracker()
         self._path: list[tuple[int, int]] = []
         self._combat_count: int = 0
         self._sts_map: object = None
@@ -117,10 +219,15 @@ class _RunAgentAdapter:
         return upcoming
 
     def run_battle(self, combat: Combat) -> int:
+        potions_before = (
+            list(combat._state.potions)  # type: ignore[union-attr]
+            if hasattr(combat, "_state")
+            else []
+        )
         # Auto-evaluate potion costs for MCTSPlanner
         if hasattr(self._planner, "potion_costs") and hasattr(combat, "_state"):
             potions = combat._state.potions  # type: ignore[union-attr]
-            if potions and not self._planner.potion_costs:
+            if potions:
                 from .strategy.evaluate_potions import evaluate_potions
                 from sts_env.run.character import Character
 
@@ -143,8 +250,22 @@ class _RunAgentAdapter:
                     ),
                 )
                 log.debug("Potion costs: %s", self._planner.potion_costs)
+            else:
+                self._planner.potion_costs = {}
         self._combat_count += 1
-        return _run_battle(self._planner, combat)
+        damage = _run_battle(self._planner, combat)
+        if hasattr(combat, "_state"):
+            potions_after = list(combat._state.potions)  # type: ignore[union-attr]
+            spent = list((Counter(potions_before) - Counter(potions_after)).elements())
+            if spent:
+                self._potion_tracker.record_spent(spent)
+                for potion_id in spent:
+                    log.info(
+                        "  Potion spent: %s on floor %d",
+                        potion_id,
+                        self._potion_tracker.current_floor,
+                    )
+        return damage
 
     # Delegate all strategy decisions to the strategy agent.
 
@@ -197,6 +318,32 @@ class _RunAgentAdapter:
 # ---------------------------------------------------------------------------
 # MLflow observer
 # ---------------------------------------------------------------------------
+
+
+class _CombinedObserver:
+    """FloorObserver that tracks potion lifecycle and delegates to MLflow."""
+
+    def __init__(
+        self,
+        potion_tracker: _PotionTracker,
+        inner: _MlflowObserver,
+    ) -> None:
+        self._potion_tracker = potion_tracker
+        self._inner = inner
+
+    @contextmanager
+    def floor_scope(
+        self,
+        floor: int,
+        room_type: str,
+        character: Character,
+    ) -> Iterator[dict[str, Any]]:
+        self._potion_tracker.begin_floor(floor, list(character.potions))
+        with self._inner.floor_scope(floor, room_type, character) as attrs:
+            try:
+                yield attrs
+            finally:
+                self._potion_tracker.end_floor(list(character.potions))
 
 
 class _MlflowObserver:
@@ -298,5 +445,9 @@ def run_act1(
         )
 
     agent = _RunAgentAdapter(planner_or_agent, strategy_agent)
-    observer = _MlflowObserver()
-    return _env_run_act1(seed, agent, use_map=use_map, observer=observer)
+    potion_tracker = agent._potion_tracker
+    observer = _CombinedObserver(potion_tracker, _MlflowObserver())
+    result = _env_run_act1(seed, agent, use_map=use_map, observer=observer)
+    result.potion_log = list(potion_tracker.entries)
+    _log_potion_summary(result)
+    return result

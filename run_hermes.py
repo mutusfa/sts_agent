@@ -19,7 +19,7 @@ from pathlib import Path
 import mlflow
 
 from sts_agent.battle.mcts import MCTSPlanner
-from sts_agent.run import run_act1, RunResult
+from sts_agent.run import format_potion_log, run_act1, RunResult
 from sts_agent.strategy import SimStrategyAgent, StrategyAgent
 from sts_agent.tracing import setup_tracing
 
@@ -111,6 +111,7 @@ def _write_result(result: RunResult) -> None:
         f.write(f"max_hp_gained={result.max_hp_gained_total}\n")
         f.write(f"cards_added={result.cards_added}\n")
         f.write(f"potions_gained={result.potions_gained}\n")
+        f.write(f"potion_log={format_potion_log(result)}\n")
         f.write(f"encounter_types={result.encounter_types}\n")
 
 
