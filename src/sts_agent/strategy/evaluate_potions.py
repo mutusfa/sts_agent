@@ -10,8 +10,9 @@ when they save more than their cost or prevent death.
 
 Design
 ------
-For each non-fairy potion, we compare MCTS outcomes WITH vs WITHOUT the potion
-against the two most important upcoming encounters (boss + nearest reachable elite).
+For each non-fairy potion, we compare MCTS outcomes WITH an isolated bag
+containing only that potion vs an empty bag against the two most important
+upcoming encounters (boss + nearest reachable elite).
 
 Virtual cost = max(single_savings, pair_savings), discounted by floors remaining.
 
@@ -98,19 +99,19 @@ def _eval_single(
     targets: list[tuple[str, str, int]],
     seed: int,
 ) -> float:
-    """Estimate HP saved by having this potion across all targets.
+    """Estimate standalone HP saved by having this potion across all targets.
 
-    For each target, run a probe WITH the potion and WITHOUT, then
-    compute the damage difference discounted by floors_ahead.
+    Probes with an isolated bag: WITH ``[potion_id]`` vs WITHOUT ``[]``.
+    The potion need not already be in the character's bag (shop/discard flows).
     """
     best_saving = 0.0
 
     for enc_type, enc_id, floors_ahead in targets:
-        # Run WITH potion (character has it)
         char_with = copy.deepcopy(character)
-        if potion_id not in char_with.potions:
-            # Potion isn't in bag; skip
-            continue
+        char_with.potions = [potion_id]
+
+        char_without = copy.deepcopy(character)
+        char_without.potions = []
 
         with_result = probe_encounter(
             char_with,
@@ -120,11 +121,6 @@ def _eval_single(
             simulations=_PROBE_SIMULATIONS,
             max_nodes=_PROBE_MAX_NODES,
         )
-
-        # Run WITHOUT potion (remove it)
-        char_without = copy.deepcopy(character)
-        if potion_id in char_without.potions:
-            char_without.potions.remove(potion_id)
 
         without_result = probe_encounter(
             char_without,

@@ -283,6 +283,27 @@ def _format_possible_encounters(data: dict | None) -> str:
     return "\n".join(lines)
 
 
+def _format_potion_value(
+    character: Character,
+    potion_id: str,
+    *,
+    seed: int,
+    possible_encounters: dict | None = None,
+    sim_log: list[str] | None = None,
+) -> str:
+    """Estimate standalone HP value of a potion for LLM tool responses."""
+    from .evaluate_potions import _eval_single, _select_targets
+    from .shop_eval import encounters_for_shop_probes
+
+    encounters = encounters_for_shop_probes(possible_encounters)
+    targets = _select_targets(encounters, possible_encounters)
+    value = _eval_single(character, potion_id, targets, seed)
+    msg = f"Potion {potion_id}: estimated HP value {value:.1f}"
+    if sim_log is not None:
+        sim_log.append(msg)
+    return msg
+
+
 def _make_tools(
     character: Character,
     budget_checker: Callable[[], None],
@@ -290,15 +311,16 @@ def _make_tools(
     max_simulations: int = 100,
     max_nodes: int = 1000,
     sim_log: list[str] | None = None,
+    possible_encounters: dict | None = None,
     # Legacy parameter — accepted but ignored so existing call sites that still
     # pass seed= as a keyword don't break before they are updated.
     seed: int | None = None,
 ) -> list:
     """Create simulation tool callables bound to the current decision context.
 
-    Returns all five tools so the LLM can use whichever are relevant:
+    Returns all six tools so the LLM can use whichever are relevant:
     ``simulate_upcoming``, ``try_card``, ``try_upgrade``, ``try_remove_card``,
-    ``try_rest``.
+    ``try_rest``, ``try_potion``.
 
     Each tool checks the remaining time budget before running a simulation.
     When budget is exhausted the tool returns a message instead of raising, so
@@ -523,7 +545,29 @@ def _make_tools(
             sim_log.append(formatted)
         return formatted
 
-    return [simulate_upcoming, try_card, try_upgrade, try_remove_card, try_rest]
+    def try_potion(potion_id: str) -> str:
+        """Estimate HP value of having a potion for upcoming fights."""
+        try:
+            budget_checker()
+        except TimeoutError:
+            return _BUDGET_MSG
+
+        return _format_potion_value(
+            character,
+            potion_id,
+            seed=_seed,
+            possible_encounters=possible_encounters,
+            sim_log=sim_log,
+        )
+
+    return [
+        simulate_upcoming,
+        try_card,
+        try_upgrade,
+        try_remove_card,
+        try_rest,
+        try_potion,
+    ]
 
 
 def _make_shop_tools(
@@ -533,12 +577,10 @@ def _make_shop_tools(
     max_simulations: int = 100,
     max_nodes: int = 1000,
     sim_log: list[str] | None = None,
+    possible_encounters: dict | None = None,
 ) -> list:
     """Shop-specific simulation tools plus the standard decision tools."""
     import random as _random
-
-    from .evaluate_potions import _eval_single, _select_targets
-    from .shop_eval import encounters_for_shop_probes
 
     _seed = _random.randint(0, 2**31)
     _BUDGET_MSG = (
@@ -552,8 +594,11 @@ def _make_shop_tools(
         max_simulations=max_simulations,
         max_nodes=max_nodes,
         sim_log=sim_log,
+        possible_encounters=possible_encounters,
     )
-    simulate_upcoming, try_card, try_upgrade, try_remove_card, try_rest = base_tools
+    simulate_upcoming, try_card, try_upgrade, try_remove_card, try_rest, try_potion = (
+        base_tools
+    )
 
     def try_shop_card(card_id: str, room_type: str, encounter_id: str = "") -> str:
         """Simulate buying a shop card (same as try_card)."""
@@ -596,13 +641,13 @@ def _make_shop_tools(
         except TimeoutError:
             return _BUDGET_MSG
 
-        encounters = encounters_for_shop_probes(None)
-        targets = _select_targets(encounters, None)
-        value = _eval_single(character, potion_id, targets, _seed)
-        msg = f"Potion {potion_id}: estimated HP value {value:.1f}"
-        if sim_log is not None:
-            sim_log.append(msg)
-        return msg
+        return _format_potion_value(
+            character,
+            potion_id,
+            seed=_seed,
+            possible_encounters=possible_encounters,
+            sim_log=sim_log,
+        )
 
     return [
         simulate_upcoming,
@@ -610,6 +655,7 @@ def _make_shop_tools(
         try_upgrade,
         try_remove_card,
         try_rest,
+        try_potion,
         try_shop_card,
         try_shop_remove,
         try_shop_relic,
@@ -1018,6 +1064,7 @@ class StrategyAgent(BaseStrategyAgent):
             max_simulations=self.max_simulations,
             max_nodes=self.max_nodes,
             sim_log=self._sim_log,
+            possible_encounters=self.get_possible_encounters(),
         )
 
         try:
@@ -1172,6 +1219,7 @@ class StrategyAgent(BaseStrategyAgent):
             max_simulations=self.max_simulations,
             max_nodes=self.max_nodes,
             sim_log=self._sim_log,
+            possible_encounters=self.get_possible_encounters(),
         )
 
         # Build event description, appending extra_context if provided
@@ -1277,6 +1325,7 @@ class StrategyAgent(BaseStrategyAgent):
             max_simulations=self.max_simulations,
             max_nodes=self.max_nodes,
             sim_log=self._sim_log,
+            possible_encounters=self.get_possible_encounters(),
         )
 
         try:
@@ -1346,6 +1395,7 @@ class StrategyAgent(BaseStrategyAgent):
             max_simulations=self.max_simulations,
             max_nodes=self.max_nodes,
             sim_log=self._sim_log,
+            possible_encounters=self.get_possible_encounters(),
         )
 
         try:
@@ -1398,6 +1448,7 @@ class StrategyAgent(BaseStrategyAgent):
             max_simulations=self.max_simulations,
             max_nodes=self.max_nodes,
             sim_log=self._sim_log,
+            possible_encounters=self.get_possible_encounters(),
         )
 
         try:

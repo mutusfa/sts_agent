@@ -16,7 +16,6 @@ decisions.
 
 from __future__ import annotations
 
-import copy
 from typing import TYPE_CHECKING
 
 from sts_env.combat.rng import RNG
@@ -316,16 +315,11 @@ class BaseStrategyAgent:
 
         # Try to evaluate potion costs
         try:
-            from .evaluate_potions import evaluate_potions
-            # No upcoming info available here — use empty list (heavy discounting)
+            from .evaluate_potions import _eval_single, _select_targets, evaluate_potions
+
+            targets = _select_targets([], None)
             costs = evaluate_potions(character, [], 0)
-            # Add cost for the new potion too (not in character.potions yet)
-            if new_potion not in costs:
-                # Temporarily add and evaluate
-                char_copy = copy.deepcopy(character)
-                char_copy.potions.append(new_potion)
-                new_costs = evaluate_potions(char_copy, [], 0)
-                costs[new_potion] = new_costs.get(new_potion, 0.0)
+            costs[new_potion] = _eval_single(character, new_potion, targets, 0)
         except Exception:
             costs = {}
 
