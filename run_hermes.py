@@ -32,15 +32,29 @@ RESULT_FILE = Path("/tmp/sts_hermes_result.txt")
 def _setup_logging(verbose: int) -> None:
     """Configure logging to file and terminal.
 
-    verbose=0 → WARNING, verbose=1 → INFO, verbose>=2 → DEBUG.
+    sts_agent: verbose=0 → WARNING, 1 → INFO, 2+ → DEBUG.
+    External libraries stay at WARNING until verbose >= 3.
     """
-    level = {0: logging.WARNING, 1: logging.INFO}.get(verbose, logging.DEBUG)
+    from sts_agent.logging_config import configure_logging
+
     fmt = logging.Formatter("%(name)s %(levelname)s %(message)s")
-    fh = logging.FileHandler(LOG_FILE, mode="w")
-    fh.setFormatter(fmt)
-    sh = logging.StreamHandler()
-    sh.setFormatter(fmt)
-    logging.basicConfig(level=level, handlers=[fh, sh], force=True)
+    sts_handlers = [
+        logging.FileHandler(LOG_FILE, mode="w"),
+        logging.StreamHandler(),
+    ]
+    for handler in sts_handlers:
+        handler.setFormatter(fmt)
+
+    root_handlers = None
+    if verbose >= 3:
+        root_handlers = [
+            logging.FileHandler(LOG_FILE, mode="a"),
+            logging.StreamHandler(),
+        ]
+        for handler in root_handlers:
+            handler.setFormatter(fmt)
+
+    configure_logging(verbose, handlers=sts_handlers, root_handlers=root_handlers)
 
 
 def _open_progress_file():
@@ -77,7 +91,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "-v",
         action="count",
         default=0,
-        help="Increase verbosity (-v=INFO, -vv=DEBUG).",
+        help="Increase verbosity (-v=INFO, -vv=DEBUG, -vvv=external DEBUG).",
     )
     return parser
 

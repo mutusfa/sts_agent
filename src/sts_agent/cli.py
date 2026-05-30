@@ -19,6 +19,9 @@ Verbosity
 (none)  WARNING level — only the summary line and errors.
 -v      INFO level  — combat start/end messages.
 -vv     DEBUG level — per-step action traces + planner search details.
+-vvv    DEBUG level for third-party libraries (mlflow, urllib3, etc.).
+        ``sts_agent`` stays at DEBUG from ``-vv``; external libs stay at
+        WARNING until ``-vvv``.
 
 Exit codes
 ----------
@@ -39,6 +42,7 @@ from sts_env.combat.player_state import PlayerState
 
 from .battle import MCTSPlanner, RandomAgent, TreeSearchPlanner, run_agent, run_planner
 from .battle.tree_search import SearchBudgetExceeded
+from .logging_config import configure_logging
 
 _ENCOUNTERS = {
     name: fn
@@ -47,27 +51,28 @@ _ENCOUNTERS = {
 
 _SUBCOMMANDS = ("battle",)
 
-_LOG_LEVELS = {
-    0: logging.WARNING,
-    1: logging.INFO,
-    2: logging.DEBUG,
-}
+def _configure_logging(verbosity: int) -> None:
+    """Set log levels for ``sts_agent`` and third-party libraries.
 
-
-def _configure_logging(level: int) -> None:
-    """Set the log level for the sts_agent package and add a console handler if needed.
-
-    Attaches to the ``sts_agent`` package logger rather than the root logger so
-    that pytest's ``caplog`` fixture (which injects into root) is never disturbed.
+    Attaches handlers to the ``sts_agent`` package logger (and root at ``-vvv``)
+    rather than configuring root alone, so pytest's ``caplog`` fixture is not
+    disturbed at normal verbosity.
     """
-    pkg = logging.getLogger("sts_agent")
-    pkg.setLevel(level)
-    if not pkg.handlers:
-        handler = logging.StreamHandler(sys.stderr)
-        handler.setFormatter(
-            logging.Formatter("%(levelname)s %(name)s: %(message)s")
-        )
-        pkg.addHandler(handler)
+    formatter = logging.Formatter("%(levelname)s %(name)s: %(message)s")
+    pkg_handler = logging.StreamHandler(sys.stderr)
+    pkg_handler.setFormatter(formatter)
+
+    root_handlers: list[logging.Handler] | None = None
+    if verbosity >= 3:
+        root_handler = logging.StreamHandler(sys.stderr)
+        root_handler.setFormatter(formatter)
+        root_handlers = [root_handler]
+
+    configure_logging(
+        verbosity,
+        handlers=[pkg_handler],
+        root_handlers=root_handlers,
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -123,7 +128,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--verbose",
         action="count",
         default=0,
-        help="Increase verbosity (-v=INFO, -vv=DEBUG).",
+        help="Increase verbosity (-v=INFO, -vv=DEBUG, -vvv=external DEBUG).",
     )
 
     return parser
@@ -154,10 +159,7 @@ def run(argv: list[str] | None = None) -> None:
             msg += f"\nDid you mean one of: {suggestions}?"
         parser.error(msg)
 
-    # Configure logging level based on -v count (capped at 2).
-    verbosity = min(args.verbose, 2)
-    level = _LOG_LEVELS[verbosity]
-    _configure_logging(level)
+    _configure_logging(args.verbose)
 
     if args.subcommand == "battle":
         _run_battle(args)
