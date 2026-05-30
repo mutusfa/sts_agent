@@ -113,7 +113,10 @@ class TestForcedPick:
 
 
 def _make_dist(**kwargs) -> SimDistribution:
-    defaults = dict(mean_score=10.0, std_score=2.0, max_score=15.0, n=100, deaths=0, start_hp=80)
+    defaults = dict(
+        mean_score=10.0, std_score=2.0, max_score=15.0,
+        n=100, deaths=0, start_hp=80, max_hp=80,
+    )
     defaults.update(kwargs)
     return SimDistribution(**defaults)
 
@@ -184,10 +187,10 @@ class TestCardInfo:
 # ---------------------------------------------------------------------------
 
 
-def _mock_dist(mean=10.0, std=2.0, start_hp=80, deaths=0, n=100) -> SimDistribution:
+def _mock_dist(mean=10.0, std=2.0, start_hp=80, max_hp=80, deaths=0, n=100) -> SimDistribution:
     return SimDistribution(
         mean_score=mean, std_score=std, max_score=mean + std,
-        n=n, deaths=deaths, start_hp=start_hp,
+        n=n, deaths=deaths, start_hp=start_hp, max_hp=max_hp,
     )
 
 

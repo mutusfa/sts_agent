@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import math
 import random
 from dataclasses import dataclass
 
@@ -155,7 +156,12 @@ class SimDistribution:
     deaths:
         Number of rollouts where the player died.
     start_hp:
-        Player max HP at the start of combat (used to interpret scores).
+        Player current HP at the start of combat (used to interpret scores).
+    max_hp:
+        Player max HP at the start of combat (shown as the final_hp denominator).
+    mean_damage_alive:
+        Mean effective damage in surviving rollouts (from MCTS stats).  When set,
+        :attr:`expected_damage` uses this instead of the tier-encoded scalar.
     """
 
     mean_score: float
@@ -164,6 +170,8 @@ class SimDistribution:
     n: int
     deaths: int
     start_hp: int
+    max_hp: int
+    mean_damage_alive: float = float("nan")
     max_hp_gained_mean: float = 0.0
     max_hp_gained_std: float = 0.0
 
@@ -183,15 +191,16 @@ class SimDistribution:
 
     @property
     def expected_damage(self) -> float:
-        """Expected damage taken.
+        """Expected damage taken in surviving rollouts.
 
-        For surviving rollouts, score == damage_taken.
-        For dying rollouts, score == damage_taken * 2.
-        We estimate expected damage as min(mean_score, start_hp) which is
-        reasonable when most rollouts survive.  For high death rates the
-        interpretation is less precise, but the ordering is still correct
-        for comparison purposes.
+        Uses ``mean_damage_alive`` from MCTS when available.  When every rollout
+        died, returns ``start_hp`` (all current HP is lost).  Otherwise falls
+        back to the tier-encoded scalar capped at current HP.
         """
+        if math.isfinite(self.mean_damage_alive):
+            return min(self.mean_damage_alive, float(self.start_hp))
+        if self.n > 0 and self.deaths == self.n:
+            return float(self.start_hp)
         return min(self.mean_score, float(self.start_hp))
 
     @property
@@ -265,7 +274,9 @@ def probe_encounter(
         max_score=stats.get("max", float("nan")),
         n=int(stats.get("n", 0)),
         deaths=int(stats.get("deaths", 0)),
-        start_hp=obs.player_max_hp,
+        start_hp=obs.player_hp,
+        max_hp=obs.player_max_hp,
+        mean_damage_alive=float(stats.get("mean_damage_alive", float("nan"))),
         max_hp_gained_mean=float(stats.get("pv_max_hp_gained_mean", 0.0)),
         max_hp_gained_std=float(stats.get("pv_max_hp_gained_std", 0.0)),
     )

@@ -28,7 +28,22 @@ def test_probe_encounter_returns_distribution():
     assert isinstance(dist, SimDistribution)
     assert dist.n > 0
     assert dist.std_score >= 0
-    assert dist.start_hp > 0
+    assert dist.start_hp == char.player_hp
+    assert dist.max_hp == char.player_max_hp
+
+
+def test_probe_encounter_uses_current_hp():
+    """SimDistribution.start_hp reflects the character's current HP, not max HP."""
+    char = Character.ironclad()
+    char.player_hp = char.player_max_hp // 2
+
+    dist = probe_encounter(
+        char, "easy", "cultist", seed=0, max_nodes=50, simulations=50
+    )
+
+    assert dist.start_hp == char.player_hp
+    assert dist.max_hp == char.player_max_hp
+    assert dist.start_hp < dist.max_hp
 
 
 # ---------------------------------------------------------------------------
@@ -224,15 +239,16 @@ class TestProbeAfterRest:
             f"> wounded HP ({wounded_hp}) to build_combat"
         )
 
-    def test_full_hp_character_start_hp_matches_max(self):
-        """A character at full HP stays at max HP after rest_heal (no overheal)."""
+    def test_full_hp_character_start_hp_matches_current(self):
+        """A character at full HP reports start_hp == max_hp."""
         char = Character.ironclad()
         assert char.player_hp == char.player_max_hp
 
         dist = probe_after_rest(
             char, "easy", "cultist", seed=0, max_nodes=50, simulations=50
         )
-        assert dist.start_hp == char.player_max_hp
+        assert dist.start_hp == char.player_hp
+        assert dist.max_hp == char.player_max_hp
 
 
 # ---------------------------------------------------------------------------

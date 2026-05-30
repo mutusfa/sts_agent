@@ -210,7 +210,7 @@ def _format_dist(label: str, dist: SimDistribution) -> str:
     parts = [
         label,
         f"damage_taken={dist.damage_spread}",
-        f"final_hp={dist.start_hp - exp_dmg:.0f}±{dist.std_score:.0f}/{dist.start_hp}",
+        f"final_hp={dist.start_hp - exp_dmg:.0f}±{dist.std_score:.0f}/{dist.max_hp}",
     ]
     if dist.max_hp_gained_mean > 0:
         parts.insert(2, f"max_hp_gained={dist.max_hp_gained_spread}")
