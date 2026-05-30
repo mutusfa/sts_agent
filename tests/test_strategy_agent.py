@@ -24,6 +24,7 @@ from sts_agent.strategy.llm_agent import (
     CardRemoveSignature,
     EventPickSignature,
     RestPickSignature,
+    ShopPickSignature,
     StandardContext,
     StrategyAgent,
     _card_info,
@@ -545,6 +546,7 @@ class TestStandardContext:
             EventPickSignature,
             CardRemoveSignature,
             RestPickSignature,
+            ShopPickSignature,
         ):
             assert issubclass(sig, StandardContext)
             assert "possible_encounters" in sig.model_fields
@@ -1005,3 +1007,45 @@ class TestPickEventChoiceExtraContext:
             agent.pick_event_choice(event, _ironclad(), reset_budget=False)
 
         assert agent._start_time == sentinel
+
+
+class TestShop:
+    """StrategyAgent.shop executes LLM action plan."""
+
+    @pytest.fixture(autouse=True)
+    def _mock_lm(self):
+        with patch("sts_agent.strategy.llm_agent.ensure_lm"):
+            yield
+
+    def test_shop_executes_parsed_actions(self):
+        from sts_env.combat.rng import RNG
+        from sts_env.run.shop import generate_shop
+
+        agent = StrategyAgent()
+        ch = Character.ironclad()
+        ch.gold = 300
+        inv = generate_shop(RNG(0), ch)
+
+        card_idx = next(
+            i for i, (cid, price) in enumerate(inv.cards)
+            if cid and price <= ch.gold
+        )
+        card_id = inv.cards[card_idx][0]
+
+        def fake_react_factory(sig, tools, max_iters):
+            inst = MagicMock()
+
+            def call_side_effect(**kwargs):
+                r = MagicMock()
+                r.actions = f"buy_card:{card_idx},leave"
+                return r
+
+            inst.side_effect = call_side_effect
+            return inst
+
+        with patch("sts_agent.strategy.llm_agent.dspy.ReActV2", side_effect=fake_react_factory):
+            agent.shop(inv, ch)
+
+        assert card_id in ch.deck
+        assert ch.gold < 300
+

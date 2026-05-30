@@ -22,6 +22,13 @@ from typing import TYPE_CHECKING
 from sts_env.combat.rng import RNG
 from sts_env.run import relics as relics_mod
 from sts_env.run.rooms import RestChoice, RestResult, _best_upgrade_target
+from sts_env.run.shop import (
+    ShopInventory,
+    buy_card,
+    buy_potion,
+    buy_relic,
+    remove_worst_card,
+)
 
 if TYPE_CHECKING:
     from sts_env.run.character import Character
@@ -29,7 +36,6 @@ if TYPE_CHECKING:
     from sts_env.run.events import EventSpec
     from sts_env.run.map import StSMap
     from sts_env.run.neow import NeowChoice, NeowOption
-    from sts_env.run.shop import ShopInventory
 
 
 class BaseStrategyAgent:
@@ -40,6 +46,21 @@ class BaseStrategyAgent:
         self._encounter_queue: EncounterQueue | None = None
         self._hallway_seen: list[str] = []
         self._elites_seen: list[str] = []
+        self._run_seed: int | None = None
+        self._sts_map: StSMap | None = None
+
+    def _current_map_position(
+        self, character: Character,
+    ) -> tuple[int, int] | None:
+        """Return map (floor, x) from character state, or None if unknown."""
+        if character.map_x is None:
+            return None
+        return (character.floor - 1, character.map_x)
+
+    def _probe_seed(self, character: Character) -> int:
+        """Derive a deterministic probe seed from cached run seed and floor."""
+        run_seed = self._run_seed if self._run_seed is not None else 0
+        return run_seed * 1000 + character.floor
 
     # ------------------------------------------------------------------
     # Encounter tracking (open-knowledge query support)
@@ -98,6 +119,8 @@ class BaseStrategyAgent:
         probe seeds from it; the base implementation ignores it and uses
         ``self.rng`` instead.
         """
+        self._run_seed = seed
+        self._sts_map = sts_map
         path: list[tuple[int, int]] = []
         floor0_nodes = sts_map.nodes.get(0, [])
         candidates = [n for n in floor0_nodes if n.edges]
@@ -222,8 +245,43 @@ class BaseStrategyAgent:
     # ------------------------------------------------------------------
 
     def shop(self, inventory: ShopInventory, character: Character) -> None:
-        """Default: skip everything. Concrete agents override to spend gold."""
-        return None
+        """Heuristic shop visit: remove worst card, then buy affordable items."""
+        for _ in range(20):
+            acted = False
+
+            if character.gold >= inventory.remove_cost and character.deck:
+                if remove_worst_card(character):
+                    acted = True
+                    continue
+
+            for i, (card_id, price) in enumerate(inventory.cards):
+                if card_id and character.gold >= price:
+                    buy_card(inventory, i, character)
+                    acted = True
+                    break
+            if acted:
+                continue
+
+            for i, entry in enumerate(inventory.relics):
+                if entry is not None and character.gold >= entry[1]:
+                    buy_relic(inventory, i, character)
+                    acted = True
+                    break
+            if acted:
+                continue
+
+            for i, (potion_id, price) in enumerate(inventory.potions):
+                if (
+                    potion_id
+                    and character.gold >= price
+                    and len(character.potions) < character.max_potion_slots
+                ):
+                    buy_potion(inventory, i, character)
+                    acted = True
+                    break
+
+            if not acted:
+                break
 
     # ------------------------------------------------------------------
     # Boss relic reward

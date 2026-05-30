@@ -33,11 +33,19 @@ from sts_env.combat.card_pools import pool
 from sts_env.combat.cards import CardColor, Rarity
 
 from .base import BaseStrategyAgent
+from .shop_eval import (
+    encounters_for_shop_probes,
+    evaluate_shop_baseline,
+    evaluate_shop_option,
+    execute_shop_action,
+    list_shop_candidates,
+)
 from .simulate import SimDistribution, probe_encounter, probe_with_card
 
 if TYPE_CHECKING:
     from sts_env.run.encounter_queue import EncounterQueue
     from sts_env.run.map import MapNode, StSMap
+    from sts_env.run.shop import ShopInventory
 
 log = logging.getLogger(__name__)
 
@@ -232,6 +240,58 @@ class SimStrategyAgent(BaseStrategyAgent):
         return choices[0] if choices else None
 
     # ------------------------------------------------------------------
+    # Shop (specialised)
+    # ------------------------------------------------------------------
+
+    def shop(self, inventory: "ShopInventory", character: Character) -> None:
+        """Probe-based greedy shop visit."""
+        possible = self.get_possible_encounters()
+        if possible is None:
+            super().shop(inventory, character)
+            return
+
+        encounters = encounters_for_shop_probes(possible)
+        seed = self._probe_seed(character)
+
+        for iteration in range(10):
+            candidates = list_shop_candidates(inventory, character)
+            if len(candidates) <= 1:
+                break
+
+            baseline = evaluate_shop_baseline(
+                character,
+                encounters,
+                seed + iteration,
+                max_nodes=self.sim_nodes,
+                simulations=self.sim_sims,
+            )
+            best_action = "leave"
+            best_score = baseline.score
+
+            for action in candidates:
+                if action == "leave":
+                    continue
+                option = evaluate_shop_option(
+                    action,
+                    character,
+                    inventory,
+                    encounters,
+                    seed + iteration,
+                    max_nodes=self.sim_nodes,
+                    simulations=self.sim_sims,
+                    possible_encounters=possible,
+                )
+                if option.score > best_score:
+                    best_score = option.score
+                    best_action = action
+
+            if best_action == "leave":
+                break
+
+            log.info("  Shop: %s", best_action)
+            execute_shop_action(best_action, inventory, character)
+
+    # ------------------------------------------------------------------
     # Map route (specialised)
     # ------------------------------------------------------------------
 
@@ -250,6 +310,8 @@ class SimStrategyAgent(BaseStrategyAgent):
         Falls back to a heuristic (prefer Rest when low HP, Elite when
         high HP) when no combat is reachable for probing.
         """
+        self._run_seed = seed
+        self._sts_map = sts_map
         from sts_env.run.encounter_queue import EncounterQueue
         from sts_env.combat.rng import RNG as StsRNG
 

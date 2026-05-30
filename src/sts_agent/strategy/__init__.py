@@ -8,6 +8,7 @@ from .simulate import (
     probe_after_rest,
     probe_encounter,
     probe_with_card,
+    probe_with_relic,
     probe_with_upgrade,
     probe_without_card,
 )
@@ -22,6 +23,7 @@ __all__ = [
     "probe_after_rest",
     "probe_encounter",
     "probe_with_card",
+    "probe_with_relic",
     "probe_with_upgrade",
     "probe_without_card",
 ]

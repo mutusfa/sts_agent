@@ -351,3 +351,22 @@ def probe_without_card(
     return probe_encounter(
         char_copy, encounter_type, encounter_id, seed, **kwargs
     )
+
+
+def probe_with_relic(
+    character: Character,
+    relic_id: str,
+    encounter_type: str,
+    encounter_id: str,
+    seed: int,
+    **kwargs: object,
+) -> SimDistribution:
+    """Probe an encounter with a hypothetical relic added.
+
+    The original *character* is not mutated.
+    """
+    char_copy = copy.deepcopy(character)
+    char_copy.add_relic(relic_id)
+    return probe_encounter(
+        char_copy, encounter_type, encounter_id, seed, **kwargs
+    )

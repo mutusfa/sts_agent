@@ -44,20 +44,26 @@ from sts_env.run.character import Character
 from sts_env.run.rooms import RestChoice, RestResult
 
 from .base import BaseStrategyAgent
+from .shop_eval import (
+    execute_shop_action,
+    format_shop_inventory,
+    parse_shop_actions,
+)
 from .simulate import (
     SimDistribution,
     get_encounter_pool,
     probe_after_rest,
     probe_encounter,
     probe_with_card,
+    probe_with_relic,
     probe_with_upgrade,
     probe_without_card,
 )
 
 if TYPE_CHECKING:
     from sts_env.run.map import StSMap
-    from sts_env.run.encounter_queue import EncounterQueue
     from sts_env.run.events import EventSpec
+    from sts_env.run.shop import ShopInventory
 
 import dataclasses
 
@@ -520,6 +526,97 @@ def _make_tools(
     return [simulate_upcoming, try_card, try_upgrade, try_remove_card, try_rest]
 
 
+def _make_shop_tools(
+    character: Character,
+    budget_checker: Callable[[], None],
+    *,
+    max_simulations: int = 100,
+    max_nodes: int = 1000,
+    sim_log: list[str] | None = None,
+) -> list:
+    """Shop-specific simulation tools plus the standard decision tools."""
+    import random as _random
+
+    from .evaluate_potions import _eval_single, _select_targets
+    from .shop_eval import encounters_for_shop_probes
+
+    _seed = _random.randint(0, 2**31)
+    _BUDGET_MSG = (
+        "SIMULATION BUDGET EXHAUSTED — no more simulations available. "
+        "Make your pick now based on the results you already have."
+    )
+
+    base_tools = _make_tools(
+        character,
+        budget_checker,
+        max_simulations=max_simulations,
+        max_nodes=max_nodes,
+        sim_log=sim_log,
+    )
+    simulate_upcoming, try_card, try_upgrade, try_remove_card, try_rest = base_tools
+
+    def try_shop_card(card_id: str, room_type: str, encounter_id: str = "") -> str:
+        """Simulate buying a shop card (same as try_card)."""
+        return try_card(card_id, room_type, encounter_id)
+
+    def try_shop_remove(card_id: str, room_type: str, encounter_id: str = "") -> str:
+        """Simulate removing a deck card at the shop (same as try_remove_card)."""
+        return try_remove_card(card_id, room_type, encounter_id)
+
+    def try_shop_relic(relic_id: str, room_type: str, encounter_id: str = "") -> str:
+        """Simulate buying a shop relic and fighting an upcoming encounter."""
+        try:
+            budget_checker()
+        except TimeoutError:
+            return _BUDGET_MSG
+
+        def _sim_relic(et: str, ei: str, s: int, n: int) -> SimDistribution:
+            return probe_with_relic(
+                character, relic_id, et, ei, s,
+                max_nodes=max_nodes, simulations=n,
+            )
+
+        formatted = _probe_encounter(
+            _sim_relic,
+            room_type,
+            encounter_id,
+            _seed,
+            f"With relic {relic_id}",
+            max_nodes,
+            max_simulations,
+        )
+        if sim_log is not None:
+            sim_log.append(formatted)
+        return formatted
+
+    def try_shop_potion(potion_id: str) -> str:
+        """Estimate HP value of buying a potion for upcoming fights."""
+        try:
+            budget_checker()
+        except TimeoutError:
+            return _BUDGET_MSG
+
+        encounters = encounters_for_shop_probes(None)
+        targets = _select_targets(encounters, None)
+        value = _eval_single(character, potion_id, targets, _seed)
+        msg = f"Potion {potion_id}: estimated HP value {value:.1f}"
+        if sim_log is not None:
+            sim_log.append(msg)
+        return msg
+
+    return [
+        simulate_upcoming,
+        try_card,
+        try_upgrade,
+        try_remove_card,
+        try_rest,
+        try_shop_card,
+        try_shop_remove,
+        try_shop_relic,
+        try_shop_potion,
+    ]
+
+
 # ---------------------------------------------------------------------------
 # dspy signature
 # ---------------------------------------------------------------------------
@@ -734,6 +831,42 @@ class RestPickSignature(StandardContext):
 
 
 # ---------------------------------------------------------------------------
+# Shop signature
+# ---------------------------------------------------------------------------
+
+
+class ShopPickSignature(StandardContext):
+    """You are a Slay the Spire strategy expert shopping at a merchant.
+
+    Evaluate purchases using simulation tools:
+      - try_shop_card: simulate adding a shop card to your deck.
+      - try_shop_remove: simulate removing a deck card (costs removal gold).
+      - try_shop_relic: simulate adding a shop relic.
+      - try_shop_potion: estimate HP value of buying a potion.
+
+    Also use simulate_upcoming and try_remove_card for baseline comparisons.
+
+    Priorities:
+    1. Survive upcoming elite/boss fights — buy cards/relics that improve probes.
+    2. Thin the deck — remove Strikes/Defends when affordable and beneficial.
+    3. Potions — buy when bag has space and upcoming fights are dangerous.
+    4. Gold efficiency — don't overspend on marginal upgrades.
+
+    Output a comma-separated action plan executed in order, then leave.
+    Examples: "remove:Strike,buy_card:2" or "buy_relic:1,buy_potion:0,leave"
+    Use exact action formats: remove:<card_id>, buy_card:<index>,
+    buy_relic:<index>, buy_potion:<index>, leave.
+    """
+
+    shop_inventory: str = dspy.InputField(
+        desc="Available shop slots with prices and card-removal cost."
+    )
+    actions: str = dspy.OutputField(
+        desc='Comma-separated shop actions to take, ending with "leave" or empty.'
+    )
+
+
+# ---------------------------------------------------------------------------
 # Strategy Agent
 # ---------------------------------------------------------------------------
 
@@ -768,7 +901,8 @@ class StrategyAgent(BaseStrategyAgent):
         LM model name (default ``"deepseek-v4-flash"``).
     seed:
         Forwarded to :class:`BaseStrategyAgent` for the inherited random
-        decisions (Neow, route, rest, events, shop, boss relic).
+        decisions (Neow, route, rest, events, boss relic).  Shop visits use
+        :meth:`shop` with LLM + shop simulation tools.
     max_simulations:
         MCTS simulation budget per tool call (default 100).
     max_nodes:
@@ -1234,3 +1368,55 @@ class StrategyAgent(BaseStrategyAgent):
         except Exception:
             log.exception("LLM card removal: error, skipping removal")
             return None
+
+    # -- shop entry point -----------------------------------------------------
+
+    @mlflow.trace(name="shop")
+    def shop(
+        self,
+        inventory: "ShopInventory",
+        character: Character,
+    ) -> None:
+        """Decide shop purchases using LLM + simulation tools."""
+        ensure_lm()
+        self._start_time = time.time()
+        self._timed_out = False
+        self._sim_log = []
+
+        map_view = _format_map_view(
+            self._sts_map,
+            self._current_map_position(character),
+        )
+        encounters_view = _format_possible_encounters(
+            self.get_possible_encounters(),
+        )
+        shop_inventory = format_shop_inventory(inventory)
+
+        tools = _make_shop_tools(
+            character,
+            self._check_budget,
+            max_simulations=self.max_simulations,
+            max_nodes=self.max_nodes,
+            sim_log=self._sim_log,
+        )
+
+        try:
+            react = dspy.ReActV2(ShopPickSignature, tools=tools, max_iters=8)
+            result = react(
+                character_state=character.summary(),
+                deck_cards=list(character.deck),
+                map_view=map_view,
+                possible_encounters=encounters_view,
+                shop_inventory=shop_inventory,
+            )
+            raw_actions = getattr(result, "actions", "leave").strip()
+            actions = parse_shop_actions(raw_actions)
+            log.info("LLM shop: plan=%r parsed=%s", raw_actions, actions)
+
+            for action in actions:
+                if not execute_shop_action(action, inventory, character):
+                    log.warning("LLM shop: action failed or skipped: %s", action)
+
+        except Exception:
+            log.exception("LLM shop: error, falling back to heuristic")
+            super().shop(inventory, character)
