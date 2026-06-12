@@ -152,6 +152,11 @@ class _EdgeStats:
     _sum_turns_alive: float = 0.0
     _n_turns_alive: int = 0
 
+    # Death timeline (dead rollouts only)
+    _sum_turns_dead: float = 0.0
+    _n_turns_dead: int = 0
+    _sum_damage_taken_dead: float = 0.0
+
     @property
     def n(self) -> int:
         return self.n_alive + self.n_dead
@@ -182,6 +187,10 @@ class _EdgeStats:
             self._sum_sq_dead += s * s
             if s > self._max_dead:
                 self._max_dead = s
+            self._sum_damage_taken_dead += float(outcome.damage_taken)
+            if outcome.turns_elapsed is not None:
+                self._sum_turns_dead += float(outcome.turns_elapsed)
+                self._n_turns_dead += 1
 
         # Tier-encoded scalar: alive → damage_taken + potion_cost; dead → start_hp + 1 + remaining_hp
         if not outcome.player_dead:
@@ -235,6 +244,14 @@ class _EdgeStats:
     @property
     def mean_enemy_dmg_dead(self) -> float:
         return self._sum_dead / self.n_dead if self.n_dead > 0 else math.nan
+
+    @property
+    def mean_turns_dead(self) -> float:
+        return self._sum_turns_dead / self._n_turns_dead if self._n_turns_dead > 0 else math.nan
+
+    @property
+    def mean_damage_taken_dead(self) -> float:
+        return self._sum_damage_taken_dead / self.n_dead if self.n_dead > 0 else math.nan
 
     @property
     def mean_max_hp_gained(self) -> float:
@@ -642,6 +659,8 @@ class MCTSPlanner:
             "mean_damage_alive": best_edge.mean_damage_alive,
             "n_dead": float(best_edge.n_dead),
             "mean_enemy_dmg_dead": best_edge.mean_enemy_dmg_dead,
+            "mean_turns_dead": best_edge.mean_turns_dead,
+            "mean_damage_taken_dead": best_edge.mean_damage_taken_dead,
             # Budget
             "simulations": float(sims_run),
             "nodes": float(nodes_expanded),

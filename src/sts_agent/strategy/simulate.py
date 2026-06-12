@@ -162,6 +162,12 @@ class SimDistribution:
     mean_damage_alive:
         Mean effective damage in surviving rollouts (from MCTS stats).  When set,
         :attr:`expected_damage` uses this instead of the tier-encoded scalar.
+    mean_enemy_dmg_dead:
+        Mean enemy damage dealt in rollouts where the player died.
+    mean_turns_dead:
+        Mean turns elapsed at death in dying rollouts.
+    mean_damage_taken_dead:
+        Mean raw player damage taken in dying rollouts.
     """
 
     mean_score: float
@@ -174,6 +180,9 @@ class SimDistribution:
     mean_damage_alive: float = float("nan")
     max_hp_gained_mean: float = 0.0
     max_hp_gained_std: float = 0.0
+    mean_enemy_dmg_dead: float = float("nan")
+    mean_turns_dead: float = float("nan")
+    mean_damage_taken_dead: float = float("nan")
 
     @property
     def survival_rate(self) -> float:
@@ -213,6 +222,51 @@ class SimDistribution:
     def max_hp_gained_spread(self) -> str:
         """Human-readable max-HP-gained spread, e.g. '1.2±0.4'. Only shown when mean > 0."""
         return f"{self.max_hp_gained_mean:.1f}±{self.max_hp_gained_std:.1f}"
+
+
+# Threshold for applying death-progress heuristic (matches high-death probes).
+_DEATH_PROGRESS_DEATH_RATE = 0.95
+
+
+def _death_progress_benefit(without: SimDistribution, with_: SimDistribution) -> float:
+    """Value extra enemy damage on dying timelines in player-HP equivalents."""
+    if not math.isfinite(without.mean_enemy_dmg_dead) or not math.isfinite(
+        with_.mean_enemy_dmg_dead
+    ):
+        return 0.0
+    extra_enemy = with_.mean_enemy_dmg_dead - without.mean_enemy_dmg_dead
+    if extra_enemy <= 0:
+        return 0.0
+    if (
+        not math.isfinite(without.mean_turns_dead)
+        or without.mean_turns_dead <= 0
+        or without.mean_enemy_dmg_dead <= 0
+        or not math.isfinite(without.mean_damage_taken_dead)
+    ):
+        return 0.0
+
+    avg_enemy_per_turn = without.mean_enemy_dmg_dead / without.mean_turns_dead
+    avg_player_per_turn = without.mean_damage_taken_dead / without.mean_turns_dead
+    turns_worth = extra_enemy / avg_enemy_per_turn
+    return turns_worth * avg_player_per_turn
+
+
+def marginal_probe_benefit(
+    without: SimDistribution,
+    with_: SimDistribution,
+) -> float:
+    """Estimate HP saved by the potion from a WITH vs WITHOUT probe pair."""
+    hp = without.expected_damage - with_.expected_damage
+    survival = (without.death_rate - with_.death_rate) * without.start_hp
+    hp = max(hp, survival)
+
+    if (
+        without.death_rate >= _DEATH_PROGRESS_DEATH_RATE
+        and with_.death_rate >= _DEATH_PROGRESS_DEATH_RATE
+    ):
+        hp = max(hp, _death_progress_benefit(without, with_))
+
+    return max(0.0, hp)
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +333,11 @@ def probe_encounter(
         mean_damage_alive=float(stats.get("mean_damage_alive", float("nan"))),
         max_hp_gained_mean=float(stats.get("pv_max_hp_gained_mean", 0.0)),
         max_hp_gained_std=float(stats.get("pv_max_hp_gained_std", 0.0)),
+        mean_enemy_dmg_dead=float(stats.get("mean_enemy_dmg_dead", float("nan"))),
+        mean_turns_dead=float(stats.get("mean_turns_dead", float("nan"))),
+        mean_damage_taken_dead=float(
+            stats.get("mean_damage_taken_dead", float("nan"))
+        ),
     )
 
 
