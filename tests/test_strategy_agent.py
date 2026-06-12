@@ -459,11 +459,9 @@ class TestRunAct1:
         """run_act1 with a mock strategy agent delegates card picks."""
         mock_agent = MagicMock()
         mock_agent.pick_card.return_value = "Anger"
-        # plan_route still needs to return a real path; let the default base
-        # walker do it via the mock by delegating to a real BaseStrategyAgent.
         from sts_agent.strategy import BaseStrategyAgent
         real_router = BaseStrategyAgent(seed=42)
-        mock_agent.plan_route.side_effect = real_router.plan_route
+        mock_agent.pick_branch.side_effect = real_router.pick_branch
         mock_agent.pick_neow.side_effect = real_router.pick_neow
         mock_agent.pick_rest_choice.side_effect = real_router.pick_rest_choice
         mock_agent.pick_event_choice.side_effect = real_router.pick_event_choice

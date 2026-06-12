@@ -134,51 +134,28 @@ class BaseStrategyAgent:
         """Record a visited map coordinate for shop-count heuristics."""
         self._map_committed_path.append(coord)
 
-    def pick_map_start(
-        self,
-        sts_map: StSMap,
-        character: Character,
-        seed: int,
-    ) -> tuple[int, int]:
-        """Pick a floor-0 starting column using branch scoring."""
-        from .map_routing import pick_map_start_coord
-
-        self.begin_map_run(sts_map, seed)
-        floor0_nodes = sts_map.nodes.get(0, [])
-        candidates = [(0, n.x) for n in floor0_nodes if n.edges]
-        if not candidates:
-            return (0, 0)
-        return pick_map_start_coord(
-            sts_map,
-            character,
-            candidates,
-            seed,
-            self.rng,
-            self._encounter_queue,
-            config=self._branch_probe_config(),
-        )
-
     def pick_branch(
         self,
         sts_map: StSMap,
         character: Character,
-        current: tuple[int, int],
+        current: tuple[int, int] | None,
         seed: int,
     ) -> tuple[int, int]:
-        """Pick the next map step at a fork using heuristic + probe weights."""
-        from .map_routing import count_shops_visited, pick_branch_coord
+        """Pick the next map step at a fork using heuristic + probe weights.
 
-        f, x = current
-        node = sts_map.get_node(f, x)
-        if node is None or not node.edges:
-            return current
-        edges = [_normalize_map_edge(f, e) for e in node.edges]
-        shops = count_shops_visited(sts_map, self._committed_path())
-        return pick_branch_coord(
+        Pass ``current=None`` after Neow to choose the first map column.
+        """
+        from .map_routing import count_shops_visited, pick_fork_coord
+
+        shops = (
+            0
+            if current is None
+            else count_shops_visited(sts_map, self._committed_path())
+        )
+        return pick_fork_coord(
             sts_map,
             character,
             current,
-            edges,
             seed,
             self.rng,
             self._encounter_queue,
@@ -188,33 +165,6 @@ class BaseStrategyAgent:
 
     def _committed_path(self) -> list[tuple[int, int]]:
         return self._map_committed_path
-
-    def plan_route(
-        self,
-        sts_map: StSMap,
-        character: Character,
-        seed: int,
-    ) -> list[tuple[int, int]]:
-        """Replay pick_map_start + pick_branch with a frozen character snapshot."""
-        self.begin_map_run(sts_map, seed)
-        path: list[tuple[int, int]] = []
-        current = self.pick_map_start(sts_map, character, seed)
-        if not sts_map.get_node(*current):
-            return path
-        path.append(current)
-
-        while True:
-            f, x = current
-            node = sts_map.get_node(f, x)
-            if node is None or not node.edges:
-                break
-            if len(node.edges) == 1:
-                next_coord = _normalize_map_edge(f, node.edges[0])
-            else:
-                next_coord = self.pick_branch(sts_map, character, current, seed)
-            path.append(next_coord)
-            current = next_coord
-        return path
 
     # ------------------------------------------------------------------
     # Card rewards

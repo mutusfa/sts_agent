@@ -102,7 +102,7 @@ def _rarity_rank(card_id: str | None) -> int:
 class SimStrategyAgent(BaseStrategyAgent):
     """Simulation-driven card-pick + route-planning agent using fast MCTS probes.
 
-    Overrides :meth:`pick_card` and :meth:`plan_route`; inherits the random
+    Overrides :meth:`pick_card`; inherits probe-based map routing and random
     defaults from :class:`BaseStrategyAgent` for everything else.
 
     Parameters
@@ -301,12 +301,3 @@ class SimStrategyAgent(BaseStrategyAgent):
             max_nodes=min(self.sim_nodes, 1000),
             simulations=min(self.sim_sims, 1000),
         )
-
-    def plan_route(
-        self,
-        sts_map: "StSMap",
-        character: Character,
-        seed: int,
-    ) -> list[tuple[int, int]]:
-        """Choose a path through the map using shared map-routing heuristics."""
-        return super().plan_route(sts_map, character, seed)

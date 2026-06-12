@@ -14,6 +14,8 @@ from sts_env.run.shop import generate_shop
 
 from sts_agent.strategy import BaseStrategyAgent
 
+from tests.map_helpers import walk_map
+
 
 # ---------------------------------------------------------------------------
 # pick_neow
@@ -47,23 +49,23 @@ class TestPickNeow:
 
 
 # ---------------------------------------------------------------------------
-# plan_route
+# Map fork routing
 # ---------------------------------------------------------------------------
 
 
-class TestPlanRoute:
+class TestWalkMap:
     def test_walks_to_boss(self):
         agent = BaseStrategyAgent(seed=1)
         sts_map = generate_act1_map(seed=1)
-        path = agent.plan_route(sts_map, Character.ironclad(), seed=1)
-        assert path, "plan_route returned empty path"
+        path = walk_map(agent, sts_map, Character.ironclad(), seed=1)
+        assert path, "walk_map returned empty path"
         # Boss row is floor 15 (MAP_HEIGHT - 1), after the 15 regular floors (0-14)
         assert path[-1][0] == 15
 
     def test_each_step_is_valid_edge(self):
         agent = BaseStrategyAgent(seed=7)
         sts_map = generate_act1_map(seed=7)
-        path = agent.plan_route(sts_map, Character.ironclad(), seed=7)
+        path = walk_map(agent, sts_map, Character.ironclad(), seed=7)
         for prev, nxt in zip(path, path[1:]):
             prev_node = sts_map.get_node(*prev)
             assert prev_node is not None
@@ -74,7 +76,7 @@ class TestPlanRoute:
         a = BaseStrategyAgent(seed=99)
         b = BaseStrategyAgent(seed=99)
         ch = Character.ironclad()
-        assert a.plan_route(sts_map, ch, seed=3) == b.plan_route(sts_map, ch, seed=3)
+        assert walk_map(a, sts_map, ch, seed=3) == walk_map(b, sts_map, ch, seed=3)
 
 
 # ---------------------------------------------------------------------------

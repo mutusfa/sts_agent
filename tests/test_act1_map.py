@@ -28,16 +28,14 @@ class _GreedyAgent(BattleAgent):
 class _FirstEdgeStrategy(BaseStrategyAgent):
     """Deterministic map routing: always take the first outgoing edge."""
 
-    def pick_map_start(self, sts_map, character, seed):
-        self.begin_map_run(sts_map, seed)
-        for node in sts_map.nodes.get(0, []):
-            if node.edges:
-                return (0, node.x)
-        return (0, 0)
-
     def pick_branch(self, sts_map, character, current, seed):
         from sts_agent.strategy.base import _normalize_map_edge
 
+        if current is None:
+            for node in sts_map.nodes.get(0, []):
+                if node.edges:
+                    return (0, node.x)
+            return (0, 0)
         f, x = current
         node = sts_map.get_node(f, x)
         if node is None or not node.edges:
@@ -129,7 +127,7 @@ class TestAct1MapStrategyAgentIntegration:
 
         # Subclass that records pick_card calls but inherits all other random
         # defaults from BaseStrategyAgent so the run loop has well-typed
-        # return values for plan_route, pick_neow, etc.
+        # return values for pick_branch, pick_neow, etc.
         class _RecordingAgent(BaseStrategyAgent):
             def __init__(self, seed):
                 super().__init__(seed=seed)

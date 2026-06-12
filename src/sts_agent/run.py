@@ -196,7 +196,6 @@ class _RunAgentAdapter:
         self._strategy = strategy_agent
         self._potion_tracker = potion_tracker or _PotionTracker()
         self._path: list[tuple[int, int]] = []
-        self._path_idx: int = 0
         self._combat_count: int = 0
         self._sts_map: object = None
         self._run_seed: int = 0
@@ -206,14 +205,12 @@ class _RunAgentAdapter:
         self._sts_map = sts_map
         self._run_seed = seed
         self._path = []
-        self._path_idx = 0
         self._combat_count = 0
         self._walk_started = False
         self._strategy.begin_map_run(sts_map, seed)
 
     def on_map_step(self, coord: tuple[int, int]) -> None:
         self._path.append(coord)
-        self._path_idx = len(self._path) - 1
         self._walk_started = True
         self._strategy.on_map_step(coord)
 
@@ -307,19 +304,8 @@ class _RunAgentAdapter:
     def pick_neow(self, options):
         return self._strategy.pick_neow(options)
 
-    def pick_map_start(self, sts_map, character, seed):
-        self.begin_map_run(sts_map, seed)
-        return self._strategy.pick_map_start(sts_map, character, seed)
-
     def pick_branch(self, sts_map, character, current, seed):
         return self._strategy.pick_branch(sts_map, character, current, seed)
-
-    def plan_route(self, sts_map, character, seed):
-        self.begin_map_run(sts_map, seed)
-        path = self._strategy.plan_route(sts_map, character, seed)
-        self._path = list(path)
-        self._path_idx = 0
-        return path
 
     def pick_card(self, character, card_choices, upcoming_encounters, seed, **kwargs):
         return self._strategy.pick_card(

@@ -7,9 +7,10 @@ normalized to monster fights.  Elite ends up slightly above rest (~2–2.5 vs 2)
 which matches rough player intuition: elites are worth a bit more than healing,
 but not so much that the router blindly chains them.
 
-**Crossroad decisions** (``pick_branch_coord``) multiply that path score by a
-*local* survival estimate: chained MCTS probes over the next few rooms, with HP
-carryover and post-combat relic heals.  This works for most forks — low HP
+**Fork decisions** (``pick_fork_coord``) multiply that path score by a *local*
+survival estimate: chained MCTS probes over the next few rooms, with HP
+carryover and post-combat relic heals.  Pass ``current=None`` after Neow to
+choose the first map column; pass a map coordinate at later forks.  Low HP
 steers away from imminent elites; distant elites on a high-reward path are not
 heavily penalized by the static score alone.
 
@@ -591,63 +592,62 @@ def weighted_choice(rng: RNG, items: list[tuple[int, int]], weights: list[float]
     return items[-1]
 
 
-def pick_map_start_coord(
+def _fork_heuristic_and_prefix(
     sts_map: StSMap,
-    character: Character,
-    starts: list[tuple[int, int]],
-    seed: int,
-    rng: RNG,
-    encounter_queue: EncounterQueue | None,
-    *,
-    probe_cache: dict[tuple, SimDistribution] | None = None,
-    config: ProbeConfig | None = None,
-) -> tuple[int, int]:
-    if len(starts) == 1:
-        return starts[0]
-
-    weights: list[float] = []
-    cache = probe_cache if probe_cache is not None else {}
-    for start in starts:
-        scored = top_paths(sts_map, start, shops_visited=0, k=1)
-        heuristic = scored[0].score if scored else 0.0
-        prefix = scored[0].coords[:PREFIX_ROOM_COUNT] if scored else [start]
-        survival = probe_prefix_survival(
-            character,
-            sts_map,
-            prefix,
-            seed,
-            encounter_queue,
-            probe_cache=cache,
-            config=config,
-        )
-        weights.append(max(heuristic * survival, 0.0))
-    return weighted_choice(rng, starts, weights)
-
-
-def pick_branch_coord(
-    sts_map: StSMap,
-    character: Character,
-    current: tuple[int, int],
-    edges: list[tuple[int, int]],
-    seed: int,
-    rng: RNG,
-    encounter_queue: EncounterQueue | None,
+    current: tuple[int, int] | None,
+    option: tuple[int, int],
     *,
     shops_visited: int,
+) -> tuple[float, list[tuple[int, int]]]:
+    if current is None:
+        scored = top_paths(sts_map, option, shops_visited=0, k=1)
+        if not scored:
+            return 0.0, [option]
+        return scored[0].score, scored[0].coords[:PREFIX_ROOM_COUNT]
+    heuristic = best_path_score_from_edge(
+        sts_map, current, option, shops_visited=shops_visited,
+    )
+    prefix = prefix_coords_for_edge(
+        sts_map, current, option, shops_visited=shops_visited,
+    )
+    return heuristic, prefix
+
+
+def pick_fork_coord(
+    sts_map: StSMap,
+    character: Character,
+    current: tuple[int, int] | None,
+    seed: int,
+    rng: RNG,
+    encounter_queue: EncounterQueue | None,
+    *,
+    shops_visited: int = 0,
     probe_cache: dict[tuple, SimDistribution] | None = None,
     config: ProbeConfig | None = None,
 ) -> tuple[int, int]:
-    if len(edges) == 1:
-        return edges[0]
+    """Pick the next map step at a fork (or first column when *current* is None)."""
+    if current is None:
+        floor0_nodes = sts_map.nodes.get(0, [])
+        options = [(0, n.x) for n in floor0_nodes if n.edges]
+        if not options:
+            return (0, 0)
+        effective_shops = 0
+    else:
+        f, x = current
+        node = sts_map.get_node(f, x)
+        if node is None or not node.edges:
+            return current
+        options = [_normalize_edge(f, e) for e in node.edges]
+        effective_shops = shops_visited
+
+    if len(options) == 1:
+        return options[0]
 
     weights: list[float] = []
     cache = probe_cache if probe_cache is not None else {}
-    for edge in edges:
-        heuristic = best_path_score_from_edge(
-            sts_map, current, edge, shops_visited=shops_visited,
-        )
-        prefix = prefix_coords_for_edge(
-            sts_map, current, edge, shops_visited=shops_visited,
+    for option in options:
+        heuristic, prefix = _fork_heuristic_and_prefix(
+            sts_map, current, option, shops_visited=effective_shops,
         )
         survival = probe_prefix_survival(
             character,
@@ -660,4 +660,4 @@ def pick_branch_coord(
         )
         weights.append(max(heuristic * survival, 0.0))
 
-    return weighted_choice(rng, edges, weights)
+    return weighted_choice(rng, options, weights)
