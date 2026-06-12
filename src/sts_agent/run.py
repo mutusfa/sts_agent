@@ -466,7 +466,8 @@ def run_act1(
         ``BaseStrategyAgent`` seeded from ``seed`` is used.
     use_map:
         If True (default), generate a branching map and walk it (15 floors).
-        If False, use the old linear encounter list (8 floors, backwards compat).
+        If False, use the fixed 8-floor linear encounter list.  A single-path
+        map is still registered for scored map views.
 
     Returns
     -------
@@ -486,6 +487,12 @@ def run_act1(
         )
 
     agent = _RunAgentAdapter(planner_or_agent, strategy_agent)
+    if not use_map:
+        from sts_env.run.scenarios import act1_encounters
+
+        from .strategy.map_routing import linear_scenario_map
+
+        agent.begin_map_run(linear_scenario_map(act1_encounters(seed), seed), seed)
     potion_tracker = agent._potion_tracker
     observer = _CombinedObserver(potion_tracker, _MlflowObserver())
     result = _env_run_act1(seed, agent, use_map=use_map, observer=observer)

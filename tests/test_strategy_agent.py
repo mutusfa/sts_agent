@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, call, patch
 
 from sts_env.run.character import Character
 from sts_env.run.map import StSMap, MapNode, RoomType, generate_act1_map
+from tests.map_helpers import begin_linear_map, ironclad_on_linear_map
 from sts_agent.run import run_act1, RunResult
 from sts_agent.battle.mcts import MCTSPlanner
 from sts_agent.strategy.llm_agent import (
@@ -55,6 +56,12 @@ def _make_minimal_map() -> StSMap:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _llm_agent_with_map() -> StrategyAgent:
+    agent = StrategyAgent()
+    begin_linear_map(agent)
+    return agent
 
 
 def _ironclad() -> Character:
@@ -590,8 +597,12 @@ class TestPickCardMapAware:
             inst.side_effect = call_side_effect
             return inst
 
+        fake_map = _make_minimal_map()
         with patch("sts_agent.strategy.llm_agent.dspy.ReActV2", side_effect=fake_react_factory):
-            agent.pick_card(_ironclad(), ["Anger", "Inflame", "Flex"], [], seed=1)
+            agent.pick_card(
+                _ironclad(), ["Anger", "Inflame", "Flex"], [], seed=1,
+                sts_map=fake_map, current_position=(0, 3),
+            )
 
         choices = captured_kwargs["card_choices"]
         assert isinstance(choices, list)
@@ -624,9 +635,24 @@ class TestPickCardMapAware:
         assert "map_view" in captured_kwargs
         assert "Top 3 paths to boss:" in captured_kwargs["map_view"]
 
-    def test_pick_card_works_without_map(self):
-        """Without sts_map the call still works and map_view is a stub string."""
+    def test_pick_card_raises_without_map(self):
+        """Without sts_map/current_position, pick_card fails fast."""
+        from sts_agent.strategy.map_routing import MapViewError
+
         agent = StrategyAgent()
+
+        with patch("sts_agent.strategy.llm_agent.dspy.ReActV2"):
+            with pytest.raises(MapViewError, match="sts_map is required"):
+                agent.pick_card(_ironclad(), ["Anger", "Inflame", "Flex"], [], seed=1)
+
+    def test_pick_card_scores_linear_map_from_begin_map_run(self):
+        """Linear encounter lists still produce a scored map_view."""
+        from sts_env.run.scenarios import act1_encounters
+
+        from sts_agent.strategy.map_routing import linear_scenario_map
+
+        agent = StrategyAgent()
+        agent.begin_map_run(linear_scenario_map(act1_encounters(1), seed=1), seed=1)
 
         captured_kwargs: dict = {}
 
@@ -640,13 +666,15 @@ class TestPickCardMapAware:
             inst.side_effect = call_side_effect
             return inst
 
-        with patch("sts_agent.strategy.llm_agent.dspy.ReActV2", side_effect=fake_react_factory):
-            agent.pick_card(_ironclad(), ["Anger", "Inflame", "Flex"], [], seed=1)
+        char = _ironclad()
+        char.floor = 3
+        char.map_x = 0
 
-        assert "map_view" in captured_kwargs
-        mv = captured_kwargs["map_view"]
-        assert isinstance(mv, str)
-        assert mv  # not empty — should be the "no map" stub message
+        with patch("sts_agent.strategy.llm_agent.dspy.ReActV2", side_effect=fake_react_factory):
+            agent.pick_card(char, ["Anger", "Inflame", "Flex"], [], seed=1)
+
+        assert "Top 3 paths to boss:" in captured_kwargs["map_view"]
+        assert "Path A" in captured_kwargs["map_view"]
 
 
 # ---------------------------------------------------------------------------
@@ -830,7 +858,7 @@ class TestPickEventChoiceUsesReAct:
         return event
 
     def test_pick_event_choice_uses_react_not_predict(self):
-        agent = StrategyAgent()
+        agent = _llm_agent_with_map()
         event = self._make_event()
 
         react_result = MagicMock()
@@ -841,12 +869,12 @@ class TestPickEventChoiceUsesReAct:
 
         with patch("sts_agent.strategy.llm_agent.dspy.ReActV2", react_class):
             with patch("sts_agent.strategy.llm_agent.dspy.Predict") as mock_predict:
-                agent.pick_event_choice(event, _ironclad())
+                agent.pick_event_choice(event, ironclad_on_linear_map())
                 react_class.assert_called()
                 mock_predict.assert_not_called()
 
     def test_pick_event_choice_returns_valid_index(self):
-        agent = StrategyAgent()
+        agent = _llm_agent_with_map()
         event = self._make_event(n_choices=3)
 
         react_result = MagicMock()
@@ -855,7 +883,7 @@ class TestPickEventChoiceUsesReAct:
         react_class = MagicMock(return_value=react_instance)
 
         with patch("sts_agent.strategy.llm_agent.dspy.ReActV2", react_class):
-            idx = agent.pick_event_choice(event, _ironclad())
+            idx = agent.pick_event_choice(event, ironclad_on_linear_map())
 
         assert idx == 1
 
@@ -900,14 +928,14 @@ class TestPickEventChoicePassesEventEncounters:
 
     def test_combat_event_passes_encounter_ids(self):
         """Dead Adventurer-style event: encounter IDs forwarded as flat list."""
-        agent = StrategyAgent()
+        agent = _llm_agent_with_map()
         event = self._make_event(
             possible_encounters=("Three Sentries", "Gremlin Nob", "lagavulin_event")
         )
         captured, factory = self._capture_kwargs()
 
         with patch("sts_agent.strategy.llm_agent.dspy.ReActV2", side_effect=factory):
-            agent.pick_event_choice(event, _ironclad())
+            agent.pick_event_choice(event, ironclad_on_linear_map())
 
         assert captured["event_encounters"] == [
             "Three Sentries",
@@ -917,12 +945,12 @@ class TestPickEventChoicePassesEventEncounters:
 
     def test_non_combat_event_passes_empty_list(self):
         """Events with no combat encounters forward an empty list."""
-        agent = StrategyAgent()
+        agent = _llm_agent_with_map()
         event = self._make_event(possible_encounters=())
         captured, factory = self._capture_kwargs()
 
         with patch("sts_agent.strategy.llm_agent.dspy.ReActV2", side_effect=factory):
-            agent.pick_event_choice(event, _ironclad())
+            agent.pick_event_choice(event, ironclad_on_linear_map())
 
         assert captured["event_encounters"] == []
 
@@ -967,29 +995,29 @@ class TestPickEventChoiceExtraContext:
 
     def test_extra_context_appended_to_event_description(self):
         """When extra_context is provided it must appear in event_description."""
-        agent = StrategyAgent()
+        agent = _llm_agent_with_map()
         event = self._make_event()
         captured, factory = self._capture_kwargs()
 
         with patch("sts_agent.strategy.llm_agent.dspy.ReActV2", side_effect=factory):
-            agent.pick_event_choice(event, _ironclad(), extra_context="pool: Strike x3")
+            agent.pick_event_choice(event, ironclad_on_linear_map(), extra_context="pool: Strike x3")
 
         assert "pool: Strike x3" in captured["event_description"]
 
     def test_empty_extra_context_not_appended(self):
         """When extra_context is empty, event_description should not have trailing Context."""
-        agent = StrategyAgent()
+        agent = _llm_agent_with_map()
         event = self._make_event()
         captured, factory = self._capture_kwargs()
 
         with patch("sts_agent.strategy.llm_agent.dspy.ReActV2", side_effect=factory):
-            agent.pick_event_choice(event, _ironclad(), extra_context="")
+            agent.pick_event_choice(event, ironclad_on_linear_map(), extra_context="")
 
         assert "Context:" not in captured["event_description"]
 
     def test_reset_budget_false_does_not_reset_start_time(self):
         """reset_budget=False must not overwrite _start_time."""
-        agent = StrategyAgent()
+        agent = _llm_agent_with_map()
         event = self._make_event()
         sentinel = 12345.0
         agent._start_time = sentinel
@@ -1001,7 +1029,7 @@ class TestPickEventChoiceExtraContext:
         react_class = MagicMock(return_value=react_instance)
 
         with patch("sts_agent.strategy.llm_agent.dspy.ReActV2", react_class):
-            agent.pick_event_choice(event, _ironclad(), reset_budget=False)
+            agent.pick_event_choice(event, ironclad_on_linear_map(), reset_budget=False)
 
         assert agent._start_time == sentinel
 
@@ -1018,8 +1046,10 @@ class TestShop:
         from sts_env.combat.rng import RNG
         from sts_env.run.shop import generate_shop
 
-        agent = StrategyAgent()
+        agent = _llm_agent_with_map()
         ch = Character.ironclad()
+        ch.floor = 3
+        ch.map_x = 0
         ch.gold = 300
         inv = generate_shop(RNG(0), ch)
 

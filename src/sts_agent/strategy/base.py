@@ -56,7 +56,8 @@ class BaseStrategyAgent:
         self._map_committed_path: list[tuple[int, int]] = []
 
     def _current_map_position(
-        self, character: Character,
+        self,
+        character: Character,
     ) -> tuple[int, int] | None:
         """Return map (floor, x) from character state, or None if unknown."""
         if character.map_x is None:
@@ -70,6 +71,7 @@ class BaseStrategyAgent:
 
     def _branch_probe_config(self):
         from .map_routing import ProbeConfig
+
         return ProbeConfig(max_nodes=200, simulations=30)
 
     # ------------------------------------------------------------------
@@ -102,7 +104,8 @@ class BaseStrategyAgent:
         if self._encounter_queue is None:
             return None
         return self._encounter_queue.possible_encounters(
-            self._hallway_seen, self._elites_seen,
+            self._hallway_seen,
+            self._elites_seen,
         )
 
     # ------------------------------------------------------------------
@@ -292,7 +295,9 @@ class BaseStrategyAgent:
     # ------------------------------------------------------------------
 
     def pick_card_to_remove(
-        self, character: Character, **kwargs: object,
+        self,
+        character: Character,
+        **kwargs: object,
     ) -> str | None:
         """Pick a random card to remove from the deck. None = skip."""
         if not character.deck:
@@ -300,7 +305,9 @@ class BaseStrategyAgent:
         return self.rng.choice(character.deck)
 
     def pick_card_to_transform(
-        self, character: Character, **kwargs: object,
+        self,
+        character: Character,
+        **kwargs: object,
     ) -> str | None:
         """Pick a random card to transform. None = skip."""
         if not character.deck:
@@ -308,7 +315,9 @@ class BaseStrategyAgent:
         return self.rng.choice(character.deck)
 
     def pick_card_to_upgrade(
-        self, character: Character, **kwargs: object,
+        self,
+        character: Character,
+        **kwargs: object,
     ) -> str | None:
         """Pick a card to upgrade via event (prefers non-upgraded). None = skip."""
         return _best_upgrade_target(character)
@@ -389,7 +398,11 @@ class BaseStrategyAgent:
 
         # Try to evaluate potion costs
         try:
-            from .evaluate_potions import _eval_single, _select_targets, evaluate_potions
+            from .evaluate_potions import (
+                _eval_single,
+                _select_targets,
+                evaluate_potions,
+            )
 
             targets = _select_targets([], None)
             costs = evaluate_potions(character, [], 0)

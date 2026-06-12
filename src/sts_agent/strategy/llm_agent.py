@@ -617,8 +617,13 @@ def _make_shop_tools(
 
         def _sim_relic(et: str, ei: str, s: int, n: int) -> SimDistribution:
             return probe_with_relic(
-                character, relic_id, et, ei, s,
-                max_nodes=max_nodes, simulations=n,
+                character,
+                relic_id,
+                et,
+                ei,
+                s,
+                max_nodes=max_nodes,
+                simulations=n,
             )
 
         formatted = _probe_encounter(
@@ -739,35 +744,6 @@ class CardPickSignature(StandardContext):
     )
     pick: str = dspy.OutputField(
         desc="Exact card ID to pick from the choices, or 'skip' to skip all rewards"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Map view rendering
-# ---------------------------------------------------------------------------
-
-_MAP_NO_MAP_STUB = "(no map available — linear scenario)"
-
-
-def _format_map_view(
-    sts_map: StSMap | None,
-    character: Character | None,
-    current_position: tuple[int, int] | None,
-    *,
-    committed_path: list[tuple[int, int]] | None = None,
-) -> str:
-    """Render scored top-3 path summary for LLM context."""
-    if sts_map is None or character is None or current_position is None:
-        return _MAP_NO_MAP_STUB
-
-    from .map_routing import count_shops_visited, format_map_view, top_paths
-
-    shops = count_shops_visited(sts_map, committed_path or [])
-    scored = top_paths(sts_map, current_position, shops_visited=shops, k=3)
-    return (
-        "```text\n"
-        f"{format_map_view(sts_map, character, current_position, scored)}\n"
-        "```"
     )
 
 
@@ -992,9 +968,42 @@ class StrategyAgent(BaseStrategyAgent):
                 f"Strategy budget of {self.timeout}s exceeded (elapsed: {elapsed:.1f}s)"
             )
 
+    def _resolve_map_for_view(
+        self,
+        character: Character,
+        sts_map: StSMap | None,
+        current_position: tuple[int, int] | None,
+    ) -> tuple[StSMap | None, tuple[int, int] | None]:
+        effective_map = sts_map if sts_map is not None else self._sts_map
+        effective_pos = current_position or self._current_map_position(character)
+        return effective_map, effective_pos
+
+    def _build_map_view(
+        self,
+        character: Character,
+        sts_map: StSMap | None,
+        current_position: tuple[int, int] | None,
+    ) -> str:
+        from .map_routing import MapViewError, build_scored_map_view
+
+        effective_map, effective_pos = self._resolve_map_for_view(
+            character,
+            sts_map,
+            current_position,
+        )
+        if effective_map is None:
+            raise MapViewError("sts_map is required for scored map view")
+        if effective_pos is None:
+            raise MapViewError("current_position is required for scored map view")
+        return build_scored_map_view(
+            effective_map,
+            character,
+            effective_pos,
+            committed_path=self._map_committed_path,
+        )
+
     # -- main entry point ----------------------------------------------------
 
-    @mlflow.trace(name="pick_card")
     def pick_card(
         self,
         character: Character,
@@ -1005,44 +1014,30 @@ class StrategyAgent(BaseStrategyAgent):
         sts_map: StSMap | None = None,
         current_position: tuple[int, int] | None = None,
     ) -> str | None:
-        """Pick a card from reward choices using LLM + simulation.
+        """Pick a card from reward choices using LLM + simulation."""
+        map_view = self._build_map_view(character, sts_map, current_position)
+        return self._pick_card_traced(
+            character,
+            card_choices,
+            seed,
+            map_view,
+        )
 
-        Parameters
-        ----------
-        character:
-            Current character state (deep-copied by simulate tools).
-        card_choices:
-            3 card IDs to choose from.
-        upcoming_encounters:
-            Accepted for protocol compatibility; not used — the LLM reads
-            upcoming room types from the map view instead.
-        seed:
-            Master seed for deterministic simulations.
-        sts_map:
-            The full Act 1 map.  When provided (map mode), the LLM receives
-            a rendered grid with room types and the current position marked.
-        current_position:
-            ``(floor, x)`` of the node just completed, used to mark the map.
-
-        The orchestrator sets ``self.possible_encounters`` before calling
-        this method.  It contains possible remaining encounters derived from
-        open knowledge (pools + rules + encounters seen), with keys
-        ``monster_weak``, ``monster_strong``, ``elite``, ``boss``.
-
-        Returns
-        -------
-        The picked card ID, or ``None`` if skipped.
-        """
+    @mlflow.trace(name="pick_card")
+    def _pick_card_traced(
+        self,
+        character: Character,
+        card_choices: list[str],
+        seed: int,
+        map_view: str,
+    ) -> str | None:
+        """Traced pick_card body — inputs exclude raw ``sts_map`` (see ``map_view``)."""
         ensure_lm()
         self._start_time = time.time()
         self._timed_out = False
         self._sim_log = []
 
         card_infos = [_card_info(c) for c in card_choices]
-        map_view = _format_map_view(
-            sts_map, character, current_position,
-            committed_path=self._map_committed_path,
-        )
         encounters_view = _format_possible_encounters(self.get_possible_encounters())
 
         span = mlflow.get_current_active_span()
@@ -1052,7 +1047,7 @@ class StrategyAgent(BaseStrategyAgent):
                     "character_state": character.summary(),
                     "card_choices": ", ".join(c.card_id for c in card_infos),
                     "seed": seed,
-                    "map_view": map_view[:500],  # truncate for span storage
+                    "map_view": map_view,
                 }
             )
 
@@ -1171,7 +1166,6 @@ class StrategyAgent(BaseStrategyAgent):
 
     # -- event entry point ----------------------------------------------------
 
-    @mlflow.trace(name="pick_event_choice")
     def pick_event_choice(
         self,
         event: "EventSpec",
@@ -1197,7 +1191,6 @@ class StrategyAgent(BaseStrategyAgent):
             slot-picks inside a single Match and Keep event) share one
             budget window.
         """
-        ensure_lm()
         if reset_budget:
             self._start_time = time.time()
             self._timed_out = False
@@ -1206,17 +1199,42 @@ class StrategyAgent(BaseStrategyAgent):
         if not event.choices:
             return 0
 
-        # Build context --------------------------------------------------
         sts_map = kwargs.get("sts_map")
         current_position = kwargs.get("current_position")
-        map_view = _format_map_view(
-            sts_map, character, current_position,
-            committed_path=self._map_committed_path,
-        )
+        map_view = self._build_map_view(character, sts_map, current_position)
         encounters_view = _format_possible_encounters(self.get_possible_encounters())
-
-        # Format choices with their labels
         choice_labels = [f"[{i}] {ch.label}" for i, ch in enumerate(event.choices)]
+        choice_names = [ch.label for ch in event.choices]
+        event_description = f"Event: {event.event_id}\n{event.description}"
+        if extra_context:
+            event_description += f"\n\nContext: {extra_context}"
+        event_encounters = list(getattr(event, "possible_encounters", ()) or ())
+
+        return self._pick_event_choice_traced(
+            character,
+            event.event_id,
+            event_description,
+            choice_labels,
+            choice_names,
+            event_encounters,
+            map_view,
+            encounters_view,
+        )
+
+    @mlflow.trace(name="pick_event_choice")
+    def _pick_event_choice_traced(
+        self,
+        character: Character,
+        event_id: str,
+        event_description: str,
+        choice_labels: list[str],
+        choice_names: list[str],
+        event_encounters: list[str],
+        map_view: str,
+        encounters_view: str,
+    ) -> int:
+        """Traced event pick — inputs exclude raw ``EventSpec`` / ``sts_map``."""
+        ensure_lm()
 
         tools = _make_tools(
             character,
@@ -1227,13 +1245,6 @@ class StrategyAgent(BaseStrategyAgent):
             possible_encounters=self.get_possible_encounters(),
         )
 
-        # Build event description, appending extra_context if provided
-        event_description = f"Event: {event.event_id}\n{event.description}"
-        if extra_context:
-            event_description += f"\n\nContext: {extra_context}"
-
-        # LLM call -------------------------------------------------------
-        event_encounters = list(getattr(event, "possible_encounters", ()) or ())
         try:
             react = dspy.ReActV2(EventPickSignature, tools=tools, max_iters=8)
             result = react(
@@ -1250,39 +1261,37 @@ class StrategyAgent(BaseStrategyAgent):
             reasoning = getattr(result, "reasoning", "")
             missing = getattr(result, "missing_context", "")
 
-            # Parse choice index
             try:
                 idx = int(raw_choice)
             except ValueError:
-                # Try extracting first integer from the string
                 import re
 
                 m = re.search(r"\d+", raw_choice)
                 idx = int(m.group()) if m else 0
 
-            # Clamp to valid range
-            idx = max(0, min(idx, len(event.choices) - 1))
+            idx = max(0, min(idx, len(choice_names) - 1))
+            choice_label = choice_names[idx]
 
             log.info(
                 "LLM event %s: choice=%d (%s) | reasoning=%s | missing=%s",
-                event.event_id,
+                event_id,
                 idx,
-                event.choices[idx].label,
+                choice_label,
                 reasoning[:120],
                 missing[:120],
             )
 
-            # Log missing context as MLflow attributes for analysis
             span = mlflow.get_current_active_span()
             if span:
                 span.set_attributes(
                     {
-                        "event_id": event.event_id,
+                        "event_id": event_id,
                         "choice_idx": idx,
-                        "choice_label": event.choices[idx].label,
+                        "choice_label": choice_label,
                         "reasoning": reasoning[:500],
                         "missing_context": missing[:500],
-                        "num_choices": len(event.choices),
+                        "num_choices": len(choice_names),
+                        "map_view": map_view,
                     }
                 )
 
@@ -1291,13 +1300,12 @@ class StrategyAgent(BaseStrategyAgent):
         except Exception:
             log.exception(
                 "LLM event %s: error, falling back to choice 0",
-                event.event_id,
+                event_id,
             )
             return 0
 
     # -- rest site entry point ------------------------------------------------
 
-    @mlflow.trace(name="pick_rest_choice")
     def pick_rest_choice(
         self,
         character: Character,
@@ -1307,12 +1315,10 @@ class StrategyAgent(BaseStrategyAgent):
 
         Uses ``self.get_possible_encounters()`` to get fresh encounter info.
         """
-        ensure_lm()
         self._start_time = time.time()
         self._timed_out = False
         self._sim_log = []
 
-        # Gather upgradeable cards (unupgraded, with an upgrade delta)
         from sts_env.combat.cards import get_spec
 
         upgradeable = sorted(
@@ -1321,11 +1327,26 @@ class StrategyAgent(BaseStrategyAgent):
 
         sts_map = kwargs.get("sts_map")
         current_position = kwargs.get("current_position")
-        map_view = _format_map_view(
-            sts_map, character, current_position,
-            committed_path=self._map_committed_path,
-        )
+        map_view = self._build_map_view(character, sts_map, current_position)
         encounters_view = _format_possible_encounters(self.get_possible_encounters())
+
+        return self._pick_rest_choice_traced(
+            character,
+            upgradeable,
+            map_view,
+            encounters_view,
+        )
+
+    @mlflow.trace(name="pick_rest_choice")
+    def _pick_rest_choice_traced(
+        self,
+        character: Character,
+        upgradeable: list[str],
+        map_view: str,
+        encounters_view: str,
+    ) -> RestResult:
+        """Traced rest pick — inputs exclude raw ``sts_map``."""
+        ensure_lm()
 
         tools = _make_tools(
             character,
@@ -1351,19 +1372,16 @@ class StrategyAgent(BaseStrategyAgent):
                 parts = raw_pick.split(None, 1)
                 if len(parts) == 2:
                     card_id = parts[1].strip()
-                    # Verify the card is actually upgradeable
                     if card_id in upgradeable:
                         log.info("LLM strategy rest: upgrade %s", card_id)
                         return RestResult(
                             choice=RestChoice.UPGRADE,
                             card_upgraded=card_id,
                         )
-                # Invalid upgrade target — fall through to REST
                 log.warning(
                     "LLM strategy rest: invalid upgrade target %r, healing", raw_pick
                 )
 
-            # REST (default or explicit)
             log.info("LLM strategy rest: healing")
             return RestResult(choice=RestChoice.REST)
 
@@ -1373,7 +1391,6 @@ class StrategyAgent(BaseStrategyAgent):
 
     # -- card removal entry point -----------------------------------------------
 
-    @mlflow.trace(name="pick_card_to_remove")
     def pick_card_to_remove(
         self,
         character: Character,
@@ -1384,21 +1401,30 @@ class StrategyAgent(BaseStrategyAgent):
         Uses ``try_remove_card`` simulation tool to evaluate the impact of
         removing each candidate.  Returns the card_id to remove, or None.
         """
-        ensure_lm()
         self._start_time = time.time()
         self._timed_out = False
         self._sim_log = []
 
-        # Candidates: all cards in deck (agent can simulate to decide)
-        candidates = sorted(set(character.deck))
-
         sts_map = kwargs.get("sts_map")
         current_position = kwargs.get("current_position")
-        map_view = _format_map_view(
-            sts_map, character, current_position,
-            committed_path=self._map_committed_path,
-        )
+        map_view = self._build_map_view(character, sts_map, current_position)
         encounters_view = _format_possible_encounters(self.get_possible_encounters())
+
+        return self._pick_card_to_remove_traced(
+            character,
+            map_view,
+            encounters_view,
+        )
+
+    @mlflow.trace(name="pick_card_to_remove")
+    def _pick_card_to_remove_traced(
+        self,
+        character: Character,
+        map_view: str,
+        encounters_view: str,
+    ) -> str | None:
+        """Traced card removal — inputs exclude raw ``sts_map``."""
+        ensure_lm()
 
         tools = _make_tools(
             character,
@@ -1432,28 +1458,50 @@ class StrategyAgent(BaseStrategyAgent):
 
     # -- shop entry point -----------------------------------------------------
 
-    @mlflow.trace(name="shop")
     def shop(
         self,
         inventory: "ShopInventory",
         character: Character,
     ) -> None:
         """Decide shop purchases using LLM + simulation tools."""
-        ensure_lm()
         self._start_time = time.time()
         self._timed_out = False
         self._sim_log = []
 
-        map_view = _format_map_view(
-            self._sts_map,
+        map_view = self._build_map_view(
             character,
+            self._sts_map,
             self._current_map_position(character),
-            committed_path=self._map_committed_path,
         )
         encounters_view = _format_possible_encounters(
             self.get_possible_encounters(),
         )
         shop_inventory = format_shop_inventory(inventory)
+
+        try:
+            actions = self._shop_traced(
+                character,
+                shop_inventory,
+                map_view,
+                encounters_view,
+            )
+            for action in actions:
+                if not execute_shop_action(action, inventory, character):
+                    log.warning("LLM shop: action failed or skipped: %s", action)
+        except Exception:
+            log.exception("LLM shop: error, falling back to heuristic")
+            super().shop(inventory, character)
+
+    @mlflow.trace(name="shop")
+    def _shop_traced(
+        self,
+        character: Character,
+        shop_inventory: str,
+        map_view: str,
+        encounters_view: str,
+    ) -> list[str]:
+        """Traced shop plan — inputs exclude raw ``ShopInventory`` / ``sts_map``."""
+        ensure_lm()
 
         tools = _make_shop_tools(
             character,
@@ -1464,23 +1512,15 @@ class StrategyAgent(BaseStrategyAgent):
             possible_encounters=self.get_possible_encounters(),
         )
 
-        try:
-            react = dspy.ReActV2(ShopPickSignature, tools=tools, max_iters=8)
-            result = react(
-                character_state=character.summary(),
-                deck_cards=list(character.deck),
-                map_view=map_view,
-                possible_encounters=encounters_view,
-                shop_inventory=shop_inventory,
-            )
-            raw_actions = getattr(result, "actions", "leave").strip()
-            actions = parse_shop_actions(raw_actions)
-            log.info("LLM shop: plan=%r parsed=%s", raw_actions, actions)
-
-            for action in actions:
-                if not execute_shop_action(action, inventory, character):
-                    log.warning("LLM shop: action failed or skipped: %s", action)
-
-        except Exception:
-            log.exception("LLM shop: error, falling back to heuristic")
-            super().shop(inventory, character)
+        react = dspy.ReActV2(ShopPickSignature, tools=tools, max_iters=8)
+        result = react(
+            character_state=character.summary(),
+            deck_cards=list(character.deck),
+            map_view=map_view,
+            possible_encounters=encounters_view,
+            shop_inventory=shop_inventory,
+        )
+        raw_actions = getattr(result, "actions", "leave").strip()
+        actions = parse_shop_actions(raw_actions)
+        log.info("LLM shop: plan=%r parsed=%s", raw_actions, actions)
+        return actions

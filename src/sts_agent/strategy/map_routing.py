@@ -28,6 +28,10 @@ have lighter survival models or logged act outcomes.
 
 **Deferred: gold ↔ HP conversion** — see todo ``gold-hp-conversion`` in the
 map-path plan; crossroad survival currently substitutes for fine HP budgeting.
+
+**Linear scenarios** use ``linear_scenario_map()`` — a single-column chain with
+one scored path.  There is no separate “unscored linear” mode; fixed encounter
+lists are still valid map input for ``build_scored_map_view()``.
 """
 
 from __future__ import annotations
@@ -37,7 +41,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from sts_env.run import relics as relics_mod
-from sts_env.run.map import RoomType, get_encounter_for_room
+from sts_env.run.map import MapNode, RoomType, StSMap, get_encounter_for_room
 from sts_env.run.rewards import (
     COMMON_POTIONS,
     UNCOMMON_POTIONS,
@@ -56,7 +60,6 @@ if TYPE_CHECKING:
     from sts_env.combat.rng import RNG
     from sts_env.run.character import Character
     from sts_env.run.encounter_queue import EncounterQueue
-    from sts_env.run.map import MapNode, StSMap
 
 # Tunable heuristic constants
 MONSTER_VALUE = 1.0
@@ -66,6 +69,40 @@ FIRST_SHOP_VALUE = 2.0
 EVENT_VALUE = 1.0
 TREASURE_VALUE = 0.0
 PREFIX_ROOM_COUNT = 3
+
+
+class MapViewError(RuntimeError):
+    """Raised when scored map context is required but cannot be built.
+
+    Applies to branching and linear runs alike — a linear encounter list still
+    yields a single-path map that must be scored like any other.
+    """
+
+
+_LINEAR_ENCOUNTER_ROOM: dict[str, RoomType] = {
+    "easy": RoomType.MONSTER,
+    "hard": RoomType.MONSTER,
+    "elite": RoomType.ELITE,
+    "boss": RoomType.BOSS,
+}
+
+
+def linear_scenario_map(
+    encounters: list[tuple[str, str]],
+    seed: int,
+) -> StSMap:
+    """Build a single-column map from a fixed encounter sequence."""
+    nodes: dict[int, list[MapNode]] = {}
+    for floor_idx, (enc_type, _enc_id) in enumerate(encounters):
+        room_type = _LINEAR_ENCOUNTER_ROOM.get(enc_type, RoomType.MONSTER)
+        edges: list[tuple[int, int]] = []
+        if floor_idx + 1 < len(encounters):
+            edges = [(floor_idx + 1, 0)]
+        nodes[floor_idx] = [
+            MapNode(floor=floor_idx, x=0, room_type=room_type, edges=edges),
+        ]
+    return StSMap(nodes=nodes, seed=seed)
+
 
 _ROOM_SYMBOLS = {
     RoomType.MONSTER: "M",
@@ -217,6 +254,8 @@ def enumerate_forward_paths(
 def _path_room_counts(
     sts_map: StSMap,
     path: list[tuple[int, int]],
+    *,
+    mark_at: tuple[int, int] | None = None,
 ) -> tuple[list[str], dict[RoomType, int]]:
     symbols: list[str] = []
     counts: dict[RoomType, int] = {}
@@ -224,7 +263,11 @@ def _path_room_counts(
         node = sts_map.get_node(floor_num, x_pos)
         if node is None:
             continue
-        symbols.append(_ROOM_SYMBOLS.get(node.room_type, "?"))
+        if mark_at is not None and (floor_num, x_pos) == mark_at:
+            sym = "@"
+        else:
+            sym = _ROOM_SYMBOLS.get(node.room_type, "?")
+        symbols.append(sym)
         if node.room_type in _COUNT_TYPES:
             counts[node.room_type] = counts.get(node.room_type, 0) + 1
     return symbols, counts
@@ -256,9 +299,14 @@ def top_paths(
     k: int = 3,
 ) -> list[ScoredPath]:
     paths = enumerate_forward_paths(sts_map, current_pos)
+    seen: set[tuple[tuple[int, int], ...]] = set()
     scored: list[ScoredPath] = []
     for path in paths:
-        symbols, counts = _path_room_counts(sts_map, path)
+        key = tuple(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        symbols, counts = _path_room_counts(sts_map, path, mark_at=current_pos)
         scored.append(
             ScoredPath(
                 coords=path,
@@ -271,6 +319,40 @@ def top_paths(
     return scored[:k]
 
 
+def require_top_paths(
+    sts_map: StSMap,
+    current_pos: tuple[int, int],
+    *,
+    shops_visited: int,
+    k: int = 3,
+) -> list[ScoredPath]:
+    """Return top-*k* scored paths or raise if the map cannot be scored."""
+    scored = top_paths(sts_map, current_pos, shops_visited=shops_visited, k=k)
+    if not scored:
+        raise MapViewError(
+            f"no scored forward paths from {current_pos} "
+            f"(map seed={sts_map.seed})"
+        )
+    return scored
+
+
+def build_scored_map_view(
+    sts_map: StSMap,
+    character: Character,
+    current_position: tuple[int, int],
+    *,
+    committed_path: list[tuple[int, int]] | None = None,
+    k: int = 3,
+) -> str:
+    """Build fenced LLM map view with top-*k* scored paths."""
+    shops = count_shops_visited(sts_map, committed_path or [])
+    scored = require_top_paths(
+        sts_map, current_position, shops_visited=shops, k=k,
+    )
+    view = format_map_view(sts_map, character, current_position, scored)
+    return f"```text\n{view}\n```"
+
+
 def provisional_remaining_path(
     sts_map: StSMap,
     current_pos: tuple[int, int],
@@ -278,9 +360,9 @@ def provisional_remaining_path(
     shops_visited: int,
 ) -> list[tuple[int, int]]:
     """Return suffix coords after *current_pos* on the highest-scored full path."""
-    scored = top_paths(sts_map, current_pos, shops_visited=shops_visited, k=1)
-    if not scored:
-        return []
+    scored = require_top_paths(
+        sts_map, current_pos, shops_visited=shops_visited, k=1,
+    )
     full = scored[0].coords
     if not full or full[0] != current_pos:
         return full
@@ -306,6 +388,10 @@ def format_map_view(
     current_pos: tuple[int, int],
     top: list[ScoredPath],
 ) -> str:
+    if not top:
+        raise MapViewError(
+            f"format_map_view requires scored paths at {current_pos}"
+        )
     floor_num, x_pos = current_pos
     node = sts_map.get_node(floor_num, x_pos)
     sym = _ROOM_SYMBOLS.get(node.room_type, "?") if node else "?"
