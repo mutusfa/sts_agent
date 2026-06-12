@@ -599,10 +599,9 @@ class TestPickCardMapAware:
         assert [c.card_id for c in choices] == ["Anger", "Inflame", "Flex"]
 
     def test_pick_card_passes_map_view_when_sts_map_provided(self):
-        """When sts_map + current_position supplied, map_view comes from render_ascii."""
+        """When sts_map + current_position supplied, map_view shows top paths."""
         agent = StrategyAgent()
         fake_map = _make_minimal_map()
-        fake_map.render_ascii = MagicMock(return_value="FORWARD_ASCII_MAP")
 
         captured_kwargs: dict = {}
 
@@ -623,12 +622,7 @@ class TestPickCardMapAware:
             )
 
         assert "map_view" in captured_kwargs
-        assert "FORWARD_ASCII_MAP" in captured_kwargs["map_view"]
-        fake_map.render_ascii.assert_called_once_with(
-            current_floor=0,
-            current_x=3,
-            reachable_only=True,
-        )
+        assert "Top 3 paths to boss:" in captured_kwargs["map_view"]
 
     def test_pick_card_works_without_map(self):
         """Without sts_map the call still works and map_view is a stub string."""

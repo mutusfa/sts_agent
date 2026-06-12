@@ -196,27 +196,62 @@ class _RunAgentAdapter:
         self._strategy = strategy_agent
         self._potion_tracker = potion_tracker or _PotionTracker()
         self._path: list[tuple[int, int]] = []
+        self._path_idx: int = 0
         self._combat_count: int = 0
         self._sts_map: object = None
         self._run_seed: int = 0
+        self._walk_started: bool = False
+
+    def begin_map_run(self, sts_map, seed: int) -> None:
+        self._sts_map = sts_map
+        self._run_seed = seed
+        self._path = []
+        self._path_idx = 0
+        self._combat_count = 0
+        self._walk_started = False
+        self._strategy.begin_map_run(sts_map, seed)
+
+    def on_map_step(self, coord: tuple[int, int]) -> None:
+        self._path.append(coord)
+        self._path_idx = len(self._path) - 1
+        self._walk_started = True
+        self._strategy.on_map_step(coord)
+
+    def provisional_remaining_path(
+        self,
+        sts_map,
+        character: Character,
+        current_position: tuple[int, int],
+    ) -> list[tuple[int, int]]:
+        from .strategy.map_routing import (
+            count_shops_visited,
+            provisional_remaining_path,
+        )
+
+        shops = count_shops_visited(sts_map, self._path)
+        return provisional_remaining_path(
+            sts_map, current_position, shops_visited=shops,
+        )
 
     def _upcoming_encounters(self) -> list[tuple[str, str]]:
-        """Derive upcoming (room_type, enc_id) from remaining path.
+        """Derive upcoming (room_type, enc_id) from committed + provisional path."""
+        if self._sts_map is None or not self._path:
+            return []
+        from .strategy.map_routing import (
+            count_shops_visited,
+            path_to_upcoming,
+            provisional_remaining_path,
+        )
 
-        Approximate: uses combat count to estimate position in the path.
-        Non-combat rooms (rest, shop, event, treasure) are included since
-        the discount only needs rough distance estimates.
-        """
-        upcoming: list[tuple[str, str]] = []
-        if self._sts_map is not None:
-            # Start from a rough offset based on combat count
-            start = min(self._combat_count, len(self._path))
-            for i in range(start, len(self._path)):
-                floor_num, x_pos = self._path[i]
-                node = self._sts_map.get_node(floor_num, x_pos)
-                if node is not None:
-                    upcoming.append((node.room_type.name.lower(), ""))
-        return upcoming
+        if not self._walk_started:
+            return path_to_upcoming(self._sts_map, self._path)
+
+        current = self._path[-1]
+        shops = count_shops_visited(self._sts_map, self._path)
+        suffix = provisional_remaining_path(
+            self._sts_map, current, shops_visited=shops,
+        )
+        return path_to_upcoming(self._sts_map, suffix)
 
     def run_battle(self, combat: Combat) -> int:
         potions_before = (
@@ -272,12 +307,18 @@ class _RunAgentAdapter:
     def pick_neow(self, options):
         return self._strategy.pick_neow(options)
 
+    def pick_map_start(self, sts_map, character, seed):
+        self.begin_map_run(sts_map, seed)
+        return self._strategy.pick_map_start(sts_map, character, seed)
+
+    def pick_branch(self, sts_map, character, current, seed):
+        return self._strategy.pick_branch(sts_map, character, current, seed)
+
     def plan_route(self, sts_map, character, seed):
+        self.begin_map_run(sts_map, seed)
         path = self._strategy.plan_route(sts_map, character, seed)
-        self._path = path
+        self._path = list(path)
         self._path_idx = 0
-        self._sts_map = sts_map
-        self._run_seed = seed
         return path
 
     def pick_card(self, character, card_choices, upcoming_encounters, seed, **kwargs):

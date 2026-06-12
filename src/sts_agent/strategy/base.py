@@ -37,6 +37,12 @@ if TYPE_CHECKING:
     from sts_env.run.neow import NeowChoice, NeowOption
 
 
+def _normalize_map_edge(floor: int, edge: int | tuple[int, int]) -> tuple[int, int]:
+    if isinstance(edge, tuple):
+        return edge
+    return floor + 1, edge
+
+
 class BaseStrategyAgent:
     """Random-valid-option agent. Subclass and override to specialise."""
 
@@ -47,6 +53,7 @@ class BaseStrategyAgent:
         self._elites_seen: list[str] = []
         self._run_seed: int | None = None
         self._sts_map: StSMap | None = None
+        self._map_committed_path: list[tuple[int, int]] = []
 
     def _current_map_position(
         self, character: Character,
@@ -60,6 +67,10 @@ class BaseStrategyAgent:
         """Derive a deterministic probe seed from cached run seed and floor."""
         run_seed = self._run_seed if self._run_seed is not None else 0
         return run_seed * 1000 + character.floor
+
+    def _branch_probe_config(self):
+        from .map_routing import ProbeConfig
+        return ProbeConfig(max_nodes=200, simulations=30)
 
     # ------------------------------------------------------------------
     # Encounter tracking (open-knowledge query support)
@@ -106,27 +117,87 @@ class BaseStrategyAgent:
     # Map route
     # ------------------------------------------------------------------
 
+    def begin_map_run(
+        self,
+        sts_map: StSMap,
+        seed: int,
+    ) -> None:
+        """Cache map state at run start for map-view and routing helpers."""
+        self._run_seed = seed
+        self._sts_map = sts_map
+        self._map_committed_path = []
+
+    def on_map_step(self, coord: tuple[int, int]) -> None:
+        """Record a visited map coordinate for shop-count heuristics."""
+        self._map_committed_path.append(coord)
+
+    def pick_map_start(
+        self,
+        sts_map: StSMap,
+        character: Character,
+        seed: int,
+    ) -> tuple[int, int]:
+        """Pick a floor-0 starting column using branch scoring."""
+        from .map_routing import pick_map_start_coord
+
+        self.begin_map_run(sts_map, seed)
+        floor0_nodes = sts_map.nodes.get(0, [])
+        candidates = [(0, n.x) for n in floor0_nodes if n.edges]
+        if not candidates:
+            return (0, 0)
+        return pick_map_start_coord(
+            sts_map,
+            character,
+            candidates,
+            seed,
+            self.rng,
+            self._encounter_queue,
+            config=self._branch_probe_config(),
+        )
+
+    def pick_branch(
+        self,
+        sts_map: StSMap,
+        character: Character,
+        current: tuple[int, int],
+        seed: int,
+    ) -> tuple[int, int]:
+        """Pick the next map step at a fork using heuristic + probe weights."""
+        from .map_routing import count_shops_visited, pick_branch_coord
+
+        f, x = current
+        node = sts_map.get_node(f, x)
+        if node is None or not node.edges:
+            return current
+        edges = [_normalize_map_edge(f, e) for e in node.edges]
+        shops = count_shops_visited(sts_map, self._committed_path())
+        return pick_branch_coord(
+            sts_map,
+            character,
+            current,
+            edges,
+            seed,
+            self.rng,
+            self._encounter_queue,
+            shops_visited=shops,
+            config=self._branch_probe_config(),
+        )
+
+    def _committed_path(self) -> list[tuple[int, int]]:
+        return self._map_committed_path
+
     def plan_route(
         self,
         sts_map: StSMap,
         character: Character,
         seed: int,
     ) -> list[tuple[int, int]]:
-        """Walk a random valid path from a floor-0 start node to the boss.
-
-        ``seed`` is accepted so concrete subclasses can derive per-encounter
-        probe seeds from it; the base implementation ignores it and uses
-        ``self.rng`` instead.
-        """
-        self._run_seed = seed
-        self._sts_map = sts_map
+        """Replay pick_map_start + pick_branch with a frozen character snapshot."""
+        self.begin_map_run(sts_map, seed)
         path: list[tuple[int, int]] = []
-        floor0_nodes = sts_map.nodes.get(0, [])
-        candidates = [n for n in floor0_nodes if n.edges]
-        if not candidates:
+        current = self.pick_map_start(sts_map, character, seed)
+        if not sts_map.get_node(*current):
             return path
-        start = self.rng.choice(candidates)
-        current: tuple[int, int] = (0, start.x)
         path.append(current)
 
         while True:
@@ -134,7 +205,10 @@ class BaseStrategyAgent:
             node = sts_map.get_node(f, x)
             if node is None or not node.edges:
                 break
-            next_coord = self.rng.choice(node.edges)
+            if len(node.edges) == 1:
+                next_coord = _normalize_map_edge(f, node.edges[0])
+            else:
+                next_coord = self.pick_branch(sts_map, character, current, seed)
             path.append(next_coord)
             current = next_coord
         return path

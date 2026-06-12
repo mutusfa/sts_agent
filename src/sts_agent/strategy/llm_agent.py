@@ -689,8 +689,8 @@ class StandardContext(dspy.Signature):
     )
     map_view: str = dspy.InputField(
         desc=(
-            "ASCII map of the act. @ = current position; "
-            "M/E/B/R/?/$/ T = upcoming reachable rooms. "
+            "Top paths to boss from current position with room-type sequences "
+            "and elite/rest/event/shop counts. "
             "Pass 'monster', 'elite', or 'boss' (and 'event' where tools allow) "
             "as room_type to simulation tools based on what you see ahead."
         )
@@ -751,23 +751,22 @@ _MAP_NO_MAP_STUB = "(no map available — linear scenario)"
 
 def _format_map_view(
     sts_map: StSMap | None,
+    character: Character | None,
     current_position: tuple[int, int] | None,
+    *,
+    committed_path: list[tuple[int, int]] | None = None,
 ) -> str:
-    """Render map context using sts_env's forward-looking ASCII view."""
-    if sts_map is None:
+    """Render scored top-3 path summary for LLM context."""
+    if sts_map is None or character is None or current_position is None:
         return _MAP_NO_MAP_STUB
 
-    current_floor = current_position[0] if current_position else None
-    current_x = current_position[1] if current_position else None
+    from .map_routing import count_shops_visited, format_map_view, top_paths
+
+    shops = count_shops_visited(sts_map, committed_path or [])
+    scored = top_paths(sts_map, current_position, shops_visited=shops, k=3)
     return (
         "```text\n"
-        f"{
-            sts_map.render_ascii(
-                current_floor=current_floor,
-                current_x=current_x,
-                reachable_only=True,
-            )
-        }\n"
+        f"{format_map_view(sts_map, character, current_position, scored)}\n"
         "```"
     )
 
@@ -1040,7 +1039,10 @@ class StrategyAgent(BaseStrategyAgent):
         self._sim_log = []
 
         card_infos = [_card_info(c) for c in card_choices]
-        map_view = _format_map_view(sts_map, current_position)
+        map_view = _format_map_view(
+            sts_map, character, current_position,
+            committed_path=self._map_committed_path,
+        )
         encounters_view = _format_possible_encounters(self.get_possible_encounters())
 
         span = mlflow.get_current_active_span()
@@ -1207,7 +1209,10 @@ class StrategyAgent(BaseStrategyAgent):
         # Build context --------------------------------------------------
         sts_map = kwargs.get("sts_map")
         current_position = kwargs.get("current_position")
-        map_view = _format_map_view(sts_map, current_position)
+        map_view = _format_map_view(
+            sts_map, character, current_position,
+            committed_path=self._map_committed_path,
+        )
         encounters_view = _format_possible_encounters(self.get_possible_encounters())
 
         # Format choices with their labels
@@ -1316,7 +1321,10 @@ class StrategyAgent(BaseStrategyAgent):
 
         sts_map = kwargs.get("sts_map")
         current_position = kwargs.get("current_position")
-        map_view = _format_map_view(sts_map, current_position)
+        map_view = _format_map_view(
+            sts_map, character, current_position,
+            committed_path=self._map_committed_path,
+        )
         encounters_view = _format_possible_encounters(self.get_possible_encounters())
 
         tools = _make_tools(
@@ -1386,7 +1394,10 @@ class StrategyAgent(BaseStrategyAgent):
 
         sts_map = kwargs.get("sts_map")
         current_position = kwargs.get("current_position")
-        map_view = _format_map_view(sts_map, current_position)
+        map_view = _format_map_view(
+            sts_map, character, current_position,
+            committed_path=self._map_committed_path,
+        )
         encounters_view = _format_possible_encounters(self.get_possible_encounters())
 
         tools = _make_tools(
@@ -1435,7 +1446,9 @@ class StrategyAgent(BaseStrategyAgent):
 
         map_view = _format_map_view(
             self._sts_map,
+            character,
             self._current_map_position(character),
+            committed_path=self._map_committed_path,
         )
         encounters_view = _format_possible_encounters(
             self.get_possible_encounters(),

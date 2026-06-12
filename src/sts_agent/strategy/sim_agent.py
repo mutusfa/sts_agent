@@ -295,131 +295,18 @@ class SimStrategyAgent(BaseStrategyAgent):
     # Map route (specialised)
     # ------------------------------------------------------------------
 
+    def _branch_probe_config(self):
+        from .map_routing import ProbeConfig
+        return ProbeConfig(
+            max_nodes=min(self.sim_nodes, 1000),
+            simulations=min(self.sim_sims, 1000),
+        )
+
     def plan_route(
         self,
         sts_map: "StSMap",
         character: Character,
         seed: int,
     ) -> list[tuple[int, int]]:
-        """Choose a path through the map using probe-based evaluation.
-
-        Walks floor-by-floor.  At each fork, evaluates each branch by
-        probing the next combat encounter on that branch.  Picks the
-        branch with the best survival outlook.
-
-        Falls back to a heuristic (prefer Rest when low HP, Elite when
-        high HP) when no combat is reachable for probing.
-        """
-        self._run_seed = seed
-        self._sts_map = sts_map
-        from sts_env.run.encounter_queue import EncounterQueue
-        from sts_env.combat.rng import RNG as StsRNG
-
-        path: list[tuple[int, int]] = []
-        floor0_nodes = sts_map.nodes.get(0, [])
-        start_node = next((n for n in floor0_nodes if n.edges), None)
-        if not start_node:
-            return path
-        current = (0, start_node.x)
-        path.append(current)
-
-        encounter_queue = EncounterQueue(StsRNG(seed ^ 0xBEEF))
-
-        while True:
-            f, x = current
-            node = sts_map.get_node(f, x)
-            if node is None or not node.edges:
-                break
-
-            if len(node.edges) == 1:
-                next_coord = node.edges[0]
-            else:
-                next_coord = self._pick_branch(
-                    sts_map, character, node, seed, encounter_queue,
-                )
-
-            path.append(next_coord)
-            current = next_coord
-
-        return path
-
-    def _pick_branch(
-        self,
-        sts_map: "StSMap",
-        character: Character,
-        node: "MapNode",
-        seed: int,
-        encounter_queue: "EncounterQueue",
-    ) -> tuple[int, int]:
-        """Evaluate branches at a fork and pick the best one."""
-        hp_ratio = character.player_hp / max(character.player_max_hp, 1)
-
-        best_coord = node.edges[0]
-        best_score: tuple = (-float("inf"),)
-
-        for coord in node.edges:
-            nf, nx = coord
-            next_node = sts_map.get_node(nf, nx)
-            if next_node is None:
-                continue
-
-            score = self._score_branch(
-                sts_map, character, next_node, hp_ratio, seed, encounter_queue,
-            )
-            if score > best_score:
-                best_score = score
-                best_coord = coord
-
-        return best_coord
-
-    def _score_branch(
-        self,
-        sts_map: "StSMap",
-        character: Character,
-        next_node: "MapNode",
-        hp_ratio: float,
-        seed: int,
-        encounter_queue: "EncounterQueue",
-    ) -> tuple:
-        """Score a branch for path selection.
-
-        Returns a tuple for comparison (higher = better):
-        (is_rest_and_low_hp, survival_score, room_priority)
-        """
-        from sts_env.run.map import RoomType, get_encounter_for_room
-
-        room_type = next_node.room_type
-
-        if room_type == RoomType.REST:
-            rest_value = 1.0 if hp_ratio < 0.4 else 0.0
-            return (rest_value, 0.0, 0)
-
-        if room_type in (RoomType.EVENT, RoomType.SHOP, RoomType.TREASURE):
-            return (0.0, 0.0, 1)
-
-        encounter_id = get_encounter_for_room(room_type, encounter_queue)
-        if encounter_id is None:
-            return (0.0, 0.0, 2)
-
-        encounter_type = room_type.name.lower()
-
-        try:
-            dist = probe_encounter(
-                character, encounter_type, encounter_id, seed,
-                max_nodes=min(self.sim_nodes, 1000),
-                simulations=min(self.sim_sims, 1000),
-            )
-            survival = dist.survival_rate
-        except Exception:
-            survival = 0.5
-
-        room_priority = {
-            RoomType.ELITE: 3,
-            RoomType.MONSTER: 2,
-            RoomType.BOSS: 1,
-        }.get(room_type, 0)
-
-        if hp_ratio < 0.3 and room_type == RoomType.ELITE:
-            room_priority = 0
-
-        return (0.0, survival, room_priority)
+        """Choose a path through the map using shared map-routing heuristics."""
+        return super().plan_route(sts_map, character, seed)
