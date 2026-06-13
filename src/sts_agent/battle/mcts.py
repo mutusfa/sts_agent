@@ -83,6 +83,30 @@ After each ``act()`` call the attribute ``last_stats`` is populated with::
                       >= best_alive_so_far at rollout start (per-sim alpha-abort savings)
     root_visit_top1_frac  fraction of root visits going to the single most-visited edge
     root_visit_top2_frac  fraction of root visits going to the top-2 most-visited edges
+
+Known limitations (accepted for now)
+------------------------------------
+We deliberately keep high-sim-count open-loop MCTS as the combat pilot while
+it doubles as the data-collection and deployment agent.  The oracle and
+strategy probes therefore measure value *for this pilot*, not universal deck
+strength under expert play.
+
+**Open-loop / no draw conditioning.**  Stochastic transitions (shuffles, enemy
+intents) are collapsed into edge averages — the tree does not branch on what
+you drew.  More simulations buy breadth across RNG samples, not closed-loop
+planning: they cannot fix the inability to conditionally sequence on the cards
+currently in hand.  Infinite and high-draw decks suffer most; Ironclad rarely
+builds them (they need rare card/relic combos), so the gap affects a small
+slice of finished decks but still shows up upstream as **pivot-avoidance
+bias** — the agent undervalues rare enablers (Corruption, Dead Branch, draw
+engines) that lead to those decks, not just misplaying the finished build.
+
+**High action-count / infinite decks (deferred).**  Best current idea when
+revisited: horizon in *actions ahead*, not turns ahead.  Depth alone is only
+half the problem — true infinites also need within-turn branching control (the
+per-turn action tree explodes), loop/transposition detection, and closed-loop
+reaction to mid-turn draws.  Expect closed-loop branching plus loop detection,
+not just deeper search.
 """
 
 from __future__ import annotations
@@ -247,11 +271,17 @@ class _EdgeStats:
 
     @property
     def mean_turns_dead(self) -> float:
-        return self._sum_turns_dead / self._n_turns_dead if self._n_turns_dead > 0 else math.nan
+        return (
+            self._sum_turns_dead / self._n_turns_dead
+            if self._n_turns_dead > 0
+            else math.nan
+        )
 
     @property
     def mean_damage_taken_dead(self) -> float:
-        return self._sum_damage_taken_dead / self.n_dead if self.n_dead > 0 else math.nan
+        return (
+            self._sum_damage_taken_dead / self.n_dead if self.n_dead > 0 else math.nan
+        )
 
     @property
     def mean_max_hp_gained(self) -> float:
@@ -266,7 +296,11 @@ class _EdgeStats:
 
     @property
     def mean_turns_alive(self) -> float:
-        return self._sum_turns_alive / self._n_turns_alive if self._n_turns_alive > 0 else math.nan
+        return (
+            self._sum_turns_alive / self._n_turns_alive
+            if self._n_turns_alive > 0
+            else math.nan
+        )
 
     @property
     def death_rate(self) -> float:
@@ -632,9 +666,7 @@ class MCTSPlanner:
             sims_run += 1
 
         # Root visit concentration
-        _root_visits = sorted(
-            (e.n for e in root_node.edges.values()), reverse=True
-        )
+        _root_visits = sorted((e.n for e in root_node.edges.values()), reverse=True)
         _total_root = sum(_root_visits) or 1
         _top1_frac = _root_visits[0] / _total_root if _root_visits else 0.0
         _top2_frac = sum(_root_visits[:2]) / _total_root if _root_visits else 0.0
@@ -667,8 +699,12 @@ class MCTSPlanner:
             # Budget telemetry
             "sel_depth_mean": sel_depth_sum / sims_run if sims_run > 0 else 0.0,
             "sel_depth_max": float(sel_depth_max_val),
-            "terminal_during_selection_frac": terminal_in_sel / sims_run if sims_run > 0 else 0.0,
-            "would_alpha_cut_at_rollout_frac": would_cut / sims_run if sims_run > 0 else 0.0,
+            "terminal_during_selection_frac": terminal_in_sel / sims_run
+            if sims_run > 0
+            else 0.0,
+            "would_alpha_cut_at_rollout_frac": would_cut / sims_run
+            if sims_run > 0
+            else 0.0,
             "root_visit_top1_frac": _top1_frac,
             "root_visit_top2_frac": _top2_frac,
             # PV
@@ -691,13 +727,13 @@ class MCTSPlanner:
         if self.potion_costs:
             log.debug(
                 "T=%d potion penalty: %d/%d rollouts used potions  avg_cost=%.1f",
-                obs.turn, _potion_cost_n, sims_run,
+                obs.turn,
+                _potion_cost_n,
+                sims_run,
                 _potion_cost_total / _potion_cost_n if _potion_cost_n else 0.0,
             )
 
-        pv_death_rate = (
-            pv.deaths / pv.n if pv.n > 0 else math.nan
-        )
+        pv_death_rate = pv.deaths / pv.n if pv.n > 0 else math.nan
         pv_expected_dmg = min(pv.mean, float(start_hp)) if pv.n > 0 else math.nan
         pv_kill_t = pv.mean_turns_alive
         log.debug(

@@ -62,6 +62,8 @@ if TYPE_CHECKING:
     from sts_env.run.character import Character
     from sts_env.run.encounter_queue import EncounterQueue
 
+    from .probe_data import ProbeCache
+
 # Tunable heuristic constants
 MONSTER_VALUE = 1.0
 ELITE_PENALTY = 1.0
@@ -437,42 +439,24 @@ def _clone_character(character: Character) -> Character:
     return copy.deepcopy(character)
 
 
-def _probe_cache_key(
-    encounter_type: str,
-    encounter_id: str,
-    hp: int,
-    max_hp: int,
-    seed: int,
-) -> tuple[str, str, int, int, int]:
-    return encounter_type, encounter_id, hp, max_hp, seed
-
-
 def _cached_probe(
     character: Character,
     encounter_type: str,
     encounter_id: str,
     seed: int,
     *,
-    probe_cache: dict[tuple, SimDistribution],
+    probe_cache: ProbeCache | None,
     config: ProbeConfig,
 ) -> SimDistribution:
-    key = _probe_cache_key(
+    return probe_encounter(
+        character,
         encounter_type,
         encounter_id,
-        character.player_hp,
-        character.player_max_hp,
         seed,
+        max_nodes=config.max_nodes,
+        simulations=config.simulations,
+        probe_cache=probe_cache,
     )
-    if key not in probe_cache:
-        probe_cache[key] = probe_encounter(
-            character,
-            encounter_type,
-            encounter_id,
-            seed,
-            max_nodes=config.max_nodes,
-            simulations=config.simulations,
-        )
-    return probe_cache[key]
 
 
 def _apply_combat_probe_outcome(
@@ -496,14 +480,13 @@ def probe_prefix_survival(
     seed: int,
     encounter_queue: EncounterQueue | None,
     *,
-    probe_cache: dict[tuple, SimDistribution] | None = None,
+    probe_cache: ProbeCache | None = None,
     config: ProbeConfig | None = None,
 ) -> float:
     """Chained survival estimate for up to *prefix_coords* rooms with HP carryover."""
     if not prefix_coords:
         return 1.0
 
-    cache = probe_cache if probe_cache is not None else {}
     cfg = config or ProbeConfig()
     clone = _clone_character(character)
     survival = 1.0
@@ -526,7 +509,7 @@ def probe_prefix_survival(
                 node.room_type.name.lower(),
                 encounter_id,
                 enc_seed,
-                probe_cache=cache,
+                probe_cache=probe_cache,
                 config=cfg,
             )
             survival *= dist.survival_rate
@@ -622,7 +605,7 @@ def pick_fork_coord(
     encounter_queue: EncounterQueue | None,
     *,
     shops_visited: int = 0,
-    probe_cache: dict[tuple, SimDistribution] | None = None,
+    probe_cache: ProbeCache | None = None,
     config: ProbeConfig | None = None,
 ) -> tuple[int, int]:
     """Pick the next map step at a fork (or first column when *current* is None)."""
@@ -644,7 +627,6 @@ def pick_fork_coord(
         return options[0]
 
     weights: list[float] = []
-    cache = probe_cache if probe_cache is not None else {}
     for option in options:
         heuristic, prefix = _fork_heuristic_and_prefix(
             sts_map, current, option, shops_visited=effective_shops,
@@ -655,7 +637,7 @@ def pick_fork_coord(
             prefix,
             seed,
             encounter_queue,
-            probe_cache=cache,
+            probe_cache=probe_cache,
             config=config,
         )
         weights.append(max(heuristic * survival, 0.0))

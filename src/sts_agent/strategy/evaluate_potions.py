@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import copy
 import logging
+from typing import TYPE_CHECKING
 
 from sts_env.run.character import Character
 
@@ -37,6 +38,9 @@ from .simulate import (
     marginal_probe_benefit,
     probe_encounter,
 )
+
+if TYPE_CHECKING:
+    from .probe_data import ProbeCache
 
 log = logging.getLogger(__name__)
 
@@ -114,6 +118,8 @@ def _probe_without_baseline(
     enc_type: str,
     enc_id: str,
     seed: int,
+    *,
+    probe_cache: ProbeCache | None = None,
 ) -> SimDistribution:
     """Probe with an empty potion bag."""
     resolved_type, resolved_id = _resolved_encounter(enc_type, enc_id, seed)
@@ -126,6 +132,7 @@ def _probe_without_baseline(
         seed,
         simulations=_PROBE_SIMULATIONS,
         max_nodes=_PROBE_MAX_NODES,
+        probe_cache=probe_cache,
     )
 
 
@@ -135,6 +142,8 @@ def _probe_with_potion(
     enc_type: str,
     enc_id: str,
     seed: int,
+    *,
+    probe_cache: ProbeCache | None = None,
 ) -> SimDistribution:
     """Probe with an isolated bag containing only *potion_id*."""
     resolved_type, resolved_id = _resolved_encounter(enc_type, enc_id, seed)
@@ -147,6 +156,7 @@ def _probe_with_potion(
         seed,
         simulations=_PROBE_SIMULATIONS,
         max_nodes=_PROBE_MAX_NODES,
+        probe_cache=probe_cache,
     )
 
 
@@ -154,13 +164,17 @@ def _build_without_cache(
     character: Character,
     targets: list[TargetKey],
     seed: int,
+    *,
+    probe_cache: ProbeCache | None = None,
 ) -> dict[TargetKey, SimDistribution]:
     """Probe empty-bag baseline once per target."""
     cache: dict[TargetKey, SimDistribution] = {}
     for enc_type, enc_id, floors_ahead in targets:
         key = (enc_type, enc_id, floors_ahead)
         if key not in cache:
-            cache[key] = _probe_without_baseline(character, enc_type, enc_id, seed)
+            cache[key] = _probe_without_baseline(
+                character, enc_type, enc_id, seed, probe_cache=probe_cache,
+            )
     return cache
 
 
@@ -187,13 +201,16 @@ def _eval_single(
     *,
     without_cache: dict[TargetKey, SimDistribution] | None = None,
     detail_out: dict[str, object] | None = None,
+    probe_cache: ProbeCache | None = None,
 ) -> float:
     """Estimate standalone HP saved by having this potion across all targets.
 
     Probes with an isolated bag: WITH ``[potion_id]`` vs WITHOUT ``[]``.
     The potion need not already be in the character's bag (shop/discard flows).
     """
-    cache = without_cache or _build_without_cache(character, targets, seed)
+    cache = without_cache or _build_without_cache(
+        character, targets, seed, probe_cache=probe_cache,
+    )
     best_saving = 0.0
     probe_pairs: list[dict[str, object]] = []
 
@@ -201,7 +218,12 @@ def _eval_single(
         key = (enc_type, enc_id, floors_ahead)
         without_result = cache[key]
         with_result = _probe_with_potion(
-            character, potion_id, enc_type, enc_id, seed
+            character,
+            potion_id,
+            enc_type,
+            enc_id,
+            seed,
+            probe_cache=probe_cache,
         )
 
         discounted = _marginal_saving_for_target(
@@ -256,6 +278,7 @@ def _eval_pairs(
     seed: int,
     *,
     without_cache: dict[TargetKey, SimDistribution] | None = None,
+    probe_cache: ProbeCache | None = None,
 ) -> dict[str, float]:
     """Evaluate potion pairs and return updated costs.
 
@@ -287,6 +310,7 @@ def _eval_pairs(
                     pair_seed,
                     simulations=_PROBE_SIMULATIONS,
                     max_nodes=_PROBE_MAX_NODES,
+                    probe_cache=probe_cache,
                 )
 
                 char_without = copy.deepcopy(character)
@@ -300,6 +324,7 @@ def _eval_pairs(
                     pair_seed,
                     simulations=_PROBE_SIMULATIONS,
                     max_nodes=_PROBE_MAX_NODES,
+                    probe_cache=probe_cache,
                 )
 
                 pair_hp_saved = _marginal_saving_for_target(
@@ -337,6 +362,7 @@ def evaluate_potions(
     *,
     possible_encounters: dict | None = None,
     detail_out: dict[str, object] | None = None,
+    probe_cache: ProbeCache | None = None,
 ) -> dict[str, float]:
     """Compute virtual HP costs for all potions the character currently holds.
 
@@ -388,7 +414,9 @@ def evaluate_potions(
         )
         return costs
 
-    without_cache = _build_without_cache(character, targets, seed)
+    without_cache = _build_without_cache(
+        character, targets, seed, probe_cache=probe_cache,
+    )
 
     singles: dict[str, float] = {}
     for p in non_fairy:
@@ -396,10 +424,16 @@ def evaluate_potions(
             character, p, targets, seed,
             without_cache=without_cache,
             detail_out=detail_out,
+            probe_cache=probe_cache,
         )
 
     pair_savings = _eval_pairs(
-        character, singles, targets, seed, without_cache=without_cache
+        character,
+        singles,
+        targets,
+        seed,
+        without_cache=without_cache,
+        probe_cache=probe_cache,
     )
     if detail_out is not None:
         detail_out["pair_credits"] = dict(pair_savings)

@@ -312,6 +312,15 @@ class _RunAgentAdapter:
                 )
                 upcoming = self._upcoming_encounters()
                 floor = self._potion_tracker.current_floor
+                probe_cache = getattr(self._strategy, "probe_cache", None)
+                eval_kw = dict(
+                    possible_encounters=(
+                        self._strategy.get_possible_encounters()
+                        if hasattr(self._strategy, "get_possible_encounters")
+                        else None
+                    ),
+                    probe_cache=probe_cache,
+                )
                 if collector is not None:
                     ctx = ProbeContext(
                         collector=collector,
@@ -324,23 +333,15 @@ class _RunAgentAdapter:
                             char,
                             upcoming,
                             self._run_seed,
-                            possible_encounters=(
-                                self._strategy.get_possible_encounters()
-                                if hasattr(self._strategy, "get_possible_encounters")
-                                else None
-                            ),
                             detail_out=potion_detail,
+                            **eval_kw,
                         )
                 else:
                     self._last_potion_costs = evaluate_potions(
                         char,
                         upcoming,
                         self._run_seed,
-                        possible_encounters=(
-                            self._strategy.get_possible_encounters()
-                            if hasattr(self._strategy, "get_possible_encounters")
-                            else None
-                        ),
+                        **eval_kw,
                     )
                 self._planner.potion_costs = self._last_potion_costs
                 if collector is not None and potion_detail:

@@ -21,12 +21,17 @@ import logging
 import math
 import random
 from dataclasses import dataclass
+from time import perf_counter
+from typing import TYPE_CHECKING
 
 from sts_env.run.builder import build_combat
 from sts_env.run.character import Character
 from sts_env.run.rooms import rest_heal
 
 from ..battle.mcts import MCTSPlanner
+
+if TYPE_CHECKING:
+    from .probe_data import ProbeCache
 
 log = logging.getLogger(__name__)
 
@@ -282,6 +287,7 @@ def probe_encounter(
     *,
     max_nodes: int = 10_000,
     simulations: int = 10_000,
+    probe_cache: ProbeCache | None = None,
 ) -> SimDistribution:
     """Probe an encounter with a single MCTS act() call.
 
@@ -304,19 +310,71 @@ def probe_encounter(
         MCTS node budget.
     simulations:
         MCTS simulation budget.
+    probe_cache:
+        Optional run-scoped cache; identical keys skip MCTS.
 
     Returns
     -------
     SimDistribution with mean/std/max of terminal scores.
     """
+    from .probe_data import (
+        get_probe_context,
+        probe_cache_key,
+    )
+
     encounter_type, encounter_id = _resolve_enc(encounter_type, encounter_id, seed)
+    cache_key = probe_cache_key(
+        character,
+        encounter_type,
+        encounter_id,
+        seed,
+        max_nodes=max_nodes,
+        simulations=simulations,
+    )
+
+    ctx = get_probe_context()
+    decision_type = ctx.decision_type if ctx is not None else None
+
+    if probe_cache is not None:
+        cached = probe_cache.get(cache_key)
+        if cached is not None:
+            probe_cache.record_hit(decision_type)
+            return cached
+
+    t0 = perf_counter()
+    dist = _probe_encounter_uncached(
+        character,
+        encounter_type,
+        encounter_id,
+        seed,
+        max_nodes=max_nodes,
+        simulations=simulations,
+    )
+    elapsed = perf_counter() - t0
+
+    if probe_cache is not None:
+        probe_cache.put(cache_key, dist)
+        probe_cache.record_miss(decision_type, elapsed)
+
+    return dist
+
+
+def _probe_encounter_uncached(
+    character: Character,
+    encounter_type: str,
+    encounter_id: str,
+    seed: int,
+    *,
+    max_nodes: int,
+    simulations: int,
+) -> SimDistribution:
+    """Run MCTS for one probe (no cache). *encounter_* must be pool-resolved."""
     char_copy = copy.deepcopy(character)
     combat = build_combat(
         encounter_type, encounter_id, seed, character=char_copy
     )
     planner = MCTSPlanner(simulations=simulations, max_nodes=max_nodes)
 
-    # Single act() — MCTS does `simulations` full-battle rollouts internally
     planner.act(combat)
 
     stats = planner.last_stats

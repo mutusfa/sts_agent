@@ -39,6 +39,7 @@ from sts_agent.tracing import log_probe_artifact, set_span_attributes
 
 from .base import BaseStrategyAgent
 from .probe_data import (
+    ProbeCache,
     ProbeCollector,
     ProbeContext,
     ProbeDecisionRecord,
@@ -148,6 +149,9 @@ class SimStrategyAgent(BaseStrategyAgent):
     seed:
         Forwarded to :class:`BaseStrategyAgent` for the inherited random
         decisions (Neow, rest, events, boss relic).
+    shop_max_remove_candidates:
+        When set, cap how many ``remove:`` actions are probe-evaluated per
+        shop visit (default ``None`` = all unique deck cards).
     """
 
     def __init__(
@@ -158,6 +162,7 @@ class SimStrategyAgent(BaseStrategyAgent):
         timeout_seconds: int = 300,
         seed: int | None = None,
         *,
+        shop_max_remove_candidates: int | None = None,
         probe_collector: ProbeCollector | None = None,
         probe_jsonl: Path | str | None = None,
     ) -> None:
@@ -165,6 +170,8 @@ class SimStrategyAgent(BaseStrategyAgent):
         self.max_encounters = max_encounters_to_sim
         self.sim_nodes = sim_nodes
         self.sim_sims = sim_sims
+        self.shop_max_remove_candidates = shop_max_remove_candidates
+        self.probe_cache = ProbeCache()
         if probe_collector is not None:
             self.probe_collector = probe_collector
         elif probe_jsonl is not None:
@@ -172,9 +179,15 @@ class SimStrategyAgent(BaseStrategyAgent):
         else:
             self.probe_collector = ProbeCollector()
 
+    @property
+    def probe_stats(self) -> dict[str, object]:
+        """Summary of MCTS probe calls vs cache hits for this run."""
+        return self.probe_cache.stats.summary()
+
     def begin_map_run(self, sts_map, seed: int) -> None:
         super().begin_map_run(sts_map, seed)
         self.probe_collector.run_seed = seed
+        self.probe_cache.clear()
 
     # ------------------------------------------------------------------
     # Card-pick (specialised)
@@ -346,11 +359,13 @@ class SimStrategyAgent(BaseStrategyAgent):
                 dist = probe_encounter(
                     character, enc_type, enc_id, enc_seed,
                     max_nodes=self.sim_nodes, simulations=self.sim_sims,
+                    probe_cache=self.probe_cache,
                 )
             else:
                 dist = probe_with_card(
                     character, card_id, enc_type, enc_id, enc_seed,
                     max_nodes=self.sim_nodes, simulations=self.sim_sims,
+                    probe_cache=self.probe_cache,
                 )
 
             total_expected_damage += dist.expected_damage
@@ -418,7 +433,11 @@ class SimStrategyAgent(BaseStrategyAgent):
         )
 
         for iteration in range(10):
-            candidates = list_shop_candidates(inventory, character)
+            candidates = list_shop_candidates(
+                inventory,
+                character,
+                max_remove_candidates=self.shop_max_remove_candidates,
+            )
             if len(candidates) <= 1:
                 break
 
@@ -439,6 +458,7 @@ class SimStrategyAgent(BaseStrategyAgent):
                     max_nodes=self.sim_nodes,
                     simulations=self.sim_sims,
                     out_dists=baseline_dists,
+                    probe_cache=self.probe_cache,
                 )
             iteration_evals.append(
                 shop_score_to_dict(
@@ -472,6 +492,8 @@ class SimStrategyAgent(BaseStrategyAgent):
                         simulations=self.sim_sims,
                         possible_encounters=possible,
                         out_dists=action_dists,
+                        probe_cache=self.probe_cache,
+                        baseline=baseline,
                     )
                 iteration_evals.append(
                     shop_score_to_dict(
@@ -521,6 +543,33 @@ class SimStrategyAgent(BaseStrategyAgent):
     # ------------------------------------------------------------------
     # Map route (specialised)
     # ------------------------------------------------------------------
+
+    def pick_branch(
+        self,
+        sts_map: "StSMap",
+        character: Character,
+        current: tuple[int, int] | None,
+        seed: int,
+    ) -> tuple[int, int]:
+        """Pick the next map step using run-scoped probe cache."""
+        from .map_routing import count_shops_visited, pick_fork_coord
+
+        shops = (
+            0
+            if current is None
+            else count_shops_visited(sts_map, self._committed_path())
+        )
+        return pick_fork_coord(
+            sts_map,
+            character,
+            current,
+            seed,
+            self.rng,
+            self._encounter_queue,
+            shops_visited=shops,
+            probe_cache=self.probe_cache,
+            config=self._branch_probe_config(),
+        )
 
     def _branch_probe_config(self):
         from .map_routing import ProbeConfig

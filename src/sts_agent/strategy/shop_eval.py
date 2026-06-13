@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -25,6 +26,8 @@ from .simulate import (
 
 if TYPE_CHECKING:
     from sts_env.run.character import Character
+
+    from .probe_data import ProbeCache
 
 
 @dataclass
@@ -145,6 +148,7 @@ def _probe_action(
     *,
     max_nodes: int,
     simulations: int,
+    probe_cache: ProbeCache | None = None,
 ) -> tuple[float, float, float, list[SimDistribution]]:
     dists: list[SimDistribution] = []
     for idx, (enc_type, enc_id) in enumerate(encounters):
@@ -153,6 +157,7 @@ def _probe_action(
             probe_fn(
                 character, enc_type, enc_id, enc_seed,
                 max_nodes=max_nodes, simulations=simulations,
+                probe_cache=probe_cache,
             )
         )
     damage, survival, worst = _aggregate_probes(dists)
@@ -167,6 +172,7 @@ def evaluate_shop_baseline(
     max_nodes: int = 5000,
     simulations: int = 5000,
     out_dists: list[SimDistribution] | None = None,
+    probe_cache: ProbeCache | None = None,
 ) -> ShopScore:
     """Score the current deck against upcoming encounters (leave shop)."""
     damage, survival, worst, dists = _probe_action(
@@ -176,6 +182,7 @@ def evaluate_shop_baseline(
         seed,
         max_nodes=max_nodes,
         simulations=simulations,
+        probe_cache=probe_cache,
     )
     if out_dists is not None:
         out_dists.clear()
@@ -199,15 +206,22 @@ def evaluate_shop_option(
     simulations: int = 5000,
     possible_encounters: dict | None = None,
     out_dists: list[SimDistribution] | None = None,
+    probe_cache: ProbeCache | None = None,
+    baseline: ShopScore | None = None,
 ) -> ShopScore:
     """Score a single shop action without mutating *character*."""
     price = _action_price(action, inventory)
+    probe_kw = dict(
+        max_nodes=max_nodes,
+        simulations=simulations,
+        probe_cache=probe_cache,
+    )
 
     if action == "leave":
         return evaluate_shop_baseline(
             character, encounters, seed,
-            max_nodes=max_nodes, simulations=simulations,
             out_dists=out_dists,
+            **probe_kw,
         )
 
     if action.startswith("remove:"):
@@ -219,8 +233,7 @@ def evaluate_shop_option(
             character,
             encounters,
             seed,
-            max_nodes=max_nodes,
-            simulations=simulations,
+            **probe_kw,
         )
         if out_dists is not None:
             out_dists.clear()
@@ -244,8 +257,7 @@ def evaluate_shop_option(
             character,
             encounters,
             seed,
-            max_nodes=max_nodes,
-            simulations=simulations,
+            **probe_kw,
         )
         if out_dists is not None:
             out_dists.clear()
@@ -270,8 +282,7 @@ def evaluate_shop_option(
             character,
             encounters,
             seed,
-            max_nodes=max_nodes,
-            simulations=simulations,
+            **probe_kw,
         )
         if out_dists is not None:
             out_dists.clear()
@@ -289,11 +300,19 @@ def evaluate_shop_option(
         potion_id = inventory.potions[idx][0]
         assert potion_id is not None
         targets = _select_targets(encounters, possible_encounters)
-        potion_value = _eval_single(character, potion_id, targets, seed)
-        baseline = evaluate_shop_baseline(
-            character, encounters, seed,
-            max_nodes=max_nodes, simulations=simulations,
+        potion_value = _eval_single(
+            character,
+            potion_id,
+            targets,
+            seed,
+            probe_cache=probe_cache,
         )
+        if baseline is None:
+            baseline = evaluate_shop_baseline(
+                character, encounters, seed,
+                out_dists=None,
+                **probe_kw,
+            )
         return ShopScore(
             action=action,
             total_expected_damage=baseline.total_expected_damage,
@@ -306,15 +325,42 @@ def evaluate_shop_option(
     raise ValueError(f"Unknown shop action: {action!r}")
 
 
+_CURSE_CARDS = frozenset({"Doubt", "Injury", "Writhe", "Shame", "Pain", "Regret"})
+
+
+def _rank_remove_candidates(deck: list[str]) -> list[str]:
+    """Order deck cards for removal probing (strikes/defends/curses first)."""
+    counts = Counter(deck)
+
+    def sort_key(card_id: str) -> tuple[int, str]:
+        if card_id in _CURSE_CARDS:
+            return (0, card_id)
+        base = card_id.rstrip("+")
+        if base == "Strike":
+            return (1, card_id)
+        if base == "Defend":
+            return (2, card_id)
+        if counts[card_id] > 1:
+            return (3, card_id)
+        return (4, card_id)
+
+    return sorted(set(deck), key=sort_key)
+
+
 def list_shop_candidates(
     inventory: ShopInventory,
     character: Character,
+    *,
+    max_remove_candidates: int | None = None,
 ) -> list[str]:
     """Return affordable shop actions plus ``leave``."""
     candidates = ["leave"]
 
     if character.gold >= inventory.remove_cost and character.deck:
-        for card_id in sorted(set(character.deck)):
+        remove_cards = _rank_remove_candidates(character.deck)
+        if max_remove_candidates is not None:
+            remove_cards = remove_cards[:max_remove_candidates]
+        for card_id in remove_cards:
             candidates.append(f"remove:{card_id}")
 
     for i, (card_id, price) in enumerate(inventory.cards):
