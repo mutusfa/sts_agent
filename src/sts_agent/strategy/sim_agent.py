@@ -27,7 +27,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import mlflow
 
@@ -165,11 +165,13 @@ class SimStrategyAgent(BaseStrategyAgent):
         shop_max_remove_candidates: int | None = None,
         probe_collector: ProbeCollector | None = None,
         probe_jsonl: Path | str | None = None,
+        rollout_mode: Literal["heuristic", "in_tree"] = "heuristic",
     ) -> None:
         super().__init__(seed=seed)
         self.max_encounters = max_encounters_to_sim
         self.sim_nodes = sim_nodes
         self.sim_sims = sim_sims
+        self.rollout_mode = rollout_mode
         self.shop_max_remove_candidates = shop_max_remove_candidates
         self.probe_cache = ProbeCache()
         if probe_collector is not None:
@@ -360,12 +362,14 @@ class SimStrategyAgent(BaseStrategyAgent):
                     character, enc_type, enc_id, enc_seed,
                     max_nodes=self.sim_nodes, simulations=self.sim_sims,
                     probe_cache=self.probe_cache,
+                    rollout_mode=self.rollout_mode,
                 )
             else:
                 dist = probe_with_card(
                     character, card_id, enc_type, enc_id, enc_seed,
                     max_nodes=self.sim_nodes, simulations=self.sim_sims,
                     probe_cache=self.probe_cache,
+                    rollout_mode=self.rollout_mode,
                 )
 
             total_expected_damage += dist.expected_damage
@@ -459,6 +463,7 @@ class SimStrategyAgent(BaseStrategyAgent):
                     simulations=self.sim_sims,
                     out_dists=baseline_dists,
                     probe_cache=self.probe_cache,
+                    rollout_mode=self.rollout_mode,
                 )
             iteration_evals.append(
                 shop_score_to_dict(
@@ -494,6 +499,7 @@ class SimStrategyAgent(BaseStrategyAgent):
                         out_dists=action_dists,
                         probe_cache=self.probe_cache,
                         baseline=baseline,
+                        rollout_mode=self.rollout_mode,
                     )
                 iteration_evals.append(
                     shop_score_to_dict(
@@ -574,6 +580,7 @@ class SimStrategyAgent(BaseStrategyAgent):
     def _branch_probe_config(self):
         from .map_routing import ProbeConfig
         return ProbeConfig(
-            max_nodes=min(self.sim_nodes, 1000),
-            simulations=min(self.sim_sims, 1000),
+            max_nodes=self.sim_nodes,
+            simulations=self.sim_sims,
+            rollout_mode=self.rollout_mode,
         )

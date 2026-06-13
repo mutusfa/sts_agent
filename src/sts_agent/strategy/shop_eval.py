@@ -149,6 +149,7 @@ def _probe_action(
     max_nodes: int,
     simulations: int,
     probe_cache: ProbeCache | None = None,
+    rollout_mode: str = "heuristic",
 ) -> tuple[float, float, float, list[SimDistribution]]:
     dists: list[SimDistribution] = []
     for idx, (enc_type, enc_id) in enumerate(encounters):
@@ -158,6 +159,7 @@ def _probe_action(
                 character, enc_type, enc_id, enc_seed,
                 max_nodes=max_nodes, simulations=simulations,
                 probe_cache=probe_cache,
+                rollout_mode=rollout_mode,
             )
         )
     damage, survival, worst = _aggregate_probes(dists)
@@ -173,6 +175,7 @@ def evaluate_shop_baseline(
     simulations: int = 5000,
     out_dists: list[SimDistribution] | None = None,
     probe_cache: ProbeCache | None = None,
+    rollout_mode: str = "heuristic",
 ) -> ShopScore:
     """Score the current deck against upcoming encounters (leave shop)."""
     damage, survival, worst, dists = _probe_action(
@@ -183,6 +186,7 @@ def evaluate_shop_baseline(
         max_nodes=max_nodes,
         simulations=simulations,
         probe_cache=probe_cache,
+        rollout_mode=rollout_mode,
     )
     if out_dists is not None:
         out_dists.clear()
@@ -208,6 +212,7 @@ def evaluate_shop_option(
     out_dists: list[SimDistribution] | None = None,
     probe_cache: ProbeCache | None = None,
     baseline: ShopScore | None = None,
+    rollout_mode: str = "heuristic",
 ) -> ShopScore:
     """Score a single shop action without mutating *character*."""
     price = _action_price(action, inventory)
@@ -215,6 +220,7 @@ def evaluate_shop_option(
         max_nodes=max_nodes,
         simulations=simulations,
         probe_cache=probe_cache,
+        rollout_mode=rollout_mode,
     )
 
     if action == "leave":

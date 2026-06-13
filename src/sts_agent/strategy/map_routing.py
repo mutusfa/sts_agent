@@ -139,6 +139,7 @@ class ScoredPath:
 class ProbeConfig:
     max_nodes: int = 1000
     simulations: int = 300
+    rollout_mode: str = "heuristic"
 
 
 def _card_slot_ev(room: Room) -> float:
@@ -456,6 +457,7 @@ def _cached_probe(
         max_nodes=config.max_nodes,
         simulations=config.simulations,
         probe_cache=probe_cache,
+        rollout_mode=config.rollout_mode,  # type: ignore[arg-type]
     )
 
 

@@ -22,7 +22,7 @@ import math
 import random
 from dataclasses import dataclass
 from time import perf_counter
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from sts_env.run.builder import build_combat
 from sts_env.run.character import Character
@@ -288,6 +288,7 @@ def probe_encounter(
     max_nodes: int = 10_000,
     simulations: int = 10_000,
     probe_cache: ProbeCache | None = None,
+    rollout_mode: Literal["heuristic", "in_tree"] = "heuristic",
 ) -> SimDistribution:
     """Probe an encounter with a single MCTS act() call.
 
@@ -330,6 +331,7 @@ def probe_encounter(
         seed,
         max_nodes=max_nodes,
         simulations=simulations,
+        rollout_mode=rollout_mode,
     )
 
     ctx = get_probe_context()
@@ -349,6 +351,7 @@ def probe_encounter(
         seed,
         max_nodes=max_nodes,
         simulations=simulations,
+        rollout_mode=rollout_mode,
     )
     elapsed = perf_counter() - t0
 
@@ -367,13 +370,18 @@ def _probe_encounter_uncached(
     *,
     max_nodes: int,
     simulations: int,
+    rollout_mode: Literal["heuristic", "in_tree"] = "heuristic",
 ) -> SimDistribution:
     """Run MCTS for one probe (no cache). *encounter_* must be pool-resolved."""
     char_copy = copy.deepcopy(character)
     combat = build_combat(
         encounter_type, encounter_id, seed, character=char_copy
     )
-    planner = MCTSPlanner(simulations=simulations, max_nodes=max_nodes)
+    planner = MCTSPlanner(
+        simulations=simulations,
+        max_nodes=max_nodes,
+        rollout_mode=rollout_mode,
+    )
 
     planner.act(combat)
 

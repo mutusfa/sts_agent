@@ -334,6 +334,9 @@ class _RunAgentAdapter:
                             upcoming,
                             self._run_seed,
                             detail_out=potion_detail,
+                            rollout_mode=getattr(
+                                self._planner, "rollout_mode", "heuristic"
+                            ),
                             **eval_kw,
                         )
                 else:
@@ -341,6 +344,9 @@ class _RunAgentAdapter:
                         char,
                         upcoming,
                         self._run_seed,
+                        rollout_mode=getattr(
+                            self._planner, "rollout_mode", "heuristic"
+                        ),
                         **eval_kw,
                     )
                 self._planner.potion_costs = self._last_potion_costs

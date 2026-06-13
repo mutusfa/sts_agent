@@ -115,6 +115,7 @@ import logging
 import math
 import random
 from dataclasses import dataclass, field
+from typing import Literal
 
 from sts_env.combat import Action, Combat
 from sts_env.combat.card import Card
@@ -474,6 +475,13 @@ class MCTSPlanner:
         Mapping from potion_id to virtual HP cost.  When a potion is used
         during a rollout, its cost is added to the reward so MCTS treats
         using a potion as "spending" HP.  Default: empty dict (potions free).
+    pv_early_stop:
+        When True, stop the simulation loop once the principal variation
+        reaches a terminal state with each edge visited at least
+        ``_effective_pv_min_n()`` times.
+    rollout_mode:
+        ``"heuristic"`` (default) — shallow select/expand then greedy rollout.
+        ``"in_tree"`` — select/expand until combat is done (no rollout tail).
     """
 
     def __init__(
@@ -483,6 +491,8 @@ class MCTSPlanner:
         exploration_c: float | None = None,
         seed: int | None = None,
         pv_min_n: int | None = None,
+        pv_early_stop: bool = False,
+        rollout_mode: Literal["heuristic", "in_tree"] = "heuristic",
         potion_costs: dict[str, float] | None = None,
     ) -> None:
         self.simulations = simulations
@@ -490,6 +500,8 @@ class MCTSPlanner:
         self._exploration_c = exploration_c
         self._rng = random.Random(seed)
         self._pv_min_n_override = pv_min_n
+        self.pv_early_stop = pv_early_stop
+        self.rollout_mode = rollout_mode
         self.potion_costs: dict[str, float] = potion_costs or {}
         self.last_stats: dict[str, float] = {}
         self._node_store: dict[tuple, _Node] = {}
@@ -512,7 +524,8 @@ class MCTSPlanner:
         c = self._exploration_c if self._exploration_c is not None else start_hp
 
         root_key = _mcts_state_key(combat)
-        if root_key in self._node_store:
+        root_cache_hit = root_key in self._node_store
+        if root_cache_hit:
             root_node = self._node_store[root_key]
         else:
             root_node = _Node(
@@ -536,6 +549,7 @@ class MCTSPlanner:
         sel_depth_sum = 0
         sel_depth_max_val = 0
         terminal_in_sel = 0
+        in_tree_terminal_count = 0
         would_cut = 0
         best_alive_so_far: float = math.inf
 
@@ -556,63 +570,33 @@ class MCTSPlanner:
             # Capture initial potions to compute virtual cost of potions used.
             _initial_potions = list(current_combat._state.potions)  # type: ignore[union-attr]
 
-            # --- Selection ---
-            while (
-                not current_combat.observe().done and current_node.is_fully_expanded()
-            ):
-                concept_key = self._select_concept_key(current_node, c)
-                action = _resolve_action(concept_key, current_combat)
-                if action is None:
-                    # Action no longer valid in this sim path — fall back to END_TURN
-                    action = Action.end_turn()
-                    concept_key = ("END",)
-                path.append((current_node, concept_key))
-                current_combat.step(action)
-                # Some actions are not fully deterministic without tracking rng.
-                # Say, we could have tried to draw cards from a state that is identical
-                # in all but rng to the current state. Due to rng differences, we might
-                # have ended up in a different state.
-                child_key = _mcts_state_key(current_combat)
-                if child_key not in node_store:
-                    child_node = _Node(
-                        state_key=child_key,
-                        untried_action_keys=[
-                            _action_concept_key(a, current_combat)
-                            for a in _ordered_actions(current_combat)
-                        ],
+            if self.rollout_mode == "in_tree":
+                while not current_combat.observe().done:
+                    if self.max_nodes is not None and nodes_expanded >= self.max_nodes:
+                        break
+                    if (
+                        current_node.is_fully_expanded()
+                        and not current_node.untried_action_keys
+                        and not current_node.edges
+                    ):
+                        break
+                    current_node, nodes_expanded = self._sim_select_expand_once(
+                        path=path,
+                        current_node=current_node,
+                        current_combat=current_combat,
+                        node_store=node_store,
+                        c=c,
+                        nodes_expanded=nodes_expanded,
                     )
-                    node_store[child_key] = child_node
-                    nodes_expanded += 1
-                    current_node = child_node
-                    break
-                else:
-                    current_node = node_store[child_key]
-
-            # --- Expansion ---
-            if (
-                not current_combat.observe().done
-                and not current_node.is_fully_expanded()
-            ):
-                concept_key = current_node.untried_action_keys.pop(0)
-                action = _resolve_action(concept_key, current_combat)
-                if action is None:
-                    action = Action.end_turn()
-                    concept_key = ("END",)
-                path.append((current_node, concept_key))
-                current_combat.step(action)
-                child_key = _mcts_state_key(current_combat)
-                if child_key not in node_store:
-                    child_node = _Node(
-                        state_key=child_key,
-                        untried_action_keys=[
-                            _action_concept_key(a, current_combat)
-                            for a in _ordered_actions(current_combat)
-                        ],
-                    )
-                    node_store[child_key] = child_node
-                    nodes_expanded += 1
-                else:
-                    current_node = node_store[child_key]
+            else:
+                current_node, nodes_expanded = self._sim_select_expand_once(
+                    path=path,
+                    current_node=current_node,
+                    current_combat=current_combat,
+                    node_store=node_store,
+                    c=c,
+                    nodes_expanded=nodes_expanded,
+                )
 
             # --- Telemetry: depth, terminal-in-sel, would-alpha-cut ---
             depth = len(path)
@@ -622,16 +606,27 @@ class MCTSPlanner:
             _done_before_rollout = current_combat.observe().done
             if _done_before_rollout:
                 terminal_in_sel += 1
-            elif current_combat.damage_taken - mrl >= best_alive_so_far:
+                if self.rollout_mode == "in_tree":
+                    in_tree_terminal_count += 1
+            elif (
+                self.rollout_mode == "heuristic"
+                and current_combat.damage_taken - mrl >= best_alive_so_far
+            ):
                 would_cut += 1
 
-            # --- Rollout ---
-            rollout_combat = current_combat.clone()
-            outcome = _heuristic_rollout(rollout_combat, potion_costs=self.potion_costs)
+            # --- Outcome (rollout or in-tree terminal) ---
+            if self.rollout_mode == "in_tree":
+                outcome = terminal_score(current_combat)
+                _score_combat = current_combat
+            else:
+                rollout_combat = current_combat.clone()
+                outcome = _heuristic_rollout(
+                    rollout_combat, potion_costs=self.potion_costs
+                )
+                _score_combat = rollout_combat
 
-            # --- Compute potion virtual cost for this rollout ---
-            # Diff initial potions vs final state to find used ones.
-            _final_potions = rollout_combat._state.potions  # type: ignore[union-attr]
+            # --- Compute potion virtual cost ---
+            _final_potions = _score_combat._state.potions  # type: ignore[union-attr]
             _used_counts: dict[str, int] = {}
             for p in _initial_potions:
                 _used_counts[p] = _used_counts.get(p, 0) + 1
@@ -665,6 +660,11 @@ class MCTSPlanner:
 
             sims_run += 1
 
+            if self.pv_early_stop:
+                _, _, pv_terminal_now = self._pv_well_visited_edge(root_node, combat)
+                if pv_terminal_now:
+                    break
+
         # Root visit concentration
         _root_visits = sorted((e.n for e in root_node.edges.values()), reverse=True)
         _total_root = sum(_root_visits) or 1
@@ -675,8 +675,18 @@ class MCTSPlanner:
         best_concept_key, best_edge = self._best_root_concept(root_node)
         best_action = _resolve_action(best_concept_key, combat) or Action.end_turn()
 
-        pv_edge, pv_depth = self._pv_well_visited_edge(root_node, combat)
+        pv_edge, pv_depth, pv_terminal = self._pv_well_visited_edge(
+            root_node, combat
+        )
         pv = pv_edge if pv_edge is not None else best_edge
+        pv_death_rate = pv.deaths / pv.n if pv.n > 0 else math.nan
+        pv_zero_damage_confirmed = (
+            pv_terminal
+            and pv.n > 0
+            and math.isfinite(pv_death_rate)
+            and pv_death_rate < 0.05
+            and pv.mean < 1.0
+        )
 
         self.last_stats = {
             # Tier-encoded scalar stats (for log continuity)
@@ -717,11 +727,20 @@ class MCTSPlanner:
             "pv_kill_turn_mean": pv.mean_turns_alive,
             "pv_max_hp_gained_mean": pv.mean_max_hp_gained,
             "pv_max_hp_gained_std": pv.std_max_hp_gained,
+            "pv_terminal": float(pv_terminal),
+            "pv_early_stop_sim": float(sims_run),
+            "pv_zero_damage_confirmed": float(pv_zero_damage_confirmed),
             # Potion penalty
             "potion_cost_n": float(_potion_cost_n),
             "potion_cost_mean": (
                 _potion_cost_total / _potion_cost_n if _potion_cost_n else 0.0
             ),
+            # Rollout mode / cache
+            "rollout_mode_in_tree": float(self.rollout_mode == "in_tree"),
+            "root_cache_hit": float(root_cache_hit),
+            "in_tree_terminal_frac": in_tree_terminal_count / sims_run
+            if sims_run > 0
+            else 0.0,
         }
 
         if self.potion_costs:
@@ -733,7 +752,6 @@ class MCTSPlanner:
                 _potion_cost_total / _potion_cost_n if _potion_cost_n else 0.0,
             )
 
-        pv_death_rate = pv.deaths / pv.n if pv.n > 0 else math.nan
         pv_expected_dmg = min(pv.mean, float(start_hp)) if pv.n > 0 else math.nan
         pv_kill_t = pv.mean_turns_alive
         log.debug(
@@ -753,6 +771,71 @@ class MCTSPlanner:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _sim_select_expand_once(
+        self,
+        *,
+        path: list[tuple[_Node, tuple]],
+        current_node: _Node,
+        current_combat: Combat,
+        node_store: dict[tuple, _Node],
+        c: float,
+        nodes_expanded: int,
+    ) -> tuple[_Node, int]:
+        """One selection+expansion cycle within a simulation."""
+        while (
+            not current_combat.observe().done
+            and current_node.is_fully_expanded()
+            and current_node.edges
+        ):
+            concept_key = self._select_concept_key(current_node, c)
+            action = _resolve_action(concept_key, current_combat)
+            if action is None:
+                action = Action.end_turn()
+                concept_key = ("END",)
+            path.append((current_node, concept_key))
+            current_combat.step(action)
+            child_key = _mcts_state_key(current_combat)
+            if child_key not in node_store:
+                child_node = _Node(
+                    state_key=child_key,
+                    untried_action_keys=[
+                        _action_concept_key(a, current_combat)
+                        for a in _ordered_actions(current_combat)
+                    ],
+                )
+                node_store[child_key] = child_node
+                nodes_expanded += 1
+                current_node = child_node
+                break
+            current_node = node_store[child_key]
+
+        if (
+            not current_combat.observe().done
+            and not current_node.is_fully_expanded()
+        ):
+            concept_key = current_node.untried_action_keys.pop(0)
+            action = _resolve_action(concept_key, current_combat)
+            if action is None:
+                action = Action.end_turn()
+                concept_key = ("END",)
+            path.append((current_node, concept_key))
+            current_combat.step(action)
+            child_key = _mcts_state_key(current_combat)
+            if child_key not in node_store:
+                child_node = _Node(
+                    state_key=child_key,
+                    untried_action_keys=[
+                        _action_concept_key(a, current_combat)
+                        for a in _ordered_actions(current_combat)
+                    ],
+                )
+                node_store[child_key] = child_node
+                nodes_expanded += 1
+            else:
+                current_node = node_store[child_key]
+
+        return current_node, nodes_expanded
 
     def _select_concept_key(self, node: _Node, c: float) -> tuple:
         """UCB selection: argmin mean(a) - c * sqrt(ln N / n_a).
@@ -787,11 +870,13 @@ class MCTSPlanner:
 
     def _pv_well_visited_edge(
         self, root: _Node, combat: Combat
-    ) -> tuple[_EdgeStats | None, int]:
+    ) -> tuple[_EdgeStats | None, int, bool]:
         """Walk root → lex-best child while edge.n >= _effective_pv_min_n.
 
-        Returns (deepest_edge_satisfying_min_n, depth). Falls back to None
-        (caller uses chosen root edge) when no edge meets the threshold.
+        Returns (deepest_edge_satisfying_min_n, depth, pv_terminal).
+        ``pv_terminal`` is True when the walk reaches a done combat state.
+        Falls back to None (caller uses chosen root edge) when no edge meets
+        the threshold.
         """
         min_n = self._effective_pv_min_n()
         node = root
@@ -799,6 +884,7 @@ class MCTSPlanner:
         last_edge: _EdgeStats | None = None
         last_depth = 0
         depth = 0
+        pv_terminal = False
         while node.edges:
             key = min(node.edges, key=lambda k: _edge_lex_key(node.edges[k]))
             edge = node.edges[key]
@@ -811,13 +897,14 @@ class MCTSPlanner:
                 break
             sim_combat.step(action)
             if sim_combat.observe().done:
+                pv_terminal = True
                 break
             child = self._node_store.get(_mcts_state_key(sim_combat))
             if child is None or not child.edges:
                 break
             node = child
             depth += 1
-        return last_edge, last_depth
+        return last_edge, last_depth, pv_terminal
 
     def _best_root_concept(self, root: _Node) -> tuple[tuple, _EdgeStats]:
         """Pick the root concept key with the best lexicographic objective.
