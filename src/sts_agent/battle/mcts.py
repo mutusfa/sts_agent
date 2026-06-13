@@ -435,13 +435,13 @@ def _heuristic_rollout(
     Returns a TerminalOutcome describing the terminal state.
     """
     costs = potion_costs or {}
-    while not combat.observe().done:
+    while not combat._is_done():
         actions = _ordered_actions(combat)
         if costs:
             filtered = _filter_potion_actions_for_rollout(combat, actions, costs)
             if filtered:
                 actions = filtered
-        combat.step(actions[0])
+        combat._step_quiet(actions[0])
     return terminal_score(combat)
 
 
@@ -571,7 +571,7 @@ class MCTSPlanner:
             _initial_potions = list(current_combat._state.potions)  # type: ignore[union-attr]
 
             if self.rollout_mode == "in_tree":
-                while not current_combat.observe().done:
+                while not current_combat._is_done():
                     if self.max_nodes is not None and nodes_expanded >= self.max_nodes:
                         break
                     if (
@@ -603,7 +603,7 @@ class MCTSPlanner:
             sel_depth_sum += depth
             if depth > sel_depth_max_val:
                 sel_depth_max_val = depth
-            _done_before_rollout = current_combat.observe().done
+            _done_before_rollout = current_combat._is_done()
             if _done_before_rollout:
                 terminal_in_sel += 1
                 if self.rollout_mode == "in_tree":
@@ -784,7 +784,7 @@ class MCTSPlanner:
     ) -> tuple[_Node, int]:
         """One selection+expansion cycle within a simulation."""
         while (
-            not current_combat.observe().done
+            not current_combat._is_done()
             and current_node.is_fully_expanded()
             and current_node.edges
         ):
@@ -794,7 +794,7 @@ class MCTSPlanner:
                 action = Action.end_turn()
                 concept_key = ("END",)
             path.append((current_node, concept_key))
-            current_combat.step(action)
+            current_combat._step_quiet(action)
             child_key = _mcts_state_key(current_combat)
             if child_key not in node_store:
                 child_node = _Node(
@@ -811,7 +811,7 @@ class MCTSPlanner:
             current_node = node_store[child_key]
 
         if (
-            not current_combat.observe().done
+            not current_combat._is_done()
             and not current_node.is_fully_expanded()
         ):
             concept_key = current_node.untried_action_keys.pop(0)
@@ -820,7 +820,7 @@ class MCTSPlanner:
                 action = Action.end_turn()
                 concept_key = ("END",)
             path.append((current_node, concept_key))
-            current_combat.step(action)
+            current_combat._step_quiet(action)
             child_key = _mcts_state_key(current_combat)
             if child_key not in node_store:
                 child_node = _Node(
@@ -896,7 +896,7 @@ class MCTSPlanner:
             if action is None:
                 break
             sim_combat.step(action)
-            if sim_combat.observe().done:
+            if sim_combat._is_done():
                 pv_terminal = True
                 break
             child = self._node_store.get(_mcts_state_key(sim_combat))

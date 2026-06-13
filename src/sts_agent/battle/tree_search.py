@@ -56,7 +56,6 @@ from __future__ import annotations
 import dataclasses
 import logging
 import math
-from dataclasses import astuple
 
 from sts_env.combat import Action, Combat
 from sts_env.combat.cards import CardSpec, CardType
@@ -73,11 +72,21 @@ class SearchBudgetExceeded(Exception):
 
 
 def _powers_key(powers) -> tuple:  # type: ignore[no-untyped-def]
-    raw = astuple(powers)
-    # bomb_fuses is a list[tuple] — must be converted to tuple for hashability
-    return tuple(
-        tuple(v) if isinstance(v, list) else v
-        for v in raw
+    """Hashable key for a Powers instance — manual field access (no astuple)."""
+    return (
+        powers.strength, powers.vulnerable, powers.weak, powers.frail,
+        powers.ritual, powers.ritual_just_applied, powers.curl_up, powers.angry,
+        powers.spore_cloud, powers.entangled, powers.dexterity, powers.thorns,
+        powers.metallicize, powers.strength_loss_eot, powers.dexterity_loss_eot,
+        powers.strength_loss_this_turn, powers.asleep, powers.enemy_metallicize,
+        powers.dark_embrace, powers.feel_no_pain, powers.juggernaut, powers.brutality,
+        powers.demon_form, powers.berserk_energy, powers.corruption, powers.double_tap,
+        powers.rage_block, powers.artifact, powers.no_card_block_turns,
+        powers.panache_counter, powers.panache_damage, powers.magnetism,
+        powers.sadistic_nature,
+        tuple(powers.bomb_fuses) if powers.bomb_fuses else (),
+        powers.mayhem, powers.cards_played_this_turn, powers.combust,
+        powers.combust_dmg, powers.mode_shift, powers.sharp_hide,
     )
 
 
