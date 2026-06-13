@@ -23,6 +23,7 @@ Usage::
 from __future__ import annotations
 
 import inspect
+import json
 import logging
 from collections import Counter
 from contextlib import contextmanager
@@ -38,6 +39,13 @@ from sts_env.run.character import Character
 
 from .battle.base import BattleAgent, BattlePlanner, run_agent, run_planner
 from .strategy.base import BaseStrategyAgent
+from .strategy.probe_data import (
+    ProbeCollector,
+    ProbeContext,
+    ProbeDecisionRecord,
+    character_state_snapshot,
+    probe_context,
+)
 
 log = logging.getLogger(__name__)
 
@@ -177,6 +185,11 @@ def format_potion_log(result: RunResult) -> str:
     return _format_potion_log(result.potion_log)
 
 
+def _probe_collector_for(strategy_agent: BaseStrategyAgent) -> ProbeCollector | None:
+    collector = getattr(strategy_agent, "probe_collector", None)
+    return collector if isinstance(collector, ProbeCollector) else None
+
+
 class _RunAgentAdapter:
     """Combines a battle planner/agent with a strategy agent into one object
     satisfying RunAgentProtocol.
@@ -200,6 +213,12 @@ class _RunAgentAdapter:
         self._sts_map: object = None
         self._run_seed: int = 0
         self._walk_started: bool = False
+        self._last_potion_costs: dict[str, float] = {}
+        self._last_combat_encounter_id: str | None = None
+
+    @property
+    def probe_collector(self) -> ProbeCollector | None:
+        return _probe_collector_for(self._strategy)
 
     def begin_map_run(self, sts_map, seed: int) -> None:
         self._sts_map = sts_map
@@ -213,6 +232,14 @@ class _RunAgentAdapter:
         self._path.append(coord)
         self._walk_started = True
         self._strategy.on_map_step(coord)
+        collector = self.probe_collector
+        if collector is not None:
+            floor, _x = coord
+            collector.log_path_step(
+                floor=floor + 1,
+                coord=coord,
+                committed_path=list(self._path),
+            )
 
     def provisional_remaining_path(
         self,
@@ -256,6 +283,20 @@ class _RunAgentAdapter:
             if hasattr(combat, "_state")
             else []
         )
+        self._last_combat_encounter_id = None
+        if hasattr(combat, "_state") and combat._state.enemies:  # type: ignore[union-attr]
+            names = [
+                e.name
+                for e in combat._state.enemies  # type: ignore[union-attr]
+                if e.name != "Empty"
+            ]
+            if names:
+                self._last_combat_encounter_id = names[0]
+
+        collector = self.probe_collector
+        potion_detail: dict[str, object] = {}
+        self._last_potion_costs = {}
+
         # Auto-evaluate potion costs for MCTSPlanner
         if hasattr(self._planner, "potion_costs") and hasattr(combat, "_state"):
             potions = combat._state.potions  # type: ignore[union-attr]
@@ -263,7 +304,6 @@ class _RunAgentAdapter:
                 from .strategy.evaluate_potions import evaluate_potions
                 from sts_env.run.character import Character
 
-                # Build a minimal character for evaluate_potions.
                 char = Character(
                     player_hp=combat._state.player_hp,  # type: ignore[union-attr]
                     player_max_hp=combat._state.player_max_hp,  # type: ignore[union-attr]
@@ -271,24 +311,60 @@ class _RunAgentAdapter:
                     potions=list(potions),
                 )
                 upcoming = self._upcoming_encounters()
-                self._planner.potion_costs = evaluate_potions(
-                    char,
-                    upcoming,
-                    self._run_seed,
-                    possible_encounters=(
-                        self._strategy.get_possible_encounters()
-                        if hasattr(self._strategy, "get_possible_encounters")
-                        else None
-                    ),
-                )
+                floor = self._potion_tracker.current_floor
+                if collector is not None:
+                    ctx = ProbeContext(
+                        collector=collector,
+                        decision_type="potion_eval",
+                        floor=floor,
+                        run_seed=self._run_seed,
+                    )
+                    with probe_context(ctx):
+                        self._last_potion_costs = evaluate_potions(
+                            char,
+                            upcoming,
+                            self._run_seed,
+                            possible_encounters=(
+                                self._strategy.get_possible_encounters()
+                                if hasattr(self._strategy, "get_possible_encounters")
+                                else None
+                            ),
+                            detail_out=potion_detail,
+                        )
+                else:
+                    self._last_potion_costs = evaluate_potions(
+                        char,
+                        upcoming,
+                        self._run_seed,
+                        possible_encounters=(
+                            self._strategy.get_possible_encounters()
+                            if hasattr(self._strategy, "get_possible_encounters")
+                            else None
+                        ),
+                    )
+                self._planner.potion_costs = self._last_potion_costs
+                if collector is not None and potion_detail:
+                    collector.record(
+                        ProbeDecisionRecord(
+                            decision_type="potion_eval",
+                            floor=floor,
+                            seed=self._run_seed,
+                            character_state=character_state_snapshot(char),
+                            run_seed=self._run_seed,
+                            extra=dict(potion_detail),
+                        )
+                    )
                 log.debug("Potion costs: %s", self._planner.potion_costs)
             else:
                 self._planner.potion_costs = {}
         self._combat_count += 1
         damage = _run_battle(self._planner, combat)
+        survived = True
         if hasattr(combat, "_state"):
             potions_after = list(combat._state.potions)  # type: ignore[union-attr]
             spent = list((Counter(potions_before) - Counter(potions_after)).elements())
+            if hasattr(combat, "observe"):
+                survived = not combat.observe().player_dead
             if spent:
                 self._potion_tracker.record_spent(spent)
                 for potion_id in spent:
@@ -296,6 +372,17 @@ class _RunAgentAdapter:
                         "  Potion spent: %s on floor %d",
                         potion_id,
                         self._potion_tracker.current_floor,
+                    )
+                if collector is not None:
+                    collector.log_potion_spend(
+                        {
+                            "floor": self._potion_tracker.current_floor,
+                            "spent_potion_ids": spent,
+                            "encounter_id": self._last_combat_encounter_id,
+                            "damage_taken": damage,
+                            "survived": survived,
+                            "assigned_costs_at_entry": dict(self._last_potion_costs),
+                        }
                     )
         return damage
 
@@ -305,7 +392,33 @@ class _RunAgentAdapter:
         return self._strategy.pick_neow(options)
 
     def pick_branch(self, sts_map, character, current, seed):
-        return self._strategy.pick_branch(sts_map, character, current, seed)
+        collector = self.probe_collector
+        if collector is None:
+            return self._strategy.pick_branch(sts_map, character, current, seed)
+        ctx = ProbeContext(
+            collector=collector,
+            decision_type="pick_branch",
+            floor=character.floor,
+            run_seed=self._run_seed,
+        )
+        with probe_context(ctx):
+            pick = self._strategy.pick_branch(sts_map, character, current, seed)
+        collector.record(
+            ProbeDecisionRecord(
+                decision_type="pick_branch",
+                floor=character.floor,
+                seed=seed,
+                character_state=character_state_snapshot(character),
+                pick=str(list(pick)),
+                run_seed=self._run_seed,
+                extra={
+                    "coord": list(pick),
+                    "current": list(current) if current is not None else None,
+                    "committed_path": [list(c) for c in self._path],
+                },
+            )
+        )
+        return pick
 
     def pick_card(self, character, card_choices, upcoming_encounters, seed, **kwargs):
         return self._strategy.pick_card(
@@ -348,15 +461,18 @@ class _RunAgentAdapter:
 
 
 class _CombinedObserver:
-    """FloorObserver that tracks potion lifecycle and delegates to MLflow."""
+    """FloorObserver that tracks potion lifecycle, probe data, and MLflow."""
 
     def __init__(
         self,
         potion_tracker: _PotionTracker,
         inner: _MlflowObserver,
+        *,
+        probe_collector: ProbeCollector | None = None,
     ) -> None:
         self._potion_tracker = potion_tracker
         self._inner = inner
+        self._probe_collector = probe_collector
 
     @contextmanager
     def floor_scope(
@@ -371,6 +487,21 @@ class _CombinedObserver:
                 yield attrs
             finally:
                 self._potion_tracker.end_floor(list(character.potions))
+                collector = self._probe_collector
+                if collector is None:
+                    return
+                if "damage_taken" in attrs:
+                    collector.log_outcome(
+                        {
+                            "floor": floor,
+                            "room_type": room_type,
+                            "encounter_id": attrs.get("encounter_id"),
+                            "damage_taken": attrs.get("damage_taken"),
+                            "survived": attrs.get("survived"),
+                            "max_hp_gained": attrs.get("max_hp_gained"),
+                            "turns": attrs.get("turns"),
+                        }
+                    )
 
 
 class _MlflowObserver:
@@ -399,6 +530,11 @@ class _MlflowObserver:
                     "max_hp_before": character.player_max_hp,
                     "gold_before": character.gold,
                     "deck_size_before": len(character.deck),
+                    "deck_multiset": json.dumps(
+                        dict(Counter(character.deck)), sort_keys=True
+                    ),
+                    "relics": ", ".join(character.relics),
+                    "potions": ", ".join(character.potions),
                 }
             )
             attrs: dict[str, Any] = {}
@@ -462,6 +598,10 @@ def run_act1(
     if strategy_agent is None:
         strategy_agent = BaseStrategyAgent(seed=seed)
 
+    collector = _probe_collector_for(strategy_agent)
+    if collector is not None:
+        collector.run_seed = seed
+
     span = mlflow.get_current_active_span()
     if span:
         span.set_attributes(
@@ -480,8 +620,16 @@ def run_act1(
 
         agent.begin_map_run(linear_scenario_map(act1_encounters(seed), seed), seed)
     potion_tracker = agent._potion_tracker
-    observer = _CombinedObserver(potion_tracker, _MlflowObserver())
+    observer = _CombinedObserver(
+        potion_tracker,
+        _MlflowObserver(),
+        probe_collector=collector,
+    )
     result = _env_run_act1(seed, agent, use_map=use_map, observer=observer)
     result.potion_log = list(potion_tracker.entries)
+    if collector is not None:
+        collector.flush_potion_log(result.potion_log)
+        if result.room_log:
+            collector.flush_room_log(result.room_log)
     _log_potion_summary(result)
     return result

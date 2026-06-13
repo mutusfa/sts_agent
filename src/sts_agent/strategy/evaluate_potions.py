@@ -30,6 +30,7 @@ import logging
 
 from sts_env.run.character import Character
 
+from .probe_data import sim_distribution_to_dict
 from .simulate import (
     SimDistribution,
     _resolve_enc,
@@ -185,6 +186,7 @@ def _eval_single(
     seed: int,
     *,
     without_cache: dict[TargetKey, SimDistribution] | None = None,
+    detail_out: dict[str, object] | None = None,
 ) -> float:
     """Estimate standalone HP saved by having this potion across all targets.
 
@@ -193,6 +195,7 @@ def _eval_single(
     """
     cache = without_cache or _build_without_cache(character, targets, seed)
     best_saving = 0.0
+    probe_pairs: list[dict[str, object]] = []
 
     for enc_type, enc_id, floors_ahead in targets:
         key = (enc_type, enc_id, floors_ahead)
@@ -203,6 +206,18 @@ def _eval_single(
 
         discounted = _marginal_saving_for_target(
             without_result, with_result, floors_ahead
+        )
+
+        probe_pairs.append(
+            {
+                "potion_id": potion_id,
+                "encounter_type": enc_type,
+                "encounter_id": enc_id,
+                "floors_ahead": floors_ahead,
+                "without": sim_distribution_to_dict(without_result),
+                "with": sim_distribution_to_dict(with_result),
+                "discounted_benefit": discounted,
+            }
         )
 
         log.debug(
@@ -221,6 +236,10 @@ def _eval_single(
         )
         if discounted > best_saving:
             best_saving = discounted
+
+    if detail_out is not None:
+        detail_out.setdefault("probe_pairs", []).extend(probe_pairs)
+        detail_out.setdefault("singles", {})[potion_id] = best_saving
 
     return best_saving
 
@@ -317,6 +336,7 @@ def evaluate_potions(
     seed: int,
     *,
     possible_encounters: dict | None = None,
+    detail_out: dict[str, object] | None = None,
 ) -> dict[str, float]:
     """Compute virtual HP costs for all potions the character currently holds.
 
@@ -342,6 +362,16 @@ def evaluate_potions(
 
     targets = _select_targets(upcoming, possible_encounters)
     log.debug("Targets for potion eval: %s", targets)
+    if detail_out is not None:
+        detail_out.clear()
+        detail_out["targets"] = [
+            {"encounter_type": t, "encounter_id": e, "floors_ahead": f}
+            for t, e, f in targets
+        ]
+        detail_out["potions_held"] = list(character.potions)
+        detail_out["probe_pairs"] = []
+        detail_out["singles"] = {}
+        detail_out["pair_credits"] = {}
     costs: dict[str, float] = {}
     bag_full = len(character.potions) >= character.max_potion_slots
 
@@ -363,12 +393,16 @@ def evaluate_potions(
     singles: dict[str, float] = {}
     for p in non_fairy:
         singles[p] = _eval_single(
-            character, p, targets, seed, without_cache=without_cache
+            character, p, targets, seed,
+            without_cache=without_cache,
+            detail_out=detail_out,
         )
 
     pair_savings = _eval_pairs(
         character, singles, targets, seed, without_cache=without_cache
     )
+    if detail_out is not None:
+        detail_out["pair_credits"] = dict(pair_savings)
 
     for p in non_fairy:
         single_val = singles.get(p, 0.0)
@@ -377,6 +411,10 @@ def evaluate_potions(
         if bag_full:
             cost *= FULL_BAG_DISCOUNT
         costs[p] = cost
+
+    if detail_out is not None:
+        detail_out["assigned_costs"] = dict(costs)
+        detail_out["bag_full"] = bag_full
 
     log.info(
         "Potion costs: %s (bag_full=%s)",

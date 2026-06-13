@@ -50,3 +50,20 @@ def setup_tracing(
     mlflow.dspy.autolog()
 
     log.info("MLflow tracing enabled: experiment=%s uri=%s", experiment_name, uri)
+
+
+def set_span_attributes(attrs: dict[str, object]) -> None:
+    """Set attributes on the active MLflow span, if any."""
+    span = mlflow.get_current_active_span()
+    if span is not None:
+        span.set_attributes(attrs)
+
+
+def log_probe_artifact(name: str, payload: dict[str, object]) -> None:
+    """Log structured probe data as an MLflow artifact when a run is active."""
+    if not mlflow.active_run():
+        return
+    try:
+        mlflow.log_dict(payload, f"probe_data/{name}.json")
+    except Exception:
+        log.debug("Failed to log probe artifact %s", name, exc_info=True)

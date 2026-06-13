@@ -322,7 +322,7 @@ def probe_encounter(
     stats = planner.last_stats
     obs = combat.observe()
 
-    return SimDistribution(
+    dist = SimDistribution(
         mean_score=stats.get("mean", float("nan")),
         std_score=stats.get("std", 0.0),
         max_score=stats.get("max", float("nan")),
@@ -339,6 +339,21 @@ def probe_encounter(
             stats.get("mean_damage_taken_dead", float("nan"))
         ),
     )
+
+    from .probe_data import get_probe_context
+
+    ctx = get_probe_context()
+    if ctx is not None:
+        ctx.collector.log_probe(
+            dist,
+            encounter_type=encounter_type,
+            encounter_id=encounter_id,
+            enc_seed=seed,
+            character=character,
+            ctx=ctx,
+        )
+
+    return dist
 
 
 def probe_with_card(

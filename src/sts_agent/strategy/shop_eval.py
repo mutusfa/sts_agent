@@ -14,6 +14,7 @@ from sts_env.run.shop import (
 )
 
 from .evaluate_potions import _eval_single, _select_targets
+from .probe_data import sim_distribution_to_dict
 from .simulate import (
     SimDistribution,
     probe_encounter,
@@ -109,6 +110,33 @@ def _aggregate_probes(
     return (total_damage, avg_survival, worst)
 
 
+def shop_score_to_dict(
+    score: ShopScore,
+    *,
+    encounters: list[tuple[str, str]] | None = None,
+    per_encounter: list[SimDistribution] | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "action": score.action,
+        "total_expected_damage": score.total_expected_damage,
+        "total_survival_rate": score.total_survival_rate,
+        "worst_max_score": score.worst_max_score,
+        "price": score.price,
+        "potion_value": score.potion_value,
+    }
+    if per_encounter:
+        enc_list: list[dict[str, object]] = []
+        for idx, dist in enumerate(per_encounter):
+            entry = sim_distribution_to_dict(dist)
+            if encounters and idx < len(encounters):
+                enc_type, enc_id = encounters[idx]
+                entry["encounter_type"] = enc_type
+                entry["encounter_id"] = enc_id
+            enc_list.append(entry)
+        payload["per_encounter"] = enc_list
+    return payload
+
+
 def _probe_action(
     probe_fn,
     character: Character,
@@ -117,7 +145,7 @@ def _probe_action(
     *,
     max_nodes: int,
     simulations: int,
-) -> tuple[float, float, float]:
+) -> tuple[float, float, float, list[SimDistribution]]:
     dists: list[SimDistribution] = []
     for idx, (enc_type, enc_id) in enumerate(encounters):
         enc_seed = seed * 1000 + idx
@@ -127,7 +155,8 @@ def _probe_action(
                 max_nodes=max_nodes, simulations=simulations,
             )
         )
-    return _aggregate_probes(dists)
+    damage, survival, worst = _aggregate_probes(dists)
+    return damage, survival, worst, dists
 
 
 def evaluate_shop_baseline(
@@ -137,9 +166,10 @@ def evaluate_shop_baseline(
     *,
     max_nodes: int = 5000,
     simulations: int = 5000,
+    out_dists: list[SimDistribution] | None = None,
 ) -> ShopScore:
     """Score the current deck against upcoming encounters (leave shop)."""
-    damage, survival, worst = _probe_action(
+    damage, survival, worst, dists = _probe_action(
         probe_encounter,
         character,
         encounters,
@@ -147,6 +177,9 @@ def evaluate_shop_baseline(
         max_nodes=max_nodes,
         simulations=simulations,
     )
+    if out_dists is not None:
+        out_dists.clear()
+        out_dists.extend(dists)
     return ShopScore(
         action="leave",
         total_expected_damage=damage,
@@ -165,6 +198,7 @@ def evaluate_shop_option(
     max_nodes: int = 5000,
     simulations: int = 5000,
     possible_encounters: dict | None = None,
+    out_dists: list[SimDistribution] | None = None,
 ) -> ShopScore:
     """Score a single shop action without mutating *character*."""
     price = _action_price(action, inventory)
@@ -173,11 +207,12 @@ def evaluate_shop_option(
         return evaluate_shop_baseline(
             character, encounters, seed,
             max_nodes=max_nodes, simulations=simulations,
+            out_dists=out_dists,
         )
 
     if action.startswith("remove:"):
         card_id = action.split(":", 1)[1]
-        damage, survival, worst = _probe_action(
+        damage, survival, worst, dists = _probe_action(
             lambda ch, et, ei, s, **kw: probe_without_card(
                 ch, card_id, et, ei, s, **kw,
             ),
@@ -187,6 +222,9 @@ def evaluate_shop_option(
             max_nodes=max_nodes,
             simulations=simulations,
         )
+        if out_dists is not None:
+            out_dists.clear()
+            out_dists.extend(dists)
         return ShopScore(
             action=action,
             total_expected_damage=damage,
@@ -199,7 +237,7 @@ def evaluate_shop_option(
         idx = int(action.split(":", 1)[1])
         card_id = inventory.cards[idx][0]
         assert card_id is not None
-        damage, survival, worst = _probe_action(
+        damage, survival, worst, dists = _probe_action(
             lambda ch, et, ei, s, **kw: probe_with_card(
                 ch, card_id, et, ei, s, **kw,
             ),
@@ -209,6 +247,9 @@ def evaluate_shop_option(
             max_nodes=max_nodes,
             simulations=simulations,
         )
+        if out_dists is not None:
+            out_dists.clear()
+            out_dists.extend(dists)
         return ShopScore(
             action=action,
             total_expected_damage=damage,
@@ -222,7 +263,7 @@ def evaluate_shop_option(
         entry = inventory.relics[idx]
         assert entry is not None
         relic_id = entry[0]
-        damage, survival, worst = _probe_action(
+        damage, survival, worst, dists = _probe_action(
             lambda ch, et, ei, s, **kw: probe_with_relic(
                 ch, relic_id, et, ei, s, **kw,
             ),
@@ -232,6 +273,9 @@ def evaluate_shop_option(
             max_nodes=max_nodes,
             simulations=simulations,
         )
+        if out_dists is not None:
+            out_dists.clear()
+            out_dists.extend(dists)
         return ShopScore(
             action=action,
             total_expected_damage=damage,

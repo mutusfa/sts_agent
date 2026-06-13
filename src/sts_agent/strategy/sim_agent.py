@@ -26,19 +26,34 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING
+
+import mlflow
 
 from sts_env.run.character import Character
 from sts_env.combat.card_pools import pool
 from sts_env.combat.cards import CardColor, Rarity
 
+from sts_agent.tracing import log_probe_artifact, set_span_attributes
+
 from .base import BaseStrategyAgent
+from .probe_data import (
+    ProbeCollector,
+    ProbeContext,
+    ProbeDecisionRecord,
+    card_evaluation_to_dict,
+    character_state_snapshot,
+    probe_context,
+)
 from .shop_eval import (
     encounters_for_shop_probes,
     evaluate_shop_baseline,
     evaluate_shop_option,
     execute_shop_action,
+    format_shop_inventory,
     list_shop_candidates,
+    shop_score_to_dict,
 )
 from .simulate import SimDistribution, probe_encounter, probe_with_card
 
@@ -86,6 +101,20 @@ class CardEvaluation:
 
 _RARE_SET = set(pool(CardColor.RED, Rarity.RARE))
 _UNCOMMON_SET = set(pool(CardColor.RED, Rarity.UNCOMMON))
+_PROBEABLE_ENCOUNTER_TYPES = frozenset(
+    {"easy", "hard", "elite", "boss", "monster"}
+)
+
+
+def _combat_encounters_only(
+    encounters: list[tuple[str, str]],
+) -> list[tuple[str, str]]:
+    """Keep only room types that :func:`probe_encounter` can simulate."""
+    return [
+        (enc_type, enc_id)
+        for enc_type, enc_id in encounters
+        if enc_type in _PROBEABLE_ENCOUNTER_TYPES
+    ]
 
 
 def _rarity_rank(card_id: str | None) -> int:
@@ -128,11 +157,24 @@ class SimStrategyAgent(BaseStrategyAgent):
         sim_sims: int = 5_000,
         timeout_seconds: int = 300,
         seed: int | None = None,
+        *,
+        probe_collector: ProbeCollector | None = None,
+        probe_jsonl: Path | str | None = None,
     ) -> None:
         super().__init__(seed=seed)
         self.max_encounters = max_encounters_to_sim
         self.sim_nodes = sim_nodes
         self.sim_sims = sim_sims
+        if probe_collector is not None:
+            self.probe_collector = probe_collector
+        elif probe_jsonl is not None:
+            self.probe_collector = ProbeCollector(probe_jsonl)
+        else:
+            self.probe_collector = ProbeCollector()
+
+    def begin_map_run(self, sts_map, seed: int) -> None:
+        super().begin_map_run(sts_map, seed)
+        self.probe_collector.run_seed = seed
 
     # ------------------------------------------------------------------
     # Card-pick (specialised)
@@ -149,18 +191,72 @@ class SimStrategyAgent(BaseStrategyAgent):
         current_position: tuple[int, int] | None = None,
     ) -> str | None:
         """Evaluate all card options and pick the best one."""
+        map_view = self._build_map_view(character, sts_map, current_position)
+        return self._pick_card_traced(
+            character,
+            card_choices,
+            upcoming_encounters,
+            seed,
+            map_view,
+        )
+
+    @mlflow.trace(name="pick_card")
+    def _pick_card_traced(
+        self,
+        character: Character,
+        card_choices: list[str],
+        upcoming_encounters: list[tuple[str, str]],
+        seed: int,
+        map_view: str,
+    ) -> str | None:
+        """Traced pick_card body with persisted probe evaluations."""
         if not card_choices:
+            set_span_attributes({"pick": "skip", "card_choices": ""})
             return None
 
-        to_sim = upcoming_encounters[:self.max_encounters]
+        to_sim = _combat_encounters_only(upcoming_encounters[: self.max_encounters])
         if not to_sim:
-            return self._pick_by_rarity(card_choices)
+            pick = self._pick_by_rarity(card_choices)
+            set_span_attributes(
+                {
+                    "character_state": character.summary(),
+                    "card_choices": ", ".join(card_choices),
+                    "seed": seed,
+                    "map_view": map_view,
+                    "pick": pick or "skip",
+                    "fallback": True,
+                    "evaluation_count": 0,
+                }
+            )
+            return pick
+
+        set_span_attributes(
+            {
+                "character_state": character.summary(),
+                "card_choices": ", ".join(card_choices),
+                "seed": seed,
+                "map_view": map_view,
+                "upcoming_encounters": ", ".join(
+                    f"{t}/{i or '*'}" for t, i in to_sim
+                ),
+            }
+        )
+
+        run_seed = self._run_seed if self._run_seed is not None else seed
 
         options: list[CardEvaluation] = []
         candidates = [None] + list(card_choices)  # None = skip (baseline)
 
         for card_id in candidates:
-            evals = self._evaluate_option(character, card_id, to_sim, seed)
+            option_ctx = ProbeContext(
+                collector=self.probe_collector,
+                decision_type="pick_card",
+                floor=character.floor,
+                run_seed=run_seed,
+                option=card_id or "SKIP",
+            )
+            with probe_context(option_ctx):
+                evals = self._evaluate_option(character, card_id, to_sim, seed)
             options.append(evals)
             label = card_id or "SKIP"
             spreads = " | ".join(
@@ -169,15 +265,65 @@ class SimStrategyAgent(BaseStrategyAgent):
             )
             log.info(
                 "  %-18s  %s",
-                label, spreads,
+                label,
+                spreads,
             )
 
         best = max(options, key=lambda e: e.score)
+        pick = best.card_id
         log.info(
             "  → Best: %s (death=%s)",
-            best.card_id or "SKIP", best.death_pct,
+            best.card_id or "SKIP",
+            best.death_pct,
         )
-        return best.card_id
+
+        serialized = [
+            card_evaluation_to_dict(e, encounters=to_sim) for e in options
+        ]
+        record = ProbeDecisionRecord(
+            decision_type="pick_card",
+            floor=character.floor,
+            seed=seed,
+            run_seed=run_seed,
+            character_state=character_state_snapshot(character),
+            pick=pick,
+            card_choices=list(card_choices),
+            upcoming_encounters=list(to_sim),
+            evaluations=serialized,
+            map_view=map_view,
+        )
+        self.probe_collector.record(record)
+
+        artifact_name = f"floor_{character.floor}_pick_card"
+        log_probe_artifact(artifact_name, record.to_dict())
+
+        set_span_attributes(
+            {
+                "pick": pick or "skip",
+                "fallback": False,
+                "evaluation_count": len(options),
+                "best_card": pick or "skip",
+                "best_death_pct": best.death_pct,
+            }
+        )
+        return pick
+
+    def _build_map_view(
+        self,
+        character: Character,
+        sts_map: "StSMap | None",
+        current_position: tuple[int, int] | None,
+    ) -> str:
+        if sts_map is None or current_position is None:
+            return character.summary()
+        from .map_routing import build_scored_map_view
+
+        return build_scored_map_view(
+            sts_map,
+            character,
+            current_position,
+            committed_path=self._committed_path(),
+        )
 
     def _evaluate_option(
         self,
@@ -245,25 +391,61 @@ class SimStrategyAgent(BaseStrategyAgent):
 
     def shop(self, inventory: "ShopInventory", character: Character) -> None:
         """Probe-based greedy shop visit."""
+        self._shop_traced(inventory, character)
+
+    @mlflow.trace(name="shop")
+    def _shop_traced(self, inventory: "ShopInventory", character: Character) -> None:
         possible = self.get_possible_encounters()
         if possible is None:
             super().shop(inventory, character)
+            set_span_attributes({"fallback": True, "shop_actions": "random"})
             return
 
         encounters = encounters_for_shop_probes(possible)
         seed = self._probe_seed(character)
+        actions_taken: list[str] = []
+        shop_iterations: list[dict[str, object]] = []
+        run_seed = self._run_seed if self._run_seed is not None else seed
+        entry_snapshot = character_state_snapshot(character)
+
+        set_span_attributes(
+            {
+                "character_state": character.summary(),
+                "floor": character.floor,
+                "seed": seed,
+                "fallback": False,
+            }
+        )
 
         for iteration in range(10):
             candidates = list_shop_candidates(inventory, character)
             if len(candidates) <= 1:
                 break
 
-            baseline = evaluate_shop_baseline(
-                character,
-                encounters,
-                seed + iteration,
-                max_nodes=self.sim_nodes,
-                simulations=self.sim_sims,
+            iteration_evals: list[dict[str, object]] = []
+            baseline_dists: list[SimDistribution] = []
+            shop_ctx = ProbeContext(
+                collector=self.probe_collector,
+                decision_type="shop",
+                floor=character.floor,
+                run_seed=run_seed,
+                option="leave",
+            )
+            with probe_context(shop_ctx):
+                baseline = evaluate_shop_baseline(
+                    character,
+                    encounters,
+                    seed + iteration,
+                    max_nodes=self.sim_nodes,
+                    simulations=self.sim_sims,
+                    out_dists=baseline_dists,
+                )
+            iteration_evals.append(
+                shop_score_to_dict(
+                    baseline,
+                    encounters=encounters,
+                    per_encounter=baseline_dists,
+                )
             )
             best_action = "leave"
             best_score = baseline.score
@@ -271,25 +453,70 @@ class SimStrategyAgent(BaseStrategyAgent):
             for action in candidates:
                 if action == "leave":
                     continue
-                option = evaluate_shop_option(
-                    action,
-                    character,
-                    inventory,
-                    encounters,
-                    seed + iteration,
-                    max_nodes=self.sim_nodes,
-                    simulations=self.sim_sims,
-                    possible_encounters=possible,
+                action_dists: list[SimDistribution] = []
+                action_ctx = ProbeContext(
+                    collector=self.probe_collector,
+                    decision_type="shop",
+                    floor=character.floor,
+                    run_seed=run_seed,
+                    option=action,
+                )
+                with probe_context(action_ctx):
+                    option = evaluate_shop_option(
+                        action,
+                        character,
+                        inventory,
+                        encounters,
+                        seed + iteration,
+                        max_nodes=self.sim_nodes,
+                        simulations=self.sim_sims,
+                        possible_encounters=possible,
+                        out_dists=action_dists,
+                    )
+                iteration_evals.append(
+                    shop_score_to_dict(
+                        option,
+                        encounters=encounters,
+                        per_encounter=action_dists,
+                    )
                 )
                 if option.score > best_score:
                     best_score = option.score
                     best_action = action
+
+            shop_iterations.append(
+                {
+                    "iteration": iteration,
+                    "candidates": candidates,
+                    "evaluations": iteration_evals,
+                    "pick": best_action,
+                }
+            )
 
             if best_action == "leave":
                 break
 
             log.info("  Shop: %s", best_action)
             execute_shop_action(best_action, inventory, character)
+            actions_taken.append(best_action)
+
+        self.probe_collector.record(
+            ProbeDecisionRecord(
+                decision_type="shop",
+                floor=character.floor,
+                seed=seed,
+                run_seed=run_seed,
+                character_state=entry_snapshot,
+                pick=", ".join(actions_taken) or "leave",
+                extra={
+                    "shop_inventory": format_shop_inventory(inventory),
+                    "iterations": shop_iterations,
+                    "actions_taken": actions_taken,
+                },
+            )
+        )
+
+        set_span_attributes({"shop_actions": ", ".join(actions_taken) or "leave"})
 
     # ------------------------------------------------------------------
     # Map route (specialised)
