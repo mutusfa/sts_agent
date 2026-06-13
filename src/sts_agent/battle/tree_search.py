@@ -53,11 +53,13 @@ returns (== cutoff, a lower bound) are not stored.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import math
 from dataclasses import astuple
 
 from sts_env.combat import Action, Combat
+from sts_env.combat.cards import CardSpec, CardType
 from sts_env.combat.state import ActionType
 from sts_env.combat.card import Card
 
@@ -129,34 +131,61 @@ def _state_key(combat: Combat) -> tuple:
 
 
 # ---------------------------------------------------------------------------
-# Move ordering
+# Move ordering — spec-driven tiers (computed per action, no cache)
 # ---------------------------------------------------------------------------
 
-# Per-action priority — lower = tried first.  Spaced by 10 so new entries can
-# slot between tiers without renumbering.
-#
-#  10   (reserved for POWER cards — none implemented yet)
-#  20   cards that apply lasting effects this turn (Bash → Vulnerable)
-#  25   USE_POTION — defensive/utility potions best used before taking damage
-#  30   free (cost-0) cards — always play, they cost nothing
-#  40-49 attack-dominant cards, ranked by expected damage/energy
-#  50-59 block/defensive skills, ranked by expected block/energy
-#  59   DISCARD_POTION — almost never useful; try last before END_TURN
-#  60   END_TURN (always last)
-_CARD_TIER: dict[str, int] = {
-    "Bash": 20,
-    "Anger": 30,
-    "Cleave": 40,
-    "PommelStrike": 42,
-    "Strike": 44,
-    "IronWave": 46,
-    "ShrugItOff": 50,
-    "Defend": 52,
-}
-_DEFAULT_TIER = 44  # unknown card → Strike-equivalent (safe middle)
-_USE_POTION_TIER = 25
-_DISCARD_POTION_TIER = 59
-_END_TURN_TIER = 60
+# Lower = tried first.  Spaced by 10 so new tiers can slot between.
+_TIER_POWER = 10
+_TIER_USE_POTION = 20
+_TIER_CUSTOM = 30
+_TIER_DECLARATIVE = 40
+_TIER_ATTACK = 50
+_TIER_BLOCK = 60
+_TIER_FALLBACK = 65
+_TIER_CHOOSE = 70
+_TIER_DISCARD_POTION = 75
+_TIER_SKIP_CHOICE = 78
+_TIER_END_TURN = 80
+
+# Declarative int fields on CardSpec beyond attack/hits/block.
+_SPECIAL_DECLARATIVE_FIELDS: tuple[str, ...] = tuple(
+    f.name
+    for f in dataclasses.fields(CardSpec)
+    if f.default == 0 and not isinstance(f.default, bool) and f.name not in ("attack", "hits", "block")
+)
+
+
+def _effective_int(spec: CardSpec, field: str, upgraded: bool) -> int:
+    base = getattr(spec, field, 0)
+    if not upgraded:
+        return int(base)
+    return int(base) + int(spec.upgrade.get(field, 0))
+
+
+def _has_special_declarative(spec: CardSpec, upgraded: bool) -> bool:
+    return any(_effective_int(spec, name, upgraded) > 0 for name in _SPECIAL_DECLARATIVE_FIELDS)
+
+
+def _effective_attack(spec: CardSpec, upgraded: bool) -> int:
+    return _effective_int(spec, "attack", upgraded)
+
+
+def _card_play_tier(card: Card) -> int:
+    """Return move-order tier for a card play from spec + upgrade suffix."""
+    spec = card.spec
+    upgraded = card.upgraded
+
+    if spec.card_type == CardType.POWER:
+        return _TIER_POWER
+    if spec.custom is not None or spec.eot_resolve is not None:
+        return _TIER_CUSTOM
+    if _has_special_declarative(spec, upgraded):
+        return _TIER_DECLARATIVE
+    if _effective_attack(spec, upgraded) > 0:
+        return _TIER_ATTACK
+    if _effective_int(spec, "block", upgraded) > 0:
+        return _TIER_BLOCK
+    return _TIER_FALLBACK
 
 
 def _order_key(action: Action, combat: Combat) -> tuple:
@@ -164,27 +193,26 @@ def _order_key(action: Action, combat: Combat) -> tuple:
     s = combat._state  # type: ignore[union-attr]
     if action.action_type == ActionType.PLAY_CARD:
         card: Card = s.piles.hand[action.hand_index]
-        tier = _CARD_TIER.get(card.card_id, _DEFAULT_TIER)
-        # Factor in effective cost so free cards sort first
-        from sts_env.combat.cards import get_spec
-        spec = get_spec(card.card_id)
-        effective_cost = card.cost_override if card.cost_override is not None else spec.cost
+        spec = card.spec
+        tier = _card_play_tier(card)
+        effective_cost = card.effective_cost(s.energy)
         target_hp = 0
-        ti = action.target_index
-        if 0 <= ti < len(s.enemies):
-            target_hp = s.enemies[ti].hp
+        if _effective_attack(spec, card.upgraded) > 0:
+            ti = action.target_index
+            if 0 <= ti < len(s.enemies):
+                target_hp = s.enemies[ti].hp
         return (tier, effective_cost, target_hp, card.card_id)
     if action.action_type == ActionType.USE_POTION:
         potion_id = s.potions[action.potion_index] if action.potion_index < len(s.potions) else ""
-        return (_USE_POTION_TIER, 0, 0, potion_id)
+        return (_TIER_USE_POTION, 0, 0, potion_id)
     if action.action_type == ActionType.DISCARD_POTION:
         potion_id = s.potions[action.potion_index] if action.potion_index < len(s.potions) else ""
-        return (_DISCARD_POTION_TIER, 0, 0, potion_id)
+        return (_TIER_DISCARD_POTION, 0, 0, potion_id)
     if action.action_type == ActionType.CHOOSE_CARD:
-        return (_USE_POTION_TIER, 0, action.choice_index, "CHOOSE")
+        return (_TIER_CHOOSE, 0, action.choice_index, "CHOOSE")
     if action.action_type == ActionType.SKIP_CHOICE:
-        return (58, 0, 0, "SKIP")
-    return (_END_TURN_TIER, 0, 0, "")
+        return (_TIER_SKIP_CHOICE, 0, 0, "SKIP")
+    return (_TIER_END_TURN, 0, 0, "")
 
 
 def _ordered_actions(combat: Combat) -> list[Action]:

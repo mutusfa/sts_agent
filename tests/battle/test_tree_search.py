@@ -285,21 +285,26 @@ def test_node_budget_50hp_cultist():
 # ---------------------------------------------------------------------------
 
 
-def test_move_ordering_tries_bash_before_strike():
-    """_ordered_actions must return Bash before Strike before Defend before END_TURN.
-
-    Bash (tier 20) < Strike (tier 44) < Defend (tier 52) < END_TURN (tier 60).
-    """
-    combat = _make_combat(enemy_hp=50)
-    combat._state.piles.hand = [Card("Strike"), Card("Bash"), Card("Defend")]
-
+def _play_card_order(combat: Combat) -> list[str]:
+    """Card ids in move-order, END_TURN for end turn."""
     actions = _ordered_actions(combat)
-    cards = [
+    return [
         combat._state.piles.hand[a.hand_index].card_id
         if a.action_type == ActionType.PLAY_CARD
         else "END_TURN"
         for a in actions
     ]
+
+
+def test_move_ordering_tries_bash_before_strike():
+    """_ordered_actions must return Bash before Strike before Defend before END_TURN.
+
+    Bash (declarative debuff) < Strike (attack) < Defend (block) < END_TURN.
+    """
+    combat = _make_combat(enemy_hp=50)
+    combat._state.piles.hand = [Card("Strike"), Card("Bash"), Card("Defend")]
+
+    cards = _play_card_order(combat)
     bash_idx = cards.index("Bash")
     strike_idx = cards.index("Strike")
     defend_idx = cards.index("Defend")
@@ -308,6 +313,42 @@ def test_move_ordering_tries_bash_before_strike():
     assert bash_idx < strike_idx, f"Bash should come before Strike: {cards}"
     assert strike_idx < defend_idx, f"Strike should come before Defend: {cards}"
     assert defend_idx < end_idx, f"Defend should come before END_TURN: {cards}"
+
+
+def test_move_ordering_power_before_attack():
+    """Power cards sort before pure attacks."""
+    combat = _make_combat(enemy_hp=50)
+    combat._state.piles.hand = [Card("Strike"), Card("Inflame")]
+
+    cards = _play_card_order(combat)
+    assert cards.index("Inflame") < cards.index("Strike"), cards
+
+
+def test_move_ordering_custom_before_pure_attack():
+    """Custom-handler cards sort before declarative-only attacks."""
+    combat = _make_combat(enemy_hp=50)
+    combat._state.piles.hand = [Card("Strike"), Card("BodySlam")]
+
+    cards = _play_card_order(combat)
+    assert cards.index("BodySlam") < cards.index("Strike"), cards
+
+
+def test_move_ordering_draw_before_block():
+    """Declarative draw/special effects sort before pure block."""
+    combat = _make_combat(enemy_hp=50)
+    combat._state.piles.hand = [Card("Defend"), Card("ShrugItOff")]
+
+    cards = _play_card_order(combat)
+    assert cards.index("ShrugItOff") < cards.index("Defend"), cards
+
+
+def test_move_ordering_upgraded_bash_before_strike():
+    """Upgraded Bash+ keeps declarative debuff tier ahead of Strike."""
+    combat = _make_combat(enemy_hp=50)
+    combat._state.piles.hand = [Card("Strike"), Card("Bash+")]
+
+    cards = _play_card_order(combat)
+    assert cards.index("Bash+") < cards.index("Strike"), cards
 
 
 def test_move_ordering_targets_lowest_hp_first():
