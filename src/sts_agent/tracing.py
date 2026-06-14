@@ -59,6 +59,23 @@ def set_span_attributes(attrs: dict[str, object]) -> None:
         span.set_attributes(attrs)
 
 
+def current_mlflow_linkage() -> dict[str, str]:
+    """Run / trace / span IDs for correlating JSONL records with MLflow."""
+    linkage: dict[str, str] = {}
+    run = mlflow.active_run()
+    if run is not None:
+        linkage["mlflow_run_id"] = run.info.run_id
+    trace_id = mlflow.get_active_trace_id()
+    if trace_id:
+        linkage["mlflow_trace_id"] = trace_id
+    span = mlflow.get_current_active_span()
+    if span is not None:
+        linkage["mlflow_span_id"] = span.span_id
+        if span.name:
+            linkage["mlflow_span_name"] = span.name
+    return linkage
+
+
 def log_probe_artifact(name: str, payload: dict[str, object]) -> None:
     """Log structured probe data as an MLflow artifact when a run is active."""
     if not mlflow.active_run():

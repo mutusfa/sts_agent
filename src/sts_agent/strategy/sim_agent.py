@@ -25,9 +25,10 @@ Strategy hierarchy
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Iterator, Literal
 
 import mlflow
 
@@ -37,7 +38,7 @@ from sts_env.combat.cards import CardColor, Rarity
 
 from sts_agent.tracing import log_probe_artifact, set_span_attributes
 
-from .base import BaseStrategyAgent
+from .base import BaseStrategyAgent, _normalize_map_edge
 from .probe_data import (
     ProbeCache,
     ProbeCollector,
@@ -45,6 +46,7 @@ from .probe_data import (
     ProbeDecisionRecord,
     card_evaluation_to_dict,
     character_state_snapshot,
+    decision_budget,
     probe_context,
 )
 from .shop_eval import (
@@ -145,7 +147,9 @@ class SimStrategyAgent(BaseStrategyAgent):
     sim_sims:
         MCTS simulation budget per probe (default 5000).
     timeout_seconds:
-        Ignored (kept for API compat with StrategyAgent).
+        Wall-clock budget per strategy decision — pick_card, shop, pick_branch,
+        and potion evaluation (default 600 s).  On timeout the agent falls back
+        to a cheap heuristic instead of probing further.
     seed:
         Forwarded to :class:`BaseStrategyAgent` for the inherited random
         decisions (Neow, rest, events, boss relic).
@@ -159,7 +163,7 @@ class SimStrategyAgent(BaseStrategyAgent):
         max_encounters_to_sim: int = 5,
         sim_nodes: int = 5_000,
         sim_sims: int = 5_000,
-        timeout_seconds: int = 300,
+        timeout_seconds: int = 600,
         seed: int | None = None,
         *,
         shop_max_remove_candidates: int | None = None,
@@ -171,6 +175,7 @@ class SimStrategyAgent(BaseStrategyAgent):
         self.max_encounters = max_encounters_to_sim
         self.sim_nodes = sim_nodes
         self.sim_sims = sim_sims
+        self.timeout_seconds = timeout_seconds
         self.rollout_mode = rollout_mode
         self.shop_max_remove_candidates = shop_max_remove_candidates
         self.probe_cache = ProbeCache()
@@ -190,6 +195,34 @@ class SimStrategyAgent(BaseStrategyAgent):
         super().begin_map_run(sts_map, seed)
         self.probe_collector.run_seed = seed
         self.probe_cache.clear()
+
+    @contextmanager
+    def decision_budget(self, decision_type: str) -> Iterator[None]:
+        """Wall-clock budget for one strategy decision (see :func:`decision_budget`)."""
+        with decision_budget(self.timeout_seconds):
+            yield
+
+    def _pick_branch_fallback(
+        self,
+        sts_map: "StSMap",
+        current: tuple[int, int] | None,
+    ) -> tuple[int, int]:
+        """Random valid fork when probe budget is exhausted."""
+        if current is None:
+            options = [
+                (0, n.x) for n in sts_map.nodes.get(0, []) if n.edges
+            ]
+            if not options:
+                return (0, 0)
+        else:
+            floor, x_pos = current
+            node = sts_map.get_node(floor, x_pos)
+            if node is None or not node.edges:
+                return current
+            options = [_normalize_map_edge(floor, edge) for edge in node.edges]
+        if len(options) == 1:
+            return options[0]
+        return self.rng.choice(options)
 
     # ------------------------------------------------------------------
     # Card-pick (specialised)
@@ -217,6 +250,42 @@ class SimStrategyAgent(BaseStrategyAgent):
 
     @mlflow.trace(name="pick_card")
     def _pick_card_traced(
+        self,
+        character: Character,
+        card_choices: list[str],
+        upcoming_encounters: list[tuple[str, str]],
+        seed: int,
+        map_view: str,
+    ) -> str | None:
+        """Traced pick_card body with persisted probe evaluations."""
+        try:
+            with self.decision_budget("pick_card"):
+                return self._pick_card_probed(
+                    character,
+                    card_choices,
+                    upcoming_encounters,
+                    seed,
+                    map_view,
+                )
+        except TimeoutError:
+            pick = self._pick_by_rarity(card_choices)
+            log.warning(
+                "pick_card timed out after %ss on floor %d — rarity fallback %s",
+                self.timeout_seconds,
+                character.floor,
+                pick or "skip",
+            )
+            set_span_attributes(
+                {
+                    "pick": pick or "skip",
+                    "fallback": True,
+                    "timeout": True,
+                    "evaluation_count": 0,
+                }
+            )
+            return pick
+
+    def _pick_card_probed(
         self,
         character: Character,
         card_choices: list[str],
@@ -414,6 +483,20 @@ class SimStrategyAgent(BaseStrategyAgent):
 
     @mlflow.trace(name="shop")
     def _shop_traced(self, inventory: "ShopInventory", character: Character) -> None:
+        try:
+            with self.decision_budget("shop"):
+                self._shop_probed(inventory, character)
+        except TimeoutError:
+            log.warning(
+                "shop timed out after %ss on floor %d — leaving",
+                self.timeout_seconds,
+                character.floor,
+            )
+            set_span_attributes(
+                {"fallback": True, "timeout": True, "shop_actions": "leave"}
+            )
+
+    def _shop_probed(self, inventory: "ShopInventory", character: Character) -> None:
         possible = self.get_possible_encounters()
         if possible is None:
             super().shop(inventory, character)
@@ -551,6 +634,27 @@ class SimStrategyAgent(BaseStrategyAgent):
     # ------------------------------------------------------------------
 
     def pick_branch(
+        self,
+        sts_map: "StSMap",
+        character: Character,
+        current: tuple[int, int] | None,
+        seed: int,
+    ) -> tuple[int, int]:
+        """Pick the next map step using run-scoped probe cache."""
+        try:
+            with self.decision_budget("pick_branch"):
+                return self._pick_branch_probed(sts_map, character, current, seed)
+        except TimeoutError:
+            coord = self._pick_branch_fallback(sts_map, current)
+            log.warning(
+                "pick_branch timed out after %ss on floor %d — random fallback %s",
+                self.timeout_seconds,
+                character.floor,
+                coord,
+            )
+            return coord
+
+    def _pick_branch_probed(
         self,
         sts_map: "StSMap",
         character: Character,

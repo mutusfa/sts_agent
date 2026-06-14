@@ -51,6 +51,21 @@ def test_act_returns_valid_action():
     assert action in combat.valid_actions()
 
 
+def test_mcts_skips_search_when_only_one_action():
+    """With a single deduplicated legal action, act() must not run simulations."""
+    from sts_agent.battle.tree_search import _ordered_actions
+
+    combat = _make_combat()
+    combat._state.energy = 0  # type: ignore[union-attr]
+    assert len(_ordered_actions(combat)) == 1
+
+    planner = MCTSPlanner(simulations=1000, seed=0)
+    action = planner.act(combat)
+    assert action == _ordered_actions(combat)[0]
+    assert planner.last_stats["simulations"] == 0.0
+    assert planner.last_stats["early_stop_reason"] == "single_action"
+
+
 # ---------------------------------------------------------------------------
 # 2. State key ignores RNG
 # ---------------------------------------------------------------------------

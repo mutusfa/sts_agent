@@ -16,7 +16,8 @@ decisions.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from contextlib import contextmanager
+from typing import TYPE_CHECKING, Iterator
 
 from sts_env.combat.rng import RNG
 from sts_env.run import relics as relics_mod
@@ -54,6 +55,12 @@ class BaseStrategyAgent:
         self._run_seed: int | None = None
         self._sts_map: StSMap | None = None
         self._map_committed_path: list[tuple[int, int]] = []
+
+    @contextmanager
+    def decision_budget(self, decision_type: str) -> Iterator[None]:
+        """No-op budget for agents that do not enforce per-decision timeouts."""
+        del decision_type
+        yield
 
     def _current_map_position(
         self,

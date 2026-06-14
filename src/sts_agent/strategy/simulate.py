@@ -343,6 +343,9 @@ def probe_encounter(
             probe_cache.record_hit(decision_type)
             return cached
 
+    from .probe_data import check_decision_budget
+
+    check_decision_budget()
     t0 = perf_counter()
     dist = _probe_encounter_uncached(
         character,

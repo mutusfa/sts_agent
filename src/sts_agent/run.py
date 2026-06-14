@@ -321,34 +321,45 @@ class _RunAgentAdapter:
                     ),
                     probe_cache=probe_cache,
                 )
-                if collector is not None:
-                    ctx = ProbeContext(
-                        collector=collector,
-                        decision_type="potion_eval",
-                        floor=floor,
-                        run_seed=self._run_seed,
+                try:
+                    with self._strategy.decision_budget("potion_eval"):
+                        if collector is not None:
+                            ctx = ProbeContext(
+                                collector=collector,
+                                decision_type="potion_eval",
+                                floor=floor,
+                                run_seed=self._run_seed,
+                            )
+                            with probe_context(ctx):
+                                self._last_potion_costs = evaluate_potions(
+                                    char,
+                                    upcoming,
+                                    self._run_seed,
+                                    detail_out=potion_detail,
+                                    rollout_mode=getattr(
+                                        self._planner, "rollout_mode", "heuristic"
+                                    ),
+                                    **eval_kw,
+                                )
+                        else:
+                            self._last_potion_costs = evaluate_potions(
+                                char,
+                                upcoming,
+                                self._run_seed,
+                                rollout_mode=getattr(
+                                    self._planner, "rollout_mode", "heuristic"
+                                ),
+                                **eval_kw,
+                            )
+                except TimeoutError:
+                    timeout = getattr(self._strategy, "timeout_seconds", None)
+                    log.warning(
+                        "potion_eval timed out after %ss on floor %d — free potions",
+                        timeout,
+                        floor,
                     )
-                    with probe_context(ctx):
-                        self._last_potion_costs = evaluate_potions(
-                            char,
-                            upcoming,
-                            self._run_seed,
-                            detail_out=potion_detail,
-                            rollout_mode=getattr(
-                                self._planner, "rollout_mode", "heuristic"
-                            ),
-                            **eval_kw,
-                        )
-                else:
-                    self._last_potion_costs = evaluate_potions(
-                        char,
-                        upcoming,
-                        self._run_seed,
-                        rollout_mode=getattr(
-                            self._planner, "rollout_mode", "heuristic"
-                        ),
-                        **eval_kw,
-                    )
+                    self._last_potion_costs = {}
+                    potion_detail = {"timeout": True}
                 self._planner.potion_costs = self._last_potion_costs
                 if collector is not None and potion_detail:
                     collector.record(
@@ -608,6 +619,9 @@ def run_act1(
     collector = _probe_collector_for(strategy_agent)
     if collector is not None:
         collector.run_seed = seed
+        active_run = mlflow.active_run()
+        if active_run is not None:
+            collector.mlflow_run_id = active_run.info.run_id
 
     span = mlflow.get_current_active_span()
     if span:
