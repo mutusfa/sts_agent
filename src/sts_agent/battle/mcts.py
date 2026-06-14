@@ -182,6 +182,10 @@ class _EdgeStats:
     _n_turns_dead: int = 0
     _sum_damage_taken_dead: float = 0.0
 
+    # Tree linkage — set on first expansion; used for pointer-walk PV descent.
+    child_state_key: tuple | None = None
+    leads_to_terminal: bool = False
+
     @property
     def n(self) -> int:
         return self.n_alive + self.n_dead
@@ -330,6 +334,22 @@ def _edge_lex_key(stats: _EdgeStats) -> tuple:
     return (bucketed_death_rate, stats.mean_damage_alive, neg_mean_enemy_dmg)
 
 
+def _link_edge(
+    node: _Node,
+    concept_key: tuple,
+    child_state_key: tuple,
+    *,
+    leads_to_terminal: bool,
+) -> None:
+    """Record child linkage for *concept_key* on first expansion."""
+    if concept_key not in node.edges:
+        node.edges[concept_key] = _EdgeStats()
+    edge = node.edges[concept_key]
+    if edge.child_state_key is None:
+        edge.child_state_key = child_state_key
+        edge.leads_to_terminal = leads_to_terminal
+
+
 @dataclass
 class _Node:
     """A node in the MCTS tree."""
@@ -449,6 +469,9 @@ def _heuristic_rollout(
 # MCTSPlanner
 # ---------------------------------------------------------------------------
 
+_ROOT_CONVERGE_MAX_DEPTH = 16
+_ROOT_STABLE_CI_K = 2.0
+
 
 class MCTSPlanner:
     """Open-loop UCT planner that collapses RNG outcomes into value averages.
@@ -478,7 +501,14 @@ class MCTSPlanner:
     pv_early_stop:
         When True, stop the simulation loop once the principal variation
         reaches a terminal state with each edge visited at least
-        ``_effective_pv_min_n()`` times.
+        ``_effective_pv_min_n()`` times.  PV is checked every
+        ``_pv_check_period()`` simulations (``max(1, floor(sqrt(budget)))``).
+    root_stable_early_stop:
+        When True, stop once the root is fully expanded, every root edge has
+        ``n >= _effective_pv_min_n()``, and the lex-best two root children
+        either share a combat state key along their lex-best lines (within-turn
+        permutation) or have separated tier-encoded means.  Checked on the same
+        throttled schedule as PV early stop.
     rollout_mode:
         ``"heuristic"`` (default) — shallow select/expand then greedy rollout.
         ``"in_tree"`` — select/expand until combat is done (no rollout tail).
@@ -492,6 +522,7 @@ class MCTSPlanner:
         seed: int | None = None,
         pv_min_n: int | None = None,
         pv_early_stop: bool = False,
+        root_stable_early_stop: bool = False,
         rollout_mode: Literal["heuristic", "in_tree"] = "heuristic",
         potion_costs: dict[str, float] | None = None,
     ) -> None:
@@ -501,6 +532,7 @@ class MCTSPlanner:
         self._rng = random.Random(seed)
         self._pv_min_n_override = pv_min_n
         self.pv_early_stop = pv_early_stop
+        self.root_stable_early_stop = root_stable_early_stop
         self.rollout_mode = rollout_mode
         self.potion_costs: dict[str, float] = potion_costs or {}
         self.last_stats: dict[str, float] = {}
@@ -520,6 +552,10 @@ class MCTSPlanner:
 
         if self.potion_costs:
             log.debug("MCTSPlanner potion_costs=%s", self.potion_costs)
+
+        actions = _ordered_actions(combat)
+        if len(actions) == 1:
+            return self._act_single_choice(actions[0], obs=obs, start_hp=start_hp)
 
         c = self._exploration_c if self._exploration_c is not None else start_hp
 
@@ -552,6 +588,7 @@ class MCTSPlanner:
         in_tree_terminal_count = 0
         would_cut = 0
         best_alive_so_far: float = math.inf
+        early_stop_reason = ""
 
         for _ in range(self.simulations):
             if self.max_nodes is not None and nodes_expanded >= self.max_nodes:
@@ -660,9 +697,14 @@ class MCTSPlanner:
 
             sims_run += 1
 
-            if self.pv_early_stop:
-                _, _, pv_terminal_now = self._pv_well_visited_edge(root_node, combat)
-                if pv_terminal_now:
+            if sims_run % self._pv_check_period() == 0:
+                if self.pv_early_stop:
+                    _, _, pv_terminal_now = self._compute_pv(root_node)
+                    if pv_terminal_now:
+                        early_stop_reason = "pv_terminal"
+                        break
+                if self.root_stable_early_stop and self._root_is_stable(root_node):
+                    early_stop_reason = "root_stable"
                     break
 
         # Root visit concentration
@@ -675,9 +717,7 @@ class MCTSPlanner:
         best_concept_key, best_edge = self._best_root_concept(root_node)
         best_action = _resolve_action(best_concept_key, combat) or Action.end_turn()
 
-        pv_edge, pv_depth, pv_terminal = self._pv_well_visited_edge(
-            root_node, combat
-        )
+        pv_edge, pv_depth, pv_terminal = self._compute_pv(root_node)
         pv = pv_edge if pv_edge is not None else best_edge
         pv_death_rate = pv.deaths / pv.n if pv.n > 0 else math.nan
         pv_zero_damage_confirmed = (
@@ -687,6 +727,7 @@ class MCTSPlanner:
             and pv_death_rate < 0.05
             and pv.mean < 1.0
         )
+        root_stable = self._root_is_stable(root_node)
 
         self.last_stats = {
             # Tier-encoded scalar stats (for log continuity)
@@ -730,6 +771,8 @@ class MCTSPlanner:
             "pv_terminal": float(pv_terminal),
             "pv_early_stop_sim": float(sims_run),
             "pv_zero_damage_confirmed": float(pv_zero_damage_confirmed),
+            "root_stable": float(root_stable),
+            "early_stop_reason": early_stop_reason,
             # Potion penalty
             "potion_cost_n": float(_potion_cost_n),
             "potion_cost_mean": (
@@ -768,6 +811,58 @@ class MCTSPlanner:
 
         return best_action
 
+    def _act_single_choice(
+        self, action: Action, *, obs, start_hp: float
+    ) -> Action:
+        """Skip search when only one deduplicated root action exists."""
+        self.last_stats = {
+            "mean": math.nan,
+            "std": 0.0,
+            "max": math.nan,
+            "n": 0.0,
+            "deaths": 0.0,
+            "death_rate": math.nan,
+            "n_alive": 0.0,
+            "mean_damage_alive": math.nan,
+            "n_dead": 0.0,
+            "mean_enemy_dmg_dead": math.nan,
+            "mean_turns_dead": math.nan,
+            "mean_damage_taken_dead": math.nan,
+            "simulations": 0.0,
+            "nodes": 0.0,
+            "sel_depth_mean": 0.0,
+            "sel_depth_max": 0.0,
+            "terminal_during_selection_frac": 0.0,
+            "would_alpha_cut_at_rollout_frac": 0.0,
+            "root_visit_top1_frac": 0.0,
+            "root_visit_top2_frac": 0.0,
+            "pv_mean": math.nan,
+            "pv_std": 0.0,
+            "pv_max": math.nan,
+            "pv_n": 0.0,
+            "pv_deaths": 0.0,
+            "pv_depth": 0.0,
+            "pv_kill_turn_mean": math.nan,
+            "pv_max_hp_gained_mean": 0.0,
+            "pv_max_hp_gained_std": 0.0,
+            "pv_terminal": 0.0,
+            "pv_early_stop_sim": 0.0,
+            "pv_zero_damage_confirmed": 0.0,
+            "root_stable": 0.0,
+            "early_stop_reason": "single_action",
+            "potion_cost_n": 0.0,
+            "potion_cost_mean": 0.0,
+            "rollout_mode_in_tree": float(self.rollout_mode == "in_tree"),
+            "root_cache_hit": 0.0,
+            "in_tree_terminal_frac": 0.0,
+        }
+        log.debug(
+            "T=%d → %-16s  single action — search skipped",
+            obs.turn,
+            _fmt_action(action, obs.hand),
+        )
+        return action
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -796,6 +891,12 @@ class MCTSPlanner:
             path.append((current_node, concept_key))
             current_combat._step_quiet(action)
             child_key = _mcts_state_key(current_combat)
+            _link_edge(
+                current_node,
+                concept_key,
+                child_key,
+                leads_to_terminal=current_combat.observe().done,
+            )
             if child_key not in node_store:
                 child_node = _Node(
                     state_key=child_key,
@@ -822,6 +923,12 @@ class MCTSPlanner:
             path.append((current_node, concept_key))
             current_combat._step_quiet(action)
             child_key = _mcts_state_key(current_combat)
+            _link_edge(
+                current_node,
+                concept_key,
+                child_key,
+                leads_to_terminal=current_combat.observe().done,
+            )
             if child_key not in node_store:
                 child_node = _Node(
                     state_key=child_key,
@@ -868,11 +975,16 @@ class MCTSPlanner:
             return self._pv_min_n_override
         return max(10, int(math.sqrt(self.simulations)))
 
-    def _pv_well_visited_edge(
-        self, root: _Node, combat: Combat
+    def _pv_check_period(self) -> int:
+        """Simulations between PV early-stop checks."""
+        return max(1, int(math.sqrt(self.simulations)))
+
+    def _compute_pv(
+        self, root: _Node
     ) -> tuple[_EdgeStats | None, int, bool]:
         """Walk root → lex-best child while edge.n >= _effective_pv_min_n.
 
+        Follows cached ``child_state_key`` links — no combat replay.
         Returns (deepest_edge_satisfying_min_n, depth, pv_terminal).
         ``pv_terminal`` is True when the walk reaches a done combat state.
         Falls back to None (caller uses chosen root edge) when no edge meets
@@ -880,7 +992,6 @@ class MCTSPlanner:
         """
         min_n = self._effective_pv_min_n()
         node = root
-        sim_combat = combat.clone()
         last_edge: _EdgeStats | None = None
         last_depth = 0
         depth = 0
@@ -892,19 +1003,71 @@ class MCTSPlanner:
                 break
             last_edge = edge
             last_depth = depth + 1
-            action = _resolve_action(key, sim_combat)
-            if action is None:
-                break
-            sim_combat.step(action)
-            if sim_combat._is_done():
+            if edge.leads_to_terminal:
                 pv_terminal = True
                 break
-            child = self._node_store.get(_mcts_state_key(sim_combat))
+            if edge.child_state_key is None:
+                break
+            child = self._node_store.get(edge.child_state_key)
             if child is None or not child.edges:
                 break
             node = child
             depth += 1
         return last_edge, last_depth, pv_terminal
+
+    def _root_is_stable(self, root: _Node) -> bool:
+        """True when root is fully explored and top-two are tied or separated."""
+        if not root.is_fully_expanded():
+            return False
+        if len(root.edges) < 2:
+            return False
+
+        min_n = self._effective_pv_min_n()
+        if any(e.n < min_n for e in root.edges.values()):
+            return False
+
+        ordered = sorted(root.edges.values(), key=_edge_lex_key)
+        best, runner = ordered[0], ordered[1]
+        return self._children_converge(best, runner) or self._edges_statistically_separable(
+            best, runner
+        )
+
+    def _edges_statistically_separable(
+        self, best: _EdgeStats, runner: _EdgeStats
+    ) -> bool:
+        """True when tier-encoded CIs for lex-best vs runner-up do not overlap."""
+        if best.n < 2 or runner.n < 2:
+            return False
+        k = _ROOT_STABLE_CI_K
+        se_best = best.std / math.sqrt(best.n)
+        se_runner = runner.std / math.sqrt(runner.n)
+        return best.mean + k * se_best < runner.mean - k * se_runner
+
+    def _children_converge(self, best: _EdgeStats, runner: _EdgeStats) -> bool:
+        """True when lex-best lines from two root edges share a state key."""
+        return bool(
+            self._best_line_keys(best) & self._best_line_keys(runner)
+        )
+
+    def _best_line_keys(self, edge: _EdgeStats) -> set[tuple]:
+        """State keys along the lex-best line from *edge*'s child (pointer walk)."""
+        keys: set[tuple] = set()
+        ck = edge.child_state_key
+        depth = 0
+        while ck is not None and depth < _ROOT_CONVERGE_MAX_DEPTH:
+            keys.add(ck)
+            node = self._node_store.get(ck)
+            if node is None or not node.edges:
+                break
+            nkey = min(node.edges, key=lambda k: _edge_lex_key(node.edges[k]))
+            nedge = node.edges[nkey]
+            if nedge.leads_to_terminal:
+                if nedge.child_state_key is not None:
+                    keys.add(nedge.child_state_key)
+                break
+            ck = nedge.child_state_key
+            depth += 1
+        return keys
 
     def _best_root_concept(self, root: _Node) -> tuple[tuple, _EdgeStats]:
         """Pick the root concept key with the best lexicographic objective.
