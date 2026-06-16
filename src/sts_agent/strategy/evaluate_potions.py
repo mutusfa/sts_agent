@@ -302,7 +302,7 @@ def _eval_pairs(
     For each pair of non-fairy potions, run a probe with BOTH vs NEITHER.
     Each potion in the pair gets credited PAIR_CREDIT_FACTOR of the pair's HP savings.
     """
-    potions = [p for p in character.potions if p != "FairyInABottle"]
+    potions = [p for p in character.potions if p != "FairyPotion"]
     pair_savings: dict[str, float] = {}
 
     if len(potions) < 2:
@@ -422,10 +422,10 @@ def evaluate_potions(
     bag_full = len(character.potions) >= character.max_potion_slots
 
     for p in character.potions:
-        if p == "FairyInABottle":
+        if p == "FairyPotion":
             costs[p] = FAIRY_VIRTUAL_COST_FACTOR * character.player_max_hp
 
-    non_fairy = [p for p in character.potions if p != "FairyInABottle"]
+    non_fairy = [p for p in character.potions if p != "FairyPotion"]
     if not non_fairy:
         log.info(
             "Potion costs: %s (bag_full=%s)",
