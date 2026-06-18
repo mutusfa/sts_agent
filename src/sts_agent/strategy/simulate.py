@@ -384,6 +384,7 @@ def _probe_encounter_uncached(
         simulations=simulations,
         max_nodes=max_nodes,
         rollout_mode=rollout_mode,
+        seed=seed,
     )
 
     planner.act(combat)
