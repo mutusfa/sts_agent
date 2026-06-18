@@ -44,6 +44,10 @@ from sts_env.run import relics as _relics
 
 log = logging.getLogger(__name__)
 
+# Safety guard: if combat exceeds this many turns, abort to prevent
+# stalemate/infinite-loop hangs. Normal StS combats rarely exceed 30 turns.
+_MAX_COMBAT_TURNS = 300
+
 
 @dataclass(frozen=True)
 class TerminalOutcome:
@@ -305,6 +309,9 @@ def run_agent(agent: BattleAgent, combat: Combat) -> int:
 
     prev_turn = -1
     while not obs.done:
+        if obs.turn >= _MAX_COMBAT_TURNS:
+            log.warning("ABORT combat after %d turns (stalemate guard)", obs.turn)
+            break
         if obs.turn != prev_turn:
             log.debug("--- Turn %d ---", obs.turn)
             piles = combat._state.piles  # type: ignore[union-attr]
@@ -342,6 +349,9 @@ def run_planner(planner: BattlePlanner, combat: Combat) -> int:
     prev_turn = -1
     while not obs.done:
         curr_turn = combat.observe().turn
+        if curr_turn >= _MAX_COMBAT_TURNS:
+            log.warning("ABORT combat after %d turns (stalemate guard)", curr_turn)
+            break
         if curr_turn != prev_turn:
             log.debug("--- Turn %d ---", curr_turn)
             piles = combat._state.piles  # type: ignore[union-attr]
