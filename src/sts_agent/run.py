@@ -301,78 +301,89 @@ class _RunAgentAdapter:
         if hasattr(self._planner, "potion_costs") and hasattr(combat, "_state"):
             potions = combat._state.potions  # type: ignore[union-attr]
             if potions:
-                from .strategy.evaluate_potions import evaluate_potions
-                from sts_env.run.character import Character
+                # Check for static costs — skip dynamic evaluation entirely
+                static = getattr(self._planner, "static_potion_costs", None)
+                if static is not None:
+                    # Only assign costs for potions actually held
+                    held = set(potions)
+                    self._last_potion_costs = {
+                        p: c for p, c in static.items() if p in held
+                    }
+                    self._planner.potion_costs = self._last_potion_costs
+                    log.debug("Static potion costs: %s", self._planner.potion_costs)
+                else:
+                    from .strategy.evaluate_potions import evaluate_potions
+                    from sts_env.run.character import Character
 
-                char = Character(
-                    player_hp=combat._state.player_hp,  # type: ignore[union-attr]
-                    player_max_hp=combat._state.player_max_hp,  # type: ignore[union-attr]
-                    deck=_deck_from_combat(combat),
-                    potions=list(potions),
-                )
-                upcoming = self._upcoming_encounters()
-                floor = self._potion_tracker.current_floor
-                probe_cache = getattr(self._strategy, "probe_cache", None)
-                eval_kw = dict(
-                    possible_encounters=(
-                        self._strategy.get_possible_encounters()
-                        if hasattr(self._strategy, "get_possible_encounters")
-                        else None
-                    ),
-                    probe_cache=probe_cache,
-                )
-                try:
-                    with self._strategy.decision_budget("potion_eval"):
-                        if collector is not None:
-                            ctx = ProbeContext(
-                                collector=collector,
-                                decision_type="potion_eval",
-                                floor=floor,
-                                run_seed=self._run_seed,
-                            )
-                            with probe_context(ctx):
+                    char = Character(
+                        player_hp=combat._state.player_hp,  # type: ignore[union-attr]
+                        player_max_hp=combat._state.player_max_hp,  # type: ignore[union-attr]
+                        deck=_deck_from_combat(combat),
+                        potions=list(potions),
+                    )
+                    upcoming = self._upcoming_encounters()
+                    floor = self._potion_tracker.current_floor
+                    probe_cache = getattr(self._strategy, "probe_cache", None)
+                    eval_kw = dict(
+                        possible_encounters=(
+                            self._strategy.get_possible_encounters()
+                            if hasattr(self._strategy, "get_possible_encounters")
+                            else None
+                        ),
+                        probe_cache=probe_cache,
+                    )
+                    try:
+                        with self._strategy.decision_budget("potion_eval"):
+                            if collector is not None:
+                                ctx = ProbeContext(
+                                    collector=collector,
+                                    decision_type="potion_eval",
+                                    floor=floor,
+                                    run_seed=self._run_seed,
+                                )
+                                with probe_context(ctx):
+                                    self._last_potion_costs = evaluate_potions(
+                                        char,
+                                        upcoming,
+                                        self._run_seed,
+                                        detail_out=potion_detail,
+                                        rollout_mode=getattr(
+                                            self._planner, "rollout_mode", "heuristic"
+                                        ),
+                                        **eval_kw,
+                                    )
+                            else:
                                 self._last_potion_costs = evaluate_potions(
                                     char,
                                     upcoming,
                                     self._run_seed,
-                                    detail_out=potion_detail,
                                     rollout_mode=getattr(
                                         self._planner, "rollout_mode", "heuristic"
                                     ),
                                     **eval_kw,
                                 )
-                        else:
-                            self._last_potion_costs = evaluate_potions(
-                                char,
-                                upcoming,
-                                self._run_seed,
-                                rollout_mode=getattr(
-                                    self._planner, "rollout_mode", "heuristic"
-                                ),
-                                **eval_kw,
-                            )
-                except TimeoutError:
-                    timeout = getattr(self._strategy, "timeout_seconds", None)
-                    log.warning(
-                        "potion_eval timed out after %ss on floor %d — free potions",
-                        timeout,
-                        floor,
-                    )
-                    self._last_potion_costs = {}
-                    potion_detail = {"timeout": True}
-                self._planner.potion_costs = self._last_potion_costs
-                if collector is not None and potion_detail:
-                    collector.record(
-                        ProbeDecisionRecord(
-                            decision_type="potion_eval",
-                            floor=floor,
-                            seed=self._run_seed,
-                            character_state=character_state_snapshot(char),
-                            run_seed=self._run_seed,
-                            extra=dict(potion_detail),
+                    except TimeoutError:
+                        timeout = getattr(self._strategy, "timeout_seconds", None)
+                        log.warning(
+                            "potion_eval timed out after %ss on floor %d — free potions",
+                            timeout,
+                            floor,
                         )
-                    )
-                log.debug("Potion costs: %s", self._planner.potion_costs)
+                        self._last_potion_costs = {}
+                        potion_detail = {"timeout": True}
+                    self._planner.potion_costs = self._last_potion_costs
+                    if collector is not None and potion_detail:
+                        collector.record(
+                            ProbeDecisionRecord(
+                                decision_type="potion_eval",
+                                floor=floor,
+                                seed=self._run_seed,
+                                character_state=character_state_snapshot(char),
+                                run_seed=self._run_seed,
+                                extra=dict(potion_detail),
+                            )
+                        )
+                    log.debug("Potion costs: %s", self._planner.potion_costs)
             else:
                 self._planner.potion_costs = {}
         self._combat_count += 1
