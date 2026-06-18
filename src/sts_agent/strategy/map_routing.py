@@ -44,14 +44,14 @@ from typing import TYPE_CHECKING
 from sts_env.run import relics as relics_mod
 from sts_env.run.map import MapNode, RoomType, StSMap, get_encounter_for_room
 from sts_env.run.rewards import (
-    COMMON_POTIONS,
-    UNCOMMON_POTIONS,
-    _POTION_DROP_RATE,
+    _POTION_DROP_BASE,
     _RARE_CHANCE,
     _UNCOMMON_CHANCE,
     COMBAT_GOLD,
     Room,
 )
+from sts_env.combat.potion_pools import POTION_RARITY, POTION_BASE_PRICE
+from sts_env.combat.potion_pools import PotionRarity
 from sts_env.run.rooms import rest_heal
 from sts_env.run.shop import CARD_PRICES
 
@@ -154,13 +154,14 @@ def _card_slot_ev(room: Room) -> float:
 
 
 def _avg_potion_price() -> float:
-    common = COMMON_POTIONS
-    uncommon = UNCOMMON_POTIONS
+    common = [p for p, r in POTION_RARITY.items() if r == PotionRarity.COMMON]
+    uncommon = [p for p, r in POTION_RARITY.items() if r == PotionRarity.UNCOMMON]
     total = len(common) + len(uncommon)
     if total == 0:
         return 55.0
     return (
-        len(common) * 50 + len(uncommon) * 75
+        len(common) * POTION_BASE_PRICE[PotionRarity.COMMON]
+        + len(uncommon) * POTION_BASE_PRICE[PotionRarity.UNCOMMON]
     ) / total
 
 
@@ -189,7 +190,7 @@ def room_reward_gold_ev(room_type: RoomType) -> float:
 
     gold = float(COMBAT_GOLD.get(reward_room, COMBAT_GOLD[Room.MONSTER]))
     cards = _card_slot_ev(reward_room)
-    potion = _POTION_DROP_RATE * _avg_potion_price()
+    potion = _POTION_DROP_BASE * _avg_potion_price()
     relic = _elite_relic_ev() if room_type == RoomType.ELITE else 0.0
     return gold + cards + potion + relic
 
