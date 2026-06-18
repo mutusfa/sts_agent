@@ -455,13 +455,17 @@ def _heuristic_rollout(
     Returns a TerminalOutcome describing the terminal state.
     """
     costs = potion_costs or {}
+    _turn = 0
     while not combat._is_done():
+        if _turn >= 300:
+            break
         actions = _ordered_actions(combat)
         if costs:
             filtered = _filter_potion_actions_for_rollout(combat, actions, costs)
             if filtered:
                 actions = filtered
         combat._step_quiet(actions[0])
+        _turn += 1
     return terminal_score(combat)
 
 
@@ -499,16 +503,16 @@ class MCTSPlanner:
         during a rollout, its cost is added to the reward so MCTS treats
         using a potion as "spending" HP.  Default: empty dict (potions free).
     pv_early_stop:
-        When True, stop the simulation loop once the principal variation
-        reaches a terminal state with each edge visited at least
+        When True (default), stop the simulation loop once the principal
+        variation reaches a terminal state with each edge visited at least
         ``_effective_pv_min_n()`` times.  PV is checked every
         ``_pv_check_period()`` simulations (``max(1, floor(sqrt(budget)))``).
     root_stable_early_stop:
-        When True, stop once the root is fully expanded, every root edge has
-        ``n >= _effective_pv_min_n()``, and the lex-best two root children
-        either share a combat state key along their lex-best lines (within-turn
-        permutation) or have separated tier-encoded means.  Checked on the same
-        throttled schedule as PV early stop.
+        When True (default), stop once the root is fully expanded, every root
+        edge has ``n >= _effective_pv_min_n()``, and the lex-best two root
+        children either share a combat state key along their lex-best lines
+        (within-turn permutation) or have separated tier-encoded means.
+        Checked on the same throttled schedule as PV early stop.
     rollout_mode:
         ``"heuristic"`` (default) — shallow select/expand then greedy rollout.
         ``"in_tree"`` — select/expand until combat is done (no rollout tail).
@@ -521,8 +525,8 @@ class MCTSPlanner:
         exploration_c: float | None = None,
         seed: int | None = None,
         pv_min_n: int | None = None,
-        pv_early_stop: bool = False,
-        root_stable_early_stop: bool = False,
+        pv_early_stop: bool = True,
+        root_stable_early_stop: bool = True,
         rollout_mode: Literal["heuristic", "in_tree"] = "heuristic",
         potion_costs: dict[str, float] | None = None,
     ) -> None:
@@ -535,6 +539,8 @@ class MCTSPlanner:
         self.root_stable_early_stop = root_stable_early_stop
         self.rollout_mode = rollout_mode
         self.potion_costs: dict[str, float] = potion_costs or {}
+        # When set, skip dynamic evaluate_potions() and use these static costs.
+        self.static_potion_costs: dict[str, float] | None = None
         self.last_stats: dict[str, float] = {}
         self._node_store: dict[tuple, _Node] = {}
 
