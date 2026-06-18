@@ -161,7 +161,7 @@ def test_cli_budget_exceeded_prints_error(capsys: pytest.CaptureFixture) -> None
 
 
 def test_cli_mcts_agent_prints_summary(capsys: pytest.CaptureFixture) -> None:
-    """--agent mcts completes and the summary line contains mean=, std=, max=."""
+    """--agent mcts completes and the summary line contains PV stats."""
     cli.run(["battle", "--encounter", "cultist", "--seed", "0",
              "--agent", "mcts", "--simulations", "50"])
     out = capsys.readouterr().out
@@ -169,17 +169,16 @@ def test_cli_mcts_agent_prints_summary(capsys: pytest.CaptureFixture) -> None:
     assert "encounter=cultist" in out
     assert "damage=" in out
     assert "result=" in out
-    assert "mean=" in out
-    assert "std=" in out
-    assert "max=" in out
+    assert "dmg=" in out
+    assert "pv_depth=" in out
 
 
 def test_cli_non_mcts_agent_has_no_mcts_stats(capsys: pytest.CaptureFixture) -> None:
-    """random agent summary must NOT contain mean=/std= (those are MCTS-only fields)."""
+    """random agent summary must NOT contain MCTS-only PV stats."""
     cli.run(["battle", "--encounter", "cultist", "--seed", "0", "--agent", "random"])
     out = capsys.readouterr().out
-    assert "mean=" not in out
-    assert "std=" not in out
+    assert "dmg=" not in out
+    assert "pv_depth=" not in out
 
 
 # ---------------------------------------------------------------------------
@@ -209,13 +208,13 @@ def test_cli_potions_empty_list_is_noop(capsys: pytest.CaptureFixture) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Hermes-style runner tests (run_hermes_cli.py)
+# Hermes-style runner tests (run_hermes.py)
 # ---------------------------------------------------------------------------
 
 
 def test_hermes_cli_accepts_agent_sim(capsys: pytest.CaptureFixture) -> None:
     """--agent sim should parse successfully."""
-    import run_hermes_cli
+    import run_hermes
     from unittest.mock import patch, MagicMock
 
     mock_result = MagicMock(
@@ -232,15 +231,15 @@ def test_hermes_cli_accepts_agent_sim(capsys: pytest.CaptureFixture) -> None:
         potions_gained=["BlockPotion"]
     )
 
-    with patch("run_hermes_cli.run_act1", return_value=mock_result):
-        run_hermes_cli.run(["--agent", "sim", "--seed", "42"])
+    with patch("run_hermes.run_act1", return_value=mock_result):
+        run_hermes.run(["--agent", "sim", "--seed", "42"])
     out = capsys.readouterr().out
     assert "agent=sim" in out
 
 
 def test_hermes_cli_accepts_agent_llm(capsys: pytest.CaptureFixture) -> None:
     """--agent llm should parse successfully."""
-    import run_hermes_cli
+    import run_hermes
     from unittest.mock import patch, MagicMock
 
     mock_result = MagicMock(
@@ -257,15 +256,15 @@ def test_hermes_cli_accepts_agent_llm(capsys: pytest.CaptureFixture) -> None:
         potions_gained=["BlockPotion"]
     )
 
-    with patch("run_hermes_cli.run_act1", return_value=mock_result):
-        run_hermes_cli.run(["--agent", "llm", "--seed", "42"])
+    with patch("run_hermes.run_act1", return_value=mock_result):
+        run_hermes.run(["--agent", "llm", "--seed", "42"])
     out = capsys.readouterr().out
     assert "agent=llm" in out
 
 
 def test_hermes_cli_accepts_agent_none(capsys: pytest.CaptureFixture) -> None:
     """--agent none should parse successfully."""
-    import run_hermes_cli
+    import run_hermes
     from unittest.mock import patch, MagicMock
 
     mock_result = MagicMock(
@@ -282,22 +281,22 @@ def test_hermes_cli_accepts_agent_none(capsys: pytest.CaptureFixture) -> None:
         potions_gained=["BlockPotion"]
     )
 
-    with patch("run_hermes_cli.run_act1", return_value=mock_result):
-        run_hermes_cli.run(["--agent", "none", "--seed", "42"])
+    with patch("run_hermes.run_act1", return_value=mock_result):
+        run_hermes.run(["--agent", "none", "--seed", "42"])
     out = capsys.readouterr().out
     assert "agent=none" in out
 
 
 def test_hermes_cli_invalid_agent_fails(capsys: pytest.CaptureFixture) -> None:
     """--agent invalid should exit with non-zero code."""
-    import run_hermes_cli
+    import run_hermes
     with pytest.raises(SystemExit):
-        run_hermes_cli.run(["--agent", "invalid", "--seed", "42"])
+        run_hermes.run(["--agent", "invalid", "--seed", "42"])
 
 
 def test_hermes_cli_sim_agent_constructs_sim_strategy_agent() -> None:
     """--agent sim should construct SimStrategyAgent and pass it to run_act1."""
-    import run_hermes_cli
+    import run_hermes
     from unittest.mock import patch, MagicMock
 
     mock_run_act1 = MagicMock(return_value=MagicMock(
@@ -314,8 +313,8 @@ def test_hermes_cli_sim_agent_constructs_sim_strategy_agent() -> None:
         potions_gained=[]
     ))
 
-    with patch("run_hermes_cli.run_act1", mock_run_act1):
-        run_hermes_cli.run(["--agent", "sim", "--seed", "42"])
+    with patch("run_hermes.run_act1", mock_run_act1):
+        run_hermes.run(["--agent", "sim", "--seed", "42"])
 
     # Verify run_act1 was called with a SimStrategyAgent
     call_args = mock_run_act1.call_args
@@ -326,7 +325,7 @@ def test_hermes_cli_sim_agent_constructs_sim_strategy_agent() -> None:
 
 def test_hermes_cli_llm_agent_constructs_llm_strategy_agent() -> None:
     """--agent llm should construct StrategyAgent and pass it to run_act1."""
-    import run_hermes_cli
+    import run_hermes
     from unittest.mock import patch, MagicMock
 
     mock_run_act1 = MagicMock(return_value=MagicMock(
@@ -343,8 +342,8 @@ def test_hermes_cli_llm_agent_constructs_llm_strategy_agent() -> None:
         potions_gained=[]
     ))
 
-    with patch("run_hermes_cli.run_act1", mock_run_act1):
-        run_hermes_cli.run(["--agent", "llm", "--seed", "42"])
+    with patch("run_hermes.run_act1", mock_run_act1):
+        run_hermes.run(["--agent", "llm", "--seed", "42"])
 
     # Verify run_act1 was called with a StrategyAgent
     call_args = mock_run_act1.call_args
@@ -355,7 +354,7 @@ def test_hermes_cli_llm_agent_constructs_llm_strategy_agent() -> None:
 
 def test_hermes_cli_none_agent_passes_none_to_run_act1() -> None:
     """--agent none should pass None to run_act1."""
-    import run_hermes_cli
+    import run_hermes
     from unittest.mock import patch, MagicMock
 
     mock_run_act1 = MagicMock(return_value=MagicMock(
@@ -372,8 +371,8 @@ def test_hermes_cli_none_agent_passes_none_to_run_act1() -> None:
         potions_gained=[]
     ))
 
-    with patch("run_hermes_cli.run_act1", mock_run_act1):
-        run_hermes_cli.run(["--agent", "none", "--seed", "42"])
+    with patch("run_hermes.run_act1", mock_run_act1):
+        run_hermes.run(["--agent", "none", "--seed", "42"])
 
     # Verify run_act1 was called with None
     call_args = mock_run_act1.call_args
@@ -383,7 +382,7 @@ def test_hermes_cli_none_agent_passes_none_to_run_act1() -> None:
 
 def test_hermes_cli_writes_progress_file(capsys: pytest.CaptureFixture, tmp_path: pytest.TempPathFactory) -> None:
     """Script should write progress markers to /tmp/sts_hermes_progress.txt."""
-    import run_hermes_cli
+    import run_hermes
     from unittest.mock import patch, MagicMock
 
     mock_run_act1 = MagicMock(return_value=MagicMock(
@@ -400,8 +399,8 @@ def test_hermes_cli_writes_progress_file(capsys: pytest.CaptureFixture, tmp_path
         potions_gained=[]
     ))
 
-    with patch("run_hermes_cli.run_act1", mock_run_act1):
-        run_hermes_cli.run(["--agent", "none", "--seed", "42"])
+    with patch("run_hermes.run_act1", mock_run_act1):
+        run_hermes.run(["--agent", "none", "--seed", "42"])
 
     # Check progress file was written
     import os
@@ -415,7 +414,7 @@ def test_hermes_cli_writes_progress_file(capsys: pytest.CaptureFixture, tmp_path
 
 def test_hermes_cli_writes_result_file(capsys: pytest.CaptureFixture) -> None:
     """Script should write results to /tmp/sts_hermes_result.txt."""
-    import run_hermes_cli
+    import run_hermes
     from unittest.mock import patch, MagicMock
 
     mock_result = MagicMock(
@@ -433,8 +432,8 @@ def test_hermes_cli_writes_result_file(capsys: pytest.CaptureFixture) -> None:
     )
     mock_run_act1 = MagicMock(return_value=mock_result)
 
-    with patch("run_hermes_cli.run_act1", mock_run_act1):
-        run_hermes_cli.run(["--agent", "none", "--seed", "42"])
+    with patch("run_hermes.run_act1", mock_run_act1):
+        run_hermes.run(["--agent", "none", "--seed", "42"])
 
     # Check result file was written with expected fields
     import os

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from sts_env.combat.rng import RNG
+from sts_env.run.rng_streams import RunRNG
 from sts_env.run.character import Character
 from sts_env.run.shop import ShopInventory, buy_card, generate_shop
 
@@ -87,7 +87,8 @@ class TestListShopCandidates:
     def test_includes_affordable_actions(self):
         ch = Character.ironclad()
         ch.gold = 200
-        inv = generate_shop(RNG(0), ch)
+        ch.floor = 3
+        inv = generate_shop(RunRNG(0), ch.floor, ch)
         candidates = list_shop_candidates(inv, ch)
         assert "leave" in candidates
         assert any(c.startswith("buy_card:") for c in candidates)

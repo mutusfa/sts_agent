@@ -517,9 +517,7 @@ class _CombinedObserver:
             finally:
                 self._potion_tracker.end_floor(list(character.potions))
                 collector = self._probe_collector
-                if collector is None:
-                    return
-                if "damage_taken" in attrs:
+                if collector is not None and "damage_taken" in attrs:
                     collector.log_outcome(
                         {
                             "floor": floor,

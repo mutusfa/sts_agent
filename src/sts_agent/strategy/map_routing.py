@@ -190,7 +190,7 @@ def room_reward_gold_ev(room_type: RoomType) -> float:
 
     gold = float(COMBAT_GOLD.get(reward_room, COMBAT_GOLD[Room.MONSTER]))
     cards = _card_slot_ev(reward_room)
-    potion = _POTION_DROP_BASE * _avg_potion_price()
+    potion = (_POTION_DROP_BASE / 100.0) * _avg_potion_price()
     relic = _elite_relic_ev() if room_type == RoomType.ELITE else 0.0
     return gold + cards + potion + relic
 

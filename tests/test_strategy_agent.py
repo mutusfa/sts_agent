@@ -15,6 +15,8 @@ import pytest
 from unittest.mock import MagicMock, call, patch
 
 from sts_env.run.character import Character
+from sts_env.run.rng_streams import RunRNG
+from sts_env.run.shop import generate_shop
 from sts_env.run.map import StSMap, MapNode, RoomType, generate_act1_map
 from tests.map_helpers import begin_linear_map, ironclad_on_linear_map
 from sts_agent.run import run_act1, RunResult
@@ -66,6 +68,25 @@ def _llm_agent_with_map() -> StrategyAgent:
 
 def _ironclad() -> Character:
     return Character.ironclad()
+
+
+def _pick_card_with_map(
+    agent: StrategyAgent,
+    card_choices: list[str],
+    *,
+    seed: int = 42,
+    upcoming: list[tuple[str, str]] | None = None,
+) -> str | None:
+    """Call pick_card with the scored map context StrategyAgent now requires."""
+    begin_linear_map(agent, seed=seed)
+    return agent.pick_card(
+        ironclad_on_linear_map(),
+        card_choices,
+        upcoming if upcoming is not None else _upcoming(),
+        seed,
+        sts_map=agent._sts_map,
+        current_position=(2, 0),
+    )
 
 
 def _upcoming() -> list[tuple[str, str]]:
@@ -352,9 +373,8 @@ class TestStrategyAgent:
         agent = StrategyAgent()
         with patch("sts_agent.strategy.llm_agent.dspy.ReActV2",
                    side_effect=RuntimeError("LM connection failed")):
-            pick = agent.pick_card(
-                _ironclad(), ["Anger", "Carnage", "Inflame"],
-                _upcoming(), seed=42,
+            pick = _pick_card_with_map(
+                agent, ["Anger", "Carnage", "Inflame"],
             )
             assert pick == "Carnage"  # uncommon forced pick
 
@@ -363,9 +383,8 @@ class TestStrategyAgent:
         agent = StrategyAgent(timeout_seconds=0)
         with patch("sts_agent.strategy.llm_agent.dspy.ReActV2",
                    self._mock_react("Feed")):
-            pick = agent.pick_card(
-                _ironclad(), ["Anger", "Feed", "Inflame"],
-                _upcoming(), seed=42,
+            pick = _pick_card_with_map(
+                agent, ["Anger", "Feed", "Inflame"],
             )
             # LLM picks Feed despite budget being exhausted at tool level
             assert pick == "Feed"
@@ -375,9 +394,8 @@ class TestStrategyAgent:
         agent = StrategyAgent(timeout_seconds=0)
         with patch("sts_agent.strategy.llm_agent.dspy.ReActV2",
                    self._mock_react("NonExistentCard")):
-            pick = agent.pick_card(
-                _ironclad(), ["Anger", "Inflame", "Flex"],
-                _upcoming(), seed=42,
+            pick = _pick_card_with_map(
+                agent, ["Anger", "Inflame", "Flex"],
             )
             # Falls back to forced pick — Inflame is uncommon
             assert pick == "Inflame"
@@ -387,9 +405,8 @@ class TestStrategyAgent:
         agent = StrategyAgent()
         with patch("sts_agent.strategy.llm_agent.dspy.ReActV2",
                    self._mock_react("NonExistentCard")):
-            pick = agent.pick_card(
-                _ironclad(), ["Anger", "Inflame", "Flex"],
-                _upcoming(), seed=42,
+            pick = _pick_card_with_map(
+                agent, ["Anger", "Inflame", "Flex"],
             )
             # Falls back to forced pick — Inflame is uncommon, picked first
             assert pick == "Inflame"
@@ -399,9 +416,8 @@ class TestStrategyAgent:
         agent = StrategyAgent()
         with patch("sts_agent.strategy.llm_agent.dspy.ReActV2",
                    self._mock_react("skip")):
-            pick = agent.pick_card(
-                _ironclad(), ["Anger", "Inflame", "Flex"],
-                _upcoming(), seed=42,
+            pick = _pick_card_with_map(
+                agent, ["Anger", "Inflame", "Flex"],
             )
             assert pick is None
 
@@ -410,9 +426,8 @@ class TestStrategyAgent:
         agent = StrategyAgent()
         with patch("sts_agent.strategy.llm_agent.dspy.ReActV2",
                    self._mock_react("anger")):
-            pick = agent.pick_card(
-                _ironclad(), ["Anger", "Inflame", "Flex"],
-                _upcoming(), seed=42,
+            pick = _pick_card_with_map(
+                agent, ["Anger", "Inflame", "Flex"],
             )
             assert pick == "Anger"
 
@@ -421,9 +436,8 @@ class TestStrategyAgent:
         agent = StrategyAgent()
         with patch("sts_agent.strategy.llm_agent.dspy.ReActV2",
                    self._mock_react("I'll pick ShrugItOff")):
-            pick = agent.pick_card(
-                _ironclad(), ["Anger", "ShrugItOff", "Flex"],
-                _upcoming(), seed=42,
+            pick = _pick_card_with_map(
+                agent, ["Anger", "ShrugItOff", "Flex"],
             )
             assert pick == "ShrugItOff"
 
@@ -432,9 +446,8 @@ class TestStrategyAgent:
         agent = StrategyAgent()
         with patch("sts_agent.strategy.llm_agent.dspy.ReActV2",
                    self._mock_react("")):
-            pick = agent.pick_card(
-                _ironclad(), ["Anger", "Inflame", "Flex"],
-                _upcoming(), seed=42,
+            pick = _pick_card_with_map(
+                agent, ["Anger", "Inflame", "Flex"],
             )
             assert pick is None
 
@@ -798,9 +811,9 @@ class TestToolsPoolDetection:
 class TestUnifiedToolFactory:
     """_make_tools is the sole tool factory; old separate factories are gone."""
 
-    def test_make_tools_returns_five_tools(self):
+    def test_make_tools_returns_six_tools(self):
         tools = _make_tools(_ironclad(), budget_checker=lambda: None)
-        assert len(tools) == 5
+        assert len(tools) == 6
 
     def test_make_tools_tool_names(self):
         tools = _make_tools(_ironclad(), budget_checker=lambda: None)
@@ -811,6 +824,7 @@ class TestUnifiedToolFactory:
             "try_upgrade",
             "try_remove_card",
             "try_rest",
+            "try_potion",
         ]
 
     def test_make_rest_tools_does_not_exist(self):
@@ -1041,15 +1055,12 @@ class TestShop:
             yield
 
     def test_shop_executes_parsed_actions(self):
-        from sts_env.combat.rng import RNG
-        from sts_env.run.shop import generate_shop
-
         agent = _llm_agent_with_map()
         ch = Character.ironclad()
         ch.floor = 3
         ch.map_x = 0
         ch.gold = 300
-        inv = generate_shop(RNG(0), ch)
+        inv = generate_shop(RunRNG(0), ch.floor, ch)
 
         card_idx = next(
             i for i, (cid, price) in enumerate(inv.cards)

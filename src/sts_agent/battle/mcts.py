@@ -623,6 +623,8 @@ class MCTSPlanner:
                         and not current_node.edges
                     ):
                         break
+                    path_len_before = len(path)
+                    nodes_before = nodes_expanded
                     current_node, nodes_expanded = self._sim_select_expand_once(
                         path=path,
                         current_node=current_node,
@@ -631,6 +633,11 @@ class MCTSPlanner:
                         c=c,
                         nodes_expanded=nodes_expanded,
                     )
+                    if (
+                        len(path) == path_len_before
+                        and nodes_expanded == nodes_before
+                    ):
+                        break
             else:
                 current_node, nodes_expanded = self._sim_select_expand_once(
                     path=path,
@@ -890,6 +897,8 @@ class MCTSPlanner:
             and current_node.edges
         ):
             concept_key = self._select_concept_key(current_node, c)
+            if concept_key is None:
+                break
             action = _resolve_action(concept_key, current_combat)
             if action is None:
                 action = Action.end_turn()
@@ -950,7 +959,7 @@ class MCTSPlanner:
 
         return current_node, nodes_expanded
 
-    def _select_concept_key(self, node: _Node, c: float) -> tuple:
+    def _select_concept_key(self, node: _Node, c: float) -> tuple | None:
         """UCB selection: argmin mean(a) - c * sqrt(ln N / n_a).
 
         Returns the conceptual action key with the best UCB value.
@@ -964,6 +973,8 @@ class MCTSPlanner:
         best_keys: list[tuple] = []
 
         for concept_key, stats in node.edges.items():
+            if stats.n <= 0:
+                continue
             ucb = stats.mean - c * math.sqrt(ln_N / stats.n)
             if ucb < best_score:
                 best_score = ucb
@@ -972,7 +983,7 @@ class MCTSPlanner:
                 best_keys.append(concept_key)
 
         if not best_keys:
-            raise RuntimeError("No selectable actions at fully-expanded node.")
+            return None
         return self._rng.choice(best_keys)
 
     def _effective_pv_min_n(self) -> int:

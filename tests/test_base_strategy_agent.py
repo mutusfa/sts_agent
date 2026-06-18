@@ -9,6 +9,7 @@ from sts_env.run.events import EventChoice, EventSpec
 from sts_env.run.map import generate_act1_map
 from sts_env.run.neow import NeowChoice, roll_neow_options
 from sts_env.combat.rng import RNG
+from sts_env.run.rng_streams import RunRNG
 from sts_env.run.rooms import RestChoice, RestResult
 from sts_env.run.shop import generate_shop
 
@@ -201,9 +202,10 @@ class TestShop:
         agent = BaseStrategyAgent(seed=0)
         ch = Character.ironclad()
         ch.gold = 500
+        ch.floor = 3
         gold_before = ch.gold
         deck_size_before = len(ch.deck)
-        shop_inv = generate_shop(RNG(0), ch)
+        shop_inv = generate_shop(RunRNG(0), ch.floor, ch)
 
         agent.shop(shop_inv, ch)
 

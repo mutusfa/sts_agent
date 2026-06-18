@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from sts_env.combat.rng import RNG
 from sts_env.run.character import Character
 from sts_env.run.encounter_queue import EncounterQueue
+from sts_env.run.rng_streams import RunRNG
 from sts_env.run.shop import ShopInventory, generate_shop
 
 from sts_agent.strategy.sim_agent import SimStrategyAgent
@@ -15,8 +15,9 @@ class TestSimStrategyAgentShop:
         agent = SimStrategyAgent(sim_nodes=100, sim_sims=100, seed=0)
         ch = Character.ironclad()
         ch.gold = 500
+        ch.floor = 3
         gold_before = ch.gold
-        inv = generate_shop(RNG(0), ch)
+        inv = generate_shop(RunRNG(0), ch.floor, ch)
 
         agent.shop(inv, ch)
 
@@ -27,8 +28,8 @@ class TestSimStrategyAgentShop:
         ch = Character.ironclad()
         ch.gold = 500
         ch.floor = 5
-        inv = generate_shop(RNG(1), ch)
-        queue = EncounterQueue(RNG(0xBEEF))
+        inv = generate_shop(RunRNG(1), ch.floor, ch)
+        queue = EncounterQueue(RunRNG(0xBEEF))
         agent.set_encounter_tracking(queue, [], [])
 
         agent.shop(inv, ch)
@@ -48,7 +49,7 @@ class TestSimStrategyAgentShop:
             relics=[None, None, None],
             remove_cost=75,
         )
-        queue = EncounterQueue(RNG(0xBEEF))
+        queue = EncounterQueue(RunRNG(0xBEEF))
         agent.set_encounter_tracking(queue, [], [])
 
         from sts_agent.strategy import shop_eval as shop_eval_mod
