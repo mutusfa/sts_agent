@@ -145,11 +145,11 @@ class ProbeConfig:
 def _card_slot_ev(room: Room) -> float:
     rare_chance = _RARE_CHANCE[room]
     uncommon_chance = _UNCOMMON_CHANCE[room]
-    common_chance = max(0, 100 - rare_chance - uncommon_chance)
+    common_chance = max(0.0, 1.0 - rare_chance - uncommon_chance)
     return (
-        (rare_chance / 100.0) * CARD_PRICES["rare"]
-        + (uncommon_chance / 100.0) * CARD_PRICES["uncommon"]
-        + (common_chance / 100.0) * CARD_PRICES["common"]
+        rare_chance * CARD_PRICES["rare"]
+        + uncommon_chance * CARD_PRICES["uncommon"]
+        + common_chance * CARD_PRICES["common"]
     )
 
 
@@ -190,7 +190,7 @@ def room_reward_gold_ev(room_type: RoomType) -> float:
 
     gold = float(COMBAT_GOLD.get(reward_room, COMBAT_GOLD[Room.MONSTER]))
     cards = _card_slot_ev(reward_room)
-    potion = (_POTION_DROP_BASE / 100.0) * _avg_potion_price()
+    potion = _POTION_DROP_BASE * _avg_potion_price()
     relic = _elite_relic_ev() if room_type == RoomType.ELITE else 0.0
     return gold + cards + potion + relic
 
